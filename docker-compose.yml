@@ -70,6 +70,10 @@ services:
   watchtower:
     image: containrrr/watchtower
     restart: unless-stopped
+    environment:
+      # свежий Docker-демон требует API >= 1.40; иначе watchtower берёт старую
+      # версию (1.25) и падает "client version too old".
+      DOCKER_API_VERSION: "1.40"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: --interval 300 --cleanup --label-enable
