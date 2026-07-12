@@ -6,11 +6,16 @@
  * only knows public keys. It just says "new encrypted message". The real text
  * is pulled from the queue (still E2E-encrypted) when the app opens.
  *
- * Config via env (set by install.sh):
- *   FCM_PROJECT_ID                 - Firebase project id
- *   GOOGLE_APPLICATION_CREDENTIALS - path to the service-account JSON
+ * Config — ЛЮБОЙ из способов:
+ *   1. Просто положить service-account.json в каталог данных (/data в Docker,
+ *      рядом с relay.js на bare-metal) — файл найдётся сам, project_id
+ *      прочитается из него. Ничего настраивать не нужно.
+ *   2. Классически через env: FCM_PROJECT_ID + GOOGLE_APPLICATION_CREDENTIALS.
  * If unset, pushes are silently skipped (relay still works, just no wake-ups).
  */
+const fs = require('fs');
+const path = require('path');
+
 let GoogleAuth;
 try {
   ({ GoogleAuth } = require('google-auth-library'));
@@ -18,7 +23,38 @@ try {
   GoogleAuth = null;
 }
 
-const PROJECT_ID = process.env.FCM_PROJECT_ID;
+// Автопоиск service-account.json: env → каталог данных (volume) → рядом с кодом.
+function autoDetectCredentials() {
+  const candidates = [
+    process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    path.join(path.dirname(process.env.RELAY_DB || path.join(__dirname, 'relay.db')), 'service-account.json'),
+    path.join(__dirname, 'service-account.json'),
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {}
+  }
+  return null;
+}
+
+const CREDENTIALS_FILE = autoDetectCredentials();
+if (CREDENTIALS_FILE && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  // google-auth-library читает путь из этой переменной
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = CREDENTIALS_FILE;
+}
+
+function detectProjectId() {
+  if (process.env.FCM_PROJECT_ID) return process.env.FCM_PROJECT_ID;
+  if (!CREDENTIALS_FILE) return null;
+  try {
+    return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8')).project_id || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+const PROJECT_ID = detectProjectId();
 let auth = null;
 let warned = false;
 
