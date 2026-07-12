@@ -6,14 +6,20 @@
 # вместе с релеем.
 #
 # Все сервисы имеют restart: unless-stopped и поднимаются автоматически после
-# перезагрузки сервера (Docker включён в автозапуск systemd).
+# перезагрузки. watchtower авто-обновляет релей при выходе новой версии образа —
+# вручную обновлять каждый сервер не нужно (см. README, раздел «Авто-обновление»).
 
 services:
   relay:
-    build: .
-    # Альтернатива сборке — готовый образ:
-    # image: ghcr.io/o34183901-gif/relay:latest
+    image: ghcr.io/o34183901-gif/relay:latest
+    # Вместо готового образа можно собирать локально из репозитория, но тогда
+    # авто-обновление watchtower НЕ работает (обновлять придётся git pull +
+    # docker compose up -d --build):
+    # build: .
     restart: unless-stopped
+    labels:
+      # watchtower обновляет только помеченные контейнеры (наш код)
+      - com.centurylinklabs.watchtower.enable=true
     environment:
       RELAY_SELF_URL: ${RELAY_SELF_URL}
       RELAY_PEERS: ${RELAY_PEERS:-}
@@ -57,6 +63,16 @@ services:
       - --no-cli
       - --min-port=49160
       - --max-port=49200
+
+  # Авто-обновление: раз в 5 минут проверяет ghcr на новую версию образа релея и
+  # сам пересоздаёт контейнер (данные в volume сохраняются). Так релеи обновляются
+  # сами — достаточно опубликовать новый образ (push в репозиторий relay).
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --cleanup --label-enable
 
 volumes:
   relay-data:
