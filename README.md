@@ -102,6 +102,32 @@ curl https://<RELAY_HOST>/metrics
 чтобы закрыть — задайте `RELAY_METRICS_TOKEN` в `.env`, тогда нужен
 `?token=...` или заголовок `Authorization: Bearer ...`.
 
+## Пуши при закрытом приложении (FCM)
+
+Чтобы релей мог «будить» телефоны уведомлениями, ему нужен ключ сервисного
+аккаунта Firebase **того же проекта, что вшит в приложение**. Файл выдаёт
+владелец приложения — релеям со случайными ключами пуши работать не будут.
+
+Как включить (Docker):
+
+```bash
+# файл service-account.json лежит рядом, контейнер запущен
+docker compose cp ./service-account.json relay:/data/service-account.json
+docker compose restart relay
+docker compose logs relay | grep push
+#   → "[push] FCM configured — wake-up pushes enabled"
+```
+
+Файл лежит в томе `/data`, поэтому переживает и рестарты, и авто-обновления
+watchtower. Ничего в `.env` прописывать не нужно: релей сам находит
+`/data/service-account.json` и берёт `project_id` из него (env-переменные
+`FCM_PROJECT_ID`/`GOOGLE_APPLICATION_CREDENTIALS` по-прежнему работают и имеют
+приоритет). Bare-metal: положите файл рядом с `install.sh` до установки — он
+подхватится автоматически, или рядом с `relay.js` у работающего сервера.
+
+Приватность: пуш не содержит ни текста, ни имени отправителя — только сигнал
+«есть новое сообщение».
+
 ## Авто-обновление (без ручного захода на каждый сервер)
 
 Релей запускается из готового образа `ghcr.io/o34183901-gif/relay:latest`, а
