@@ -82,6 +82,7 @@ function createStore(dbPath, opts = {}) {
     blobIds: db.prepare('SELECT id FROM queue WHERE blob=1'),
     usersQueued: db.prepare('SELECT count(DISTINCT to_pk) c FROM queue'),
     totalQueued: db.prepare('SELECT count(*) c FROM queue'),
+    dbBytes: db.prepare('SELECT coalesce(sum(length(envelope)),0) c FROM queue'),
     expire: db.prepare('DELETE FROM queue WHERE ts < ?'),
   };
   // null — если тело-файл пропал (например, volume почистили руками): такая
@@ -258,6 +259,28 @@ function createStore(dbPath, opts = {}) {
         totalQueued: q.totalQueued.get().c,
         relays: dir.count.get().c,
       };
+    },
+    /**
+     * Сколько байт занимает очередь: тела в БД + blob-файлы на диске.
+     * Для /metrics — оператор видит реальный «вес» недоставленного.
+     */
+    queueBytes() {
+      let bytes = q.dbBytes.get().c;
+      if (blobDir) {
+        let files;
+        try {
+          files = fs.readdirSync(blobDir);
+        } catch (e) {
+          files = [];
+        }
+        for (const f of files) {
+          if (!f.endsWith('.json')) continue;
+          try {
+            bytes += fs.statSync(path.join(blobDir, f)).size;
+          } catch (e) {}
+        }
+      }
+      return bytes;
     },
     close() {
       db.close();

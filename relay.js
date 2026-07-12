@@ -125,6 +125,59 @@ const RATE_MAX_FRAMES = 80; // frames per RATE_WINDOW_MS before we drop the sock
 const MAX_CONN_PER_IP = Number(process.env.RELAY_MAX_CONN_PER_IP) || 1000; // одновременных соединений с одного IP
 const MAX_BUFFERED_BYTES = Number(process.env.RELAY_MAX_BUFFERED) || 64 * 1024 * 1024; // если клиент не читает и буфер сокета раздулся — рвём
 
+// --- /metrics (п.4): счётчики с момента старта процесса ---------------------
+// Формат Prometheus, чтобы оператор мог повесить Grafana/alerting без плясок.
+// Если endpoint нужно закрыть от посторонних — env RELAY_METRICS_TOKEN, тогда
+// требуется ?token=... или заголовок Authorization: Bearer ...
+const METRICS_TOKEN = process.env.RELAY_METRICS_TOKEN || null;
+const START_TS = Date.now();
+const counters = {
+  msgsIn: 0, // принятых 'send' от клиентов
+  deliveredOnline: 0, // доставлено получателю онлайн (сокет открыт)
+  queuedOffline: 0, // получатель офлайн — легло в очередь
+  acked: 0, // квитанций received (сообщение реально дошло)
+  pushes: 0, // отправлено wake-up пушей
+  authOk: 0, // успешных аутентификаций
+};
+
+function renderMetrics() {
+  const st = store.stats();
+  const mem = process.memoryUsage();
+  const lines = [];
+  const metric = (name, type, help, value, labels) => {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} ${type}`);
+    lines.push(`${name}${labels || ''} ${value}`);
+  };
+  metric('licno_up', 'gauge', 'Relay process is up.', 1);
+  metric('licno_uptime_seconds', 'gauge', 'Seconds since process start.', Math.round((Date.now() - START_TS) / 1000));
+  lines.push('# HELP licno_connections WebSocket connections.');
+  lines.push('# TYPE licno_connections gauge');
+  lines.push(`licno_connections{state="open"} ${wss.clients.size}`);
+  lines.push(`licno_connections{state="authed"} ${online.size}`);
+  metric('licno_known_relays', 'gauge', 'Relays known to this node (gossip directory).', relayDir.length);
+  metric('licno_queue_users', 'gauge', 'Users with pending (undelivered) envelopes.', st.usersQueued);
+  metric('licno_queue_messages', 'gauge', 'Pending envelopes in the store-and-forward queue.', st.totalQueued);
+  metric('licno_queue_bytes', 'gauge', 'Bytes held by the queue (DB rows + attachment blobs on disk).', store.queueBytes());
+  metric('licno_messages_in_total', 'counter', 'Envelopes accepted from senders since start.', counters.msgsIn);
+  metric('licno_messages_delivered_online_total', 'counter', 'Envelopes pushed to an online recipient since start.', counters.deliveredOnline);
+  metric('licno_messages_queued_offline_total', 'counter', 'Envelopes queued for an offline recipient since start.', counters.queuedOffline);
+  metric('licno_messages_acked_total', 'counter', 'Envelopes confirmed received by recipients since start.', counters.acked);
+  metric('licno_push_sent_total', 'counter', 'Wake-up pushes sent since start.', counters.pushes);
+  metric('licno_auth_success_total', 'counter', 'Successful client authentications since start.', counters.authOk);
+  metric('process_resident_memory_bytes', 'gauge', 'Resident set size of the relay process.', mem.rss);
+  metric('nodejs_heap_used_bytes', 'gauge', 'V8 heap used by the relay process.', mem.heapUsed);
+  return lines.join('\n') + '\n';
+}
+
+function metricsAuthorized(req) {
+  if (!METRICS_TOKEN) return true;
+  const url = new URL(req.url, 'http://x');
+  if (url.searchParams.get('token') === METRICS_TOKEN) return true;
+  const auth = req.headers && req.headers.authorization;
+  return auth === `Bearer ${METRICS_TOKEN}`;
+}
+
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
 const online = new Map();
 // ip -> число активных соединений (за Caddy берём X-Forwarded-For)
@@ -188,6 +241,18 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
+  // Метрики для мониторинга (Prometheus text format). Закрывается токеном
+  // через RELAY_METRICS_TOKEN (см. metricsAuthorized).
+  if (req.url === '/metrics' || req.url.startsWith('/metrics?')) {
+    if (!metricsAuthorized(req)) {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('forbidden');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+    res.end(renderMetrics());
+    return;
+  }
   // Публичный каталог релеев — любой (клиент или другой релей) может забрать его
   // отсюда. Это и есть точка, из которой список реплицируется по сети.
   if (req.url === '/relays') {
@@ -239,21 +304,29 @@ function deliver(from, to, envelope, silent, callPush) {
   const ws = online.get(to);
   if (ws) {
     send(ws, { type: 'message', id, envelope });
+    counters.deliveredOnline += 1;
     return { queued: false, id };
   }
 
   // recipient offline -> maybe wake them
+  counters.queuedOffline += 1;
   const token = store.getToken(to);
   const onInvalid = (r) => {
     if (r === 'invalid') store.delToken(to);
   };
 
   if (callPush) {
-    if (token) sendCallPush(token).then(onInvalid);
+    if (token) {
+      counters.pushes += 1;
+      sendCallPush(token).then(onInvalid);
+    }
     return { queued: true, id };
   }
   if (silent) return { queued: true, id }; // control message: deliver, no push
-  if (token) sendPush(token).then(onInvalid);
+  if (token) {
+    counters.pushes += 1;
+    sendPush(token).then(onInvalid);
+  }
   return { queued: true, id };
 }
 
@@ -262,6 +335,7 @@ function deliver(from, to, envelope, silent, callPush) {
 function ackReceived(recipientPubkey, id) {
   const from = store.ack(recipientPubkey, id); // from_pk, либо null если нет/не его
   if (from) {
+    counters.acked += 1;
     const senderWs = online.get(from);
     if (senderWs) send(senderWs, { type: 'delivered', id });
   }
@@ -354,6 +428,7 @@ wss.on('connection', (ws, req) => {
       }
       if (!boundSpk) store.bindSignKey(ws.pendingPubkey, ws.pendingSpk);
       // authenticated: take ownership of this pubkey
+      counters.authOk += 1;
       ws.authed = true;
       ws.pubkey = ws.pendingPubkey;
       ws.nonce = null;
@@ -447,6 +522,7 @@ wss.on('connection', (ws, req) => {
       if (size > MAX_ENVELOPE_BYTES) {
         return send(ws, { type: 'error', error: 'envelope too large' });
       }
+      counters.msgsIn += 1;
       const r = deliver(ws.pubkey, msg.to, msg.envelope, !!msg.silent, !!msg.callPush);
       return send(ws, { type: 'ack', ref: msg.ref, id: r.id, queued: r.queued });
     }
