@@ -172,6 +172,24 @@ const server = http.createServer((req, res) => {
   // Публичный каталог релеев — любой (клиент или другой релей) может забрать его
   // отсюда. Это и есть точка, из которой список реплицируется по сети.
   if (req.url === '/relays') {
+    // POST — другой релей сообщает о себе/своём каталоге (push-gossip): так
+    // сосед, у которого мы в peers, узнаёт про нас без ручной настройки.
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+        if (body.length > 200000) req.destroy();
+      });
+      req.on('end', () => {
+        try {
+          const j = JSON.parse(body);
+          if (Array.isArray(j.relays)) learnRelays(j.relays.filter(isValidRelayUrl));
+        } catch (e) {}
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        res.end(JSON.stringify({ relays: relayDir }));
+      });
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
     res.end(JSON.stringify({ relays: relayDir }));
     return;
@@ -407,12 +425,33 @@ async function fetchPeerRelays(wsUrl) {
     clearTimeout(t);
   }
 }
+// Push-gossip: сообщить peer'у наш каталог (включая себя). Благодаря этому
+// сосед, который сам нас в peers не прописывал (напр. самый первый релей),
+// узнаёт про нас — распространение становится двунаправленным.
+async function pushSelfTo(wsUrl) {
+  if (typeof fetch !== 'function') return;
+  const url = relayHttpBase(wsUrl) + '/relays';
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ relays: relayDir }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+  } finally {
+    clearTimeout(t);
+  }
+}
 async function gossipOnce() {
   const peers = relayDir.filter((u) => !SELF_URL || u.toLowerCase() !== SELF_URL.toLowerCase());
   let learned = false;
   for (const peer of peers) {
     const list = await fetchPeerRelays(peer);
     if (list && learnRelays(list)) learned = true;
+    await pushSelfTo(peer); // рассказываем peer'у про себя (двунаправленно)
   }
   if (learned) console.log(`[gossip] directory now ${relayDir.length} relays`);
 }
