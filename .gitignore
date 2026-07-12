@@ -3,6 +3,9 @@ node_modules/
 *.log
 
 # Рантайм-данные релея
+relay.db
+relay.db-wal
+relay.db-shm
 queue.json
 relays.json
 push-tokens.json

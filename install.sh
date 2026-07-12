@@ -52,8 +52,10 @@ log "Копирование релея в ${APP_DIR}"
 mkdir -p "$APP_DIR"
 # скрипт лежит рядом с relay.js/package.json — копируем их
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/push.js" "$SRC_DIR/package.json" "$APP_DIR/"
+cp "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/store.js" "$SRC_DIR/push.js" "$SRC_DIR/package.json" "$APP_DIR/"
 cd "$APP_DIR"
+# build-tools нужны для нативного модуля better-sqlite3 (встроенное хранилище)
+apt-get install -y --no-install-recommends python3 make g++ || true
 npm install --omit=dev
 
 # Optional FCM push: if a Firebase service-account JSON is present next to the
@@ -141,7 +143,7 @@ Type=simple
 WorkingDirectory=${APP_DIR}
 ExecStart=/usr/bin/node ${APP_DIR}/relay.js
 Environment=PORT=8787
-Environment=RELAY_DATA=${APP_DIR}/queue.json
+Environment=RELAY_DB=${APP_DIR}/relay.db
 ${DIR_ENV}
 ${FCM_ENV}
 ${TURN_ENV}

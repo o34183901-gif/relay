@@ -5,9 +5,10 @@
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js",
-    "test": "node test.js"
+    "test": "node store.test.js && node test.js"
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
     "google-auth-library": "^9.15.1",
     "tweetnacl": "^1.0.3",
     "tweetnacl-util": "^0.15.1",

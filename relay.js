@@ -32,7 +32,6 @@
  */
 
 const http = require('http');
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const nacl = require('tweetnacl');
@@ -40,6 +39,7 @@ const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady } = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl } = require('./relays');
+const { createStore } = require('./store');
 
 const TURN_SECRET = process.env.TURN_SECRET;
 const TURN_HOST = process.env.TURN_HOST;
@@ -62,16 +62,18 @@ function turnIceServers() {
 }
 
 const PORT = process.env.PORT || 8787;
-const DATA_FILE = process.env.RELAY_DATA || path.join(__dirname, 'queue.json');
-const PUSH_FILE = process.env.RELAY_PUSH || path.join(__dirname, 'push-tokens.json');
-const IDENT_FILE = process.env.RELAY_IDENT || path.join(__dirname, 'identities.json');
-const DIR_FILE = process.env.RELAY_DIR || path.join(__dirname, 'relays.json');
+// Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
+// in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
+const DB_FILE = process.env.RELAY_DB || path.join(__dirname, 'relay.db');
 const MAX_QUEUE_PER_USER = 500;
+const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
+
+const store = createStore(DB_FILE);
 
 // --- Реплицированный каталог релеев (gossip) ------------------------------
 // SELF_URL — публичный wss-адрес ЭТОГО релея; RELAY_PEERS — стартовые соседи
-// (через запятую). Каталог = self ∪ peers ∪ выученные, сохраняется в relays.json
-// и периодически синхронизируется с пирами. Клиент может забрать его у любого
+// (через запятую). Каталог = self ∪ peers ∪ выученные, хранится в БД и
+// периодически синхронизируется с пирами. Клиент может забрать его у любого
 // релея (GET /relays или WS {type:'relays'}), поэтому падение одного не критично.
 const SELF_URL = normalizeRelayUrl(process.env.RELAY_SELF_URL || '') || null;
 const PEER_SEED = (process.env.RELAY_PEERS || '')
@@ -80,29 +82,14 @@ const PEER_SEED = (process.env.RELAY_PEERS || '')
   .filter(Boolean);
 const GOSSIP_INTERVAL_MS = Number(process.env.RELAY_GOSSIP_MS) || 60000;
 
-function loadRelayDir() {
-  let stored = [];
-  try {
-    stored = JSON.parse(fs.readFileSync(DIR_FILE, 'utf8'));
-  } catch (e) {
-    stored = [];
-  }
-  return mergeRelays([], [SELF_URL, ...PEER_SEED, ...stored].filter(Boolean));
-}
-let relayDir = loadRelayDir();
-function persistRelayDir() {
-  try {
-    fs.writeFileSync(DIR_FILE, JSON.stringify(relayDir));
-  } catch (e) {
-    console.error('relay-dir persist failed:', e.message);
-  }
-}
+let relayDir = mergeRelays([], [SELF_URL, ...PEER_SEED, ...store.directory()].filter(Boolean));
+store.addRelays(relayDir, Date.now());
 /** Добавить URL(ы) в каталог; вернуть true, если что-то реально добавилось. */
 function learnRelays(urls) {
   const before = relayDir.length;
   relayDir = mergeRelays(relayDir, urls);
   if (relayDir.length !== before) {
-    persistRelayDir();
+    store.addRelays(relayDir, Date.now());
     return true;
   }
   return false;
@@ -114,35 +101,8 @@ const AUTH_TIMEOUT_MS = 10000; // must authenticate within this window
 const RATE_WINDOW_MS = 1000;
 const RATE_MAX_FRAMES = 80; // frames per RATE_WINDOW_MS before we drop the socket
 
-// pubkey -> live WebSocket
+// pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
 const online = new Map();
-// pubkey -> array of pending {id, from, envelope, silent, callPush}
-const queues = loadMap(DATA_FILE);
-// pubkey -> FCM device token (for wake-up pushes when offline)
-const pushTokens = loadMap(PUSH_FILE);
-// pubkey -> signPublicKey (trust-on-first-use ownership binding)
-const identities = loadMap(IDENT_FILE);
-
-function loadMap(file) {
-  try {
-    return new Map(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8'))));
-  } catch (e) {
-    return new Map();
-  }
-}
-
-function persistFile(file, map, label) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(Object.fromEntries(map)));
-  } catch (e) {
-    console.error(`${label} persist failed:`, e.message);
-  }
-}
-const persist = () => persistFile(DATA_FILE, queues, 'queue');
-const persistTokens = () => persistFile(PUSH_FILE, pushTokens, 'token');
-const persistIdentities = () => persistFile(IDENT_FILE, identities, 'identity');
-
-setInterval(persist, 10000).unref();
 
 let seq = 0;
 function nextId() {
@@ -165,8 +125,17 @@ function verifySignature(nonceB64, signatureB64, signPublicKeyB64) {
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
+    const st = store.stats();
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, online: online.size, queued: queues.size, relays: relayDir.length }));
+    res.end(
+      JSON.stringify({
+        ok: true,
+        online: online.size,
+        queued: st.usersQueued,
+        messages: st.totalQueued,
+        relays: relayDir.length,
+      })
+    );
     return;
   }
   // Публичный каталог релеев — любой (клиент или другой релей) может забрать его
@@ -207,7 +176,7 @@ function send(ws, obj) {
 // Re-send everything still queued for pubkey (nothing is deleted until the
 // recipient acks each id with `received`). Safe to call on every (re)connect.
 function flushQueue(pubkey, ws) {
-  const q = queues.get(pubkey) || [];
+  const q = store.queueFor(pubkey);
   for (const item of q) send(ws, { type: 'message', id: item.id, envelope: item.envelope });
   return q.length;
 }
@@ -215,11 +184,7 @@ function flushQueue(pubkey, ws) {
 function deliver(from, to, envelope, silent, callPush) {
   const id = nextId();
   // Always enqueue; the copy is removed only when the recipient acks (received).
-  const q = queues.get(to) || [];
-  if (q.length >= MAX_QUEUE_PER_USER) q.shift();
-  q.push({ id, from, envelope, silent, callPush });
-  queues.set(to, q);
-  persist();
+  store.enqueue({ id, to, from, envelope, silent, callPush, ts: Date.now(), maxPerUser: MAX_QUEUE_PER_USER });
 
   const ws = online.get(to);
   if (ws) {
@@ -228,12 +193,9 @@ function deliver(from, to, envelope, silent, callPush) {
   }
 
   // recipient offline -> maybe wake them
-  const token = pushTokens.get(to);
+  const token = store.getToken(to);
   const onInvalid = (r) => {
-    if (r === 'invalid') {
-      pushTokens.delete(to);
-      persistTokens();
-    }
+    if (r === 'invalid') store.delToken(to);
   };
 
   if (callPush) {
@@ -248,16 +210,11 @@ function deliver(from, to, envelope, silent, callPush) {
 // Recipient confirmed receipt of `id`: drop it from their queue and tell the
 // original sender (if online) that it was delivered.
 function ackReceived(recipientPubkey, id) {
-  const q = queues.get(recipientPubkey);
-  if (!q) return;
-  const idx = q.findIndex((item) => item.id === id);
-  if (idx < 0) return;
-  const [item] = q.splice(idx, 1);
-  if (q.length === 0) queues.delete(recipientPubkey);
-  else queues.set(recipientPubkey, q);
-  persist();
-  const senderWs = item.from && online.get(item.from);
-  if (senderWs) send(senderWs, { type: 'delivered', id });
+  const from = store.ack(recipientPubkey, id); // from_pk, либо null если нет/не его
+  if (from) {
+    const senderWs = online.get(from);
+    if (senderWs) send(senderWs, { type: 'delivered', id });
+  }
 }
 
 function rateLimited(ws) {
@@ -325,7 +282,7 @@ wss.on('connection', (ws) => {
         return send(ws, { type: 'error', error: 'auth requires signature' });
       }
       // TOFU: the signPublicKey bound to this pubkey must not change.
-      const boundSpk = identities.get(ws.pendingPubkey);
+      const boundSpk = store.getSignKey(ws.pendingPubkey);
       const spk = boundSpk || ws.pendingSpk;
       if (boundSpk && boundSpk !== ws.pendingSpk) {
         return send(ws, { type: 'error', error: 'pubkey bound to a different key' });
@@ -333,10 +290,7 @@ wss.on('connection', (ws) => {
       if (!verifySignature(ws.nonce, msg.signature, spk)) {
         return send(ws, { type: 'error', error: 'bad signature' });
       }
-      if (!boundSpk) {
-        identities.set(ws.pendingPubkey, ws.pendingSpk);
-        persistIdentities();
-      }
+      if (!boundSpk) store.bindSignKey(ws.pendingPubkey, ws.pendingSpk);
       // authenticated: take ownership of this pubkey
       ws.authed = true;
       ws.pubkey = ws.pendingPubkey;
@@ -362,6 +316,12 @@ wss.on('connection', (ws) => {
       return send(ws, { type: 'relays', relays: relayDir });
     }
 
+    // App-level liveness: клиент шлёт ping, чтобы отличить живое соединение от
+    // «тихо зависшего» при смене сети (WS-фреймы ping ему не видны из JS).
+    if (msg.type === 'ping') {
+      return send(ws, { type: 'pong' });
+    }
+
     // --- everything past here requires authentication ---
     if (!ws.authed) return send(ws, { type: 'error', error: 'not authenticated' });
 
@@ -371,8 +331,7 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'register') {
       if (typeof msg.pushToken === 'string' && msg.pushToken) {
-        pushTokens.set(ws.pubkey, msg.pushToken);
-        persistTokens();
+        store.setToken(ws.pubkey, msg.pushToken);
       }
       return send(ws, { type: 'registered' });
     }
@@ -473,8 +432,22 @@ setInterval(() => {
   }
 }, 30000).unref();
 
-process.on('SIGTERM', () => { persist(); persistRelayDir(); process.exit(0); });
-process.on('SIGINT', () => { persist(); persistRelayDir(); process.exit(0); });
+// TTL: периодически чистим протухшие конверты (не забрали за QUEUE_TTL_MS).
+setInterval(() => {
+  try {
+    const removed = store.expireOlderThan(Date.now() - QUEUE_TTL_MS);
+    if (removed) console.log(`[ttl] expired ${removed} stale envelope(s)`);
+  } catch (e) {}
+}, 3600 * 1000).unref();
+
+function shutdown() {
+  try {
+    store.close();
+  } catch (e) {}
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 server.listen(PORT, () => {
   console.log(`Лично relay listening on :${PORT} (health: /health, directory: /relays)`);
