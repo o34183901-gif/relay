@@ -1,0 +1,37 @@
+name: Build relay image
+
+# Собирает и публикует Docker-образ релея в GitHub Container Registry при каждом
+# коммите в main. Операторы могут тянуть готовый образ вместо локальной сборки:
+#   image: ghcr.io/o34183901-gif/relay:latest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'relay.js'
+      - 'relays.js'
+      - 'push.js'
+      - 'package.json'
+      - 'Dockerfile'
+      - '.github/workflows/image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/relay:latest

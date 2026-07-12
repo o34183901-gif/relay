@@ -1,0 +1,19 @@
+{
+  "name": "licno-relay",
+  "version": "0.1.0",
+  "description": "Store-and-forward WebSocket relay for the Лично messenger. Sees only ciphertext.",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.1",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

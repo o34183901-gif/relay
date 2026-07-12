@@ -1,0 +1,60 @@
+# Релей «Лично» одной командой:  docker compose up -d
+#
+# Перед запуском скопируйте .env.example -> .env и заполните три строки
+# (RELAY_HOST, RELAY_SELF_URL, RELAY_PEERS). Caddy сам получит TLS-сертификат
+# Let's Encrypt для RELAY_HOST, так что приложение сразу видит рабочий wss://.
+#
+# Звонки (TURN) — по желанию:  docker compose --profile calls up -d
+# (тогда заполните ещё TURN_SECRET и TURN_HOST в .env).
+
+services:
+  relay:
+    build: .
+    # Альтернатива сборке — готовый образ:
+    # image: ghcr.io/o34183901-gif/relay:latest
+    restart: unless-stopped
+    environment:
+      RELAY_SELF_URL: ${RELAY_SELF_URL}
+      RELAY_PEERS: ${RELAY_PEERS:-}
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_HOST: ${TURN_HOST:-}
+    volumes:
+      - relay-data:/data
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [relay]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RELAY_HOST: ${RELAY_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # TURN-сервер для звонков за строгим NAT. Включается профилем "calls".
+  coturn:
+    image: coturn/coturn:latest
+    profiles: ["calls"]
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - -n
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:-changeme}
+      - --realm=licno
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --min-port=49160
+      - --max-port=49200
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

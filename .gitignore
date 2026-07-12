@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.log
+
+# Рантайм-данные релея
+queue.json
+relays.json
+push-tokens.json
+identities.json
+turn-secret
+
+# FCM-ключ — СЕКРЕТ, не коммитить
+service-account.json
