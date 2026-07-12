@@ -101,8 +101,20 @@ const AUTH_TIMEOUT_MS = 10000; // must authenticate within this window
 const RATE_WINDOW_MS = 1000;
 const RATE_MAX_FRAMES = 80; // frames per RATE_WINDOW_MS before we drop the socket
 
+// Resource limits (H4): защита узла от исчерпания ресурсов при абузе/DoS.
+const MAX_CONN_PER_IP = Number(process.env.RELAY_MAX_CONN_PER_IP) || 100; // одновременных соединений с одного IP
+const MAX_BUFFERED_BYTES = Number(process.env.RELAY_MAX_BUFFERED) || 64 * 1024 * 1024; // если клиент не читает и буфер сокета раздулся — рвём
+
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
 const online = new Map();
+// ip -> число активных соединений (за Caddy берём X-Forwarded-For)
+const ipConns = new Map();
+
+function clientIp(req) {
+  const xff = req && req.headers && req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return (req && req.socket && req.socket.remoteAddress) || 'unknown';
+}
 
 let seq = 0;
 function nextId() {
@@ -227,7 +239,19 @@ function rateLimited(ws) {
   return ws.rateCount > RATE_MAX_FRAMES;
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // H4: per-IP лимит одновременных соединений (защита от коннект-флуда).
+  const ip = clientIp(req);
+  const nConn = (ipConns.get(ip) || 0) + 1;
+  if (nConn > MAX_CONN_PER_IP) {
+    try {
+      send(ws, { type: 'error', error: 'too many connections' });
+    } catch (e) {}
+    return ws.terminate();
+  }
+  ipConns.set(ip, nConn);
+  ws.ip = ip;
+
   ws.isAlive = true;
   ws.authed = false;
   ws.pubkey = null;
@@ -358,6 +382,11 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clearTimeout(ws.authTimer);
+    if (ws.ip) {
+      const c = (ipConns.get(ws.ip) || 1) - 1;
+      if (c <= 0) ipConns.delete(ws.ip);
+      else ipConns.set(ws.ip, c);
+    }
     if (ws.pubkey && online.get(ws.pubkey) === ws) online.delete(ws.pubkey);
   });
 });
@@ -420,9 +449,14 @@ if (SELF_URL || PEER_SEED.length) {
   }, GOSSIP_INTERVAL_MS).unref();
 }
 
-// drop dead connections
+// drop dead connections + backpressure (H4): рвём сокеты, чей буфер отправки
+// раздулся (клиент не вычитывает) — иначе они держат память узла.
 setInterval(() => {
   for (const ws of wss.clients) {
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      ws.terminate();
+      continue;
+    }
     if (!ws.isAlive) {
       ws.terminate();
       continue;
