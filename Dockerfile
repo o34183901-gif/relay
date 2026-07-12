@@ -23,7 +23,8 @@ RUN npm install --omit=dev && npm cache clean --force
 # Затем код релея (без клиентских исходников).
 COPY relay.js relays.js store.js push.js ./
 
-# Рантайм-данные (SQLite-БД релея) — в томе, чтобы переживали рестарт.
+# Рантайм-данные (SQLite-БД релея + крупные вложения в /data/blobs) — в томе,
+# чтобы переживали рестарт.
 ENV RELAY_DB=/data/relay.db \
     PORT=8787
 VOLUME ["/data"]

@@ -10,6 +10,7 @@ on:
     paths:
       - 'relay.js'
       - 'relays.js'
+      - 'store.js'
       - 'push.js'
       - 'package.json'
       - 'Dockerfile'

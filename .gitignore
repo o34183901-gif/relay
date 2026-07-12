@@ -6,6 +6,7 @@ node_modules/
 relay.db
 relay.db-wal
 relay.db-shm
+blobs/
 queue.json
 relays.json
 push-tokens.json

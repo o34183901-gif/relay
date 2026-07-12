@@ -67,8 +67,17 @@ const PORT = process.env.PORT || 8787;
 const DB_FILE = process.env.RELAY_DB || path.join(__dirname, 'relay.db');
 const MAX_QUEUE_PER_USER = 500;
 const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
+// Тела конвертов крупнее порога (вложения) лежат файлами рядом с БД (тот же
+// volume), в очереди — только ссылка: БД остаётся маленькой и быстрой при
+// потоке фото/видео офлайн-получателям.
+const BLOB_DIR = process.env.RELAY_BLOB_DIR || path.join(path.dirname(DB_FILE), 'blobs');
+const BLOB_THRESHOLD = Number(process.env.RELAY_BLOB_THRESHOLD) || 64 * 1024;
 
-const store = createStore(DB_FILE);
+const store = createStore(DB_FILE, { blobDir: BLOB_DIR, blobThreshold: BLOB_THRESHOLD });
+{
+  const orphans = store.cleanupOrphanBlobs();
+  if (orphans) console.log(`[blobs] removed ${orphans} orphan attachment file(s)`);
+}
 
 // --- Реплицированный каталог релеев (gossip) ------------------------------
 // SELF_URL — публичный wss-адрес ЭТОГО релея; RELAY_PEERS — стартовые соседи
