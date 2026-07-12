@@ -102,7 +102,12 @@ const RATE_WINDOW_MS = 1000;
 const RATE_MAX_FRAMES = 80; // frames per RATE_WINDOW_MS before we drop the socket
 
 // Resource limits (H4): защита узла от исчерпания ресурсов при абузе/DoS.
-const MAX_CONN_PER_IP = Number(process.env.RELAY_MAX_CONN_PER_IP) || 100; // одновременных соединений с одного IP
+// ВАЖНО: мобильные операторы прячут тысячи абонентов за одним IP (CGNAT),
+// поэтому per-IP лимит — грубый предохранитель от одиночного хоста, а не от
+// «многих пользователей». Держим его высоким, чтобы не рубить легитимных
+// пользователей за общим NAT; тонкую защиту дают auth-timeout, rate-limit на
+// соединение и квота очереди на pubkey. Оператор может поднять/опустить через env.
+const MAX_CONN_PER_IP = Number(process.env.RELAY_MAX_CONN_PER_IP) || 1000; // одновременных соединений с одного IP
 const MAX_BUFFERED_BYTES = Number(process.env.RELAY_MAX_BUFFERED) || 64 * 1024 * 1024; // если клиент не читает и буфер сокета раздулся — рвём
 
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
