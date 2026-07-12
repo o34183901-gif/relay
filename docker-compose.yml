@@ -1,11 +1,12 @@
 # Релей «Лично» одной командой:  docker compose up -d
 #
-# Перед запуском скопируйте .env.example -> .env и заполните три строки
-# (RELAY_HOST, RELAY_SELF_URL, RELAY_PEERS). Caddy сам получит TLS-сертификат
-# Let's Encrypt для RELAY_HOST, так что приложение сразу видит рабочий wss://.
+# Перед запуском скопируйте .env.example -> .env и заполните его. Caddy сам
+# получит TLS-сертификат Let's Encrypt для RELAY_HOST, так что приложение сразу
+# видит рабочий wss://. Звонки (TURN) включены по умолчанию — coturn поднимается
+# вместе с релеем.
 #
-# Звонки (TURN) — по желанию:  docker compose --profile calls up -d
-# (тогда заполните ещё TURN_SECRET и TURN_HOST в .env).
+# Все сервисы имеют restart: unless-stopped и поднимаются автоматически после
+# перезагрузки сервера (Docker включён в автозапуск systemd).
 
 services:
   relay:
@@ -16,8 +17,8 @@ services:
     environment:
       RELAY_SELF_URL: ${RELAY_SELF_URL}
       RELAY_PEERS: ${RELAY_PEERS:-}
-      TURN_SECRET: ${TURN_SECRET:-}
-      TURN_HOST: ${TURN_HOST:-}
+      TURN_SECRET: ${TURN_SECRET}
+      TURN_HOST: ${TURN_HOST}
     volumes:
       - relay-data:/data
     expose:
@@ -37,17 +38,20 @@ services:
       - caddy-data:/data
       - caddy-config:/config
 
-  # TURN-сервер для звонков за строгим NAT. Включается профилем "calls".
+  # TURN-сервер для звонков (обязателен: гарантирует соединение за строгим NAT).
+  # network_mode: host — coturn слушает 3478 и диапазон 49160-49200/udp прямо на
+  # хосте; эти порты нужно открыть в firewall (см. README).
   coturn:
     image: coturn/coturn:latest
-    profiles: ["calls"]
     network_mode: host
     restart: unless-stopped
     command:
       - -n
       - --use-auth-secret
-      - --static-auth-secret=${TURN_SECRET:-changeme}
+      - --static-auth-secret=${TURN_SECRET}
       - --realm=licno
+      - --listening-port=3478
+      - --external-ip=${TURN_HOST}
       - --no-tls
       - --no-dtls
       - --no-cli
