@@ -182,6 +182,13 @@ function metricsAuthorized(req) {
 const online = new Map();
 // ip -> число активных соединений (за Caddy берём X-Forwarded-For)
 const ipConns = new Map();
+// pubkey -> время последнего message-пуша (троттлинг уведомлений)
+const PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_PUSH_INTERVAL_MS) || 20000;
+const lastPushAt = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 10 * PUSH_MIN_INTERVAL_MS;
+  for (const [pk, t] of lastPushAt) if (t < cutoff) lastPushAt.delete(pk);
+}, 60000).unref();
 
 function clientIp(req) {
   const xff = req && req.headers && req.headers['x-forwarded-for'];
@@ -323,7 +330,12 @@ function deliver(from, to, envelope, silent, callPush) {
     return { queued: true, id };
   }
   if (silent) return { queued: true, id }; // control message: deliver, no push
-  if (token) {
+  // Троттлинг: не чаще одного message-пуша получателю за PUSH_MIN_INTERVAL_MS.
+  // Дубли одного сообщения (веер по релеям от старых клиентов) и бурсты
+  // сообщений не превращаются в очередь уведомлений; на устройстве они и так
+  // схлопываются по tag (см. push.js), это экономит и запросы к FCM.
+  if (token && Date.now() - (lastPushAt.get(to) || 0) >= PUSH_MIN_INTERVAL_MS) {
+    lastPushAt.set(to, Date.now());
     counters.pushes += 1;
     sendPush(token).then(onInvalid);
   }

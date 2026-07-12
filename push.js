@@ -104,7 +104,10 @@ async function sendPush(token) {
   return fcmSend({
     token,
     notification: { title: 'Лично', body: 'Новое зашифрованное сообщение' },
-    android: { priority: 'HIGH', notification: { channel_id: 'messages' } },
+    // tag: одинаковый у всех message-пушей — новое уведомление ЗАМЕНЯЕТ
+    // предыдущее на устройстве, а не добавляется рядом. Даже если дубли
+    // придут с нескольких релеев, пользователь увидит одно уведомление.
+    android: { priority: 'HIGH', notification: { channel_id: 'messages', tag: 'new-message' } },
     data: { type: 'message' },
   });
 }
