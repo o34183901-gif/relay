@@ -43,6 +43,10 @@ function createStore(dbPath, opts = {}) {
     CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS push_tokens (pk TEXT PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS directory   (url TEXT PRIMARY KEY, last_seen INTEGER);
+    -- X3DH: публичные prekey пользователей (подписанный + одноразовые).
+    -- Релей хранит ТОЛЬКО публичные половинки; расшифровать ими ничего нельзя.
+    CREATE TABLE IF NOT EXISTS prekeys_spk (pk TEXT PRIMARY KEY, id TEXT NOT NULL, pub TEXT NOT NULL, sig TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS prekeys_otp (pk TEXT NOT NULL, id TEXT NOT NULL, pub TEXT NOT NULL, PRIMARY KEY (pk, id));
   `);
   // Миграция существующих БД: колонка blob (1 = тело лежит файлом в blobDir).
   const hasBlobCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='blob'").get().c;
@@ -115,6 +119,17 @@ function createStore(dbPath, opts = {}) {
     all: db.prepare('SELECT url FROM directory ORDER BY last_seen DESC'),
     upsert: db.prepare('INSERT OR REPLACE INTO directory (url,last_seen) VALUES (?,?)'),
     count: db.prepare('SELECT count(*) c FROM directory'),
+  };
+  const spk = {
+    get: db.prepare('SELECT id, pub, sig FROM prekeys_spk WHERE pk=?'),
+    set: db.prepare('INSERT OR REPLACE INTO prekeys_spk (pk,id,pub,sig) VALUES (?,?,?,?)'),
+  };
+  const otp = {
+    insert: db.prepare('INSERT OR IGNORE INTO prekeys_otp (pk,id,pub) VALUES (?,?,?)'),
+    delAll: db.prepare('DELETE FROM prekeys_otp WHERE pk=?'),
+    takeOne: db.prepare('SELECT id, pub FROM prekeys_otp WHERE pk=? LIMIT 1'),
+    delOne: db.prepare('DELETE FROM prekeys_otp WHERE pk=? AND id=?'),
+    count: db.prepare('SELECT count(*) c FROM prekeys_otp WHERE pk=?'),
   };
 
   return {
@@ -195,6 +210,34 @@ function createStore(dbPath, opts = {}) {
     },
     delToken(pk) {
       tok.del.run(pk);
+    },
+
+    // --- X3DH prekeys (только публичные половинки) ---------------------------
+    /** Сохранить/заменить подписанный prekey пользователя. */
+    setSpk(pk, s) {
+      spk.set.run(pk, s.id, s.pub, s.sig);
+    },
+    getSpk(pk) {
+      const r = spk.get.get(pk);
+      return r ? { id: r.id, pub: r.pub, sig: r.sig } : null;
+    },
+    /** Заменить набор одноразовых prekey пользователя свежей пачкой. */
+    replaceOtps(pk, list) {
+      const tx = db.transaction((items) => {
+        otp.delAll.run(pk);
+        for (const k of items) otp.insert.run(pk, k.id, k.pub);
+      });
+      tx(list);
+    },
+    /** Выдать ОДИН одноразовый prekey и навсегда вычеркнуть его. */
+    takeOtp(pk) {
+      const r = otp.takeOne.get(pk);
+      if (!r) return null;
+      otp.delOne.run(pk, r.id);
+      return { id: r.id, pub: r.pub };
+    },
+    countOtps(pk) {
+      return otp.count.get(pk).c;
     },
 
     // --- relay directory ----------------------------------------------------

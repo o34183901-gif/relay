@@ -12,6 +12,12 @@
  *   client -> server  {"type":"auth","signature":"<b64>"}
  *       подпись nonce ключом Ed25519 — доказательство владения pubkey
  *   server -> client  {"type":"ready","queued":N}       — после успешной auth
+ *   client -> server  {"type":"prekeys-put","bundle":{spk:{id,pub,sig},opks:[{id,pub}]}}
+ *       выгрузка СВОИХ публичных X3DH-prekey (sig сверяется с TOFU-ключом)
+ *   server -> client  {"type":"prekeys-ok","otps":N}
+ *   client -> server  {"type":"prekeys-get","pubkey":"<b64>"}
+ *   server -> client  {"type":"prekeys","pubkey":"...","bundle":{spk,opk}|null}
+ *       одноразовый prekey выдаётся ровно один раз и вычёркивается
  *   client -> server  {"type":"send","to":"<b64>","envelope":{...},"ref":"..."}
  *   server -> client  {"type":"ack","ref":"...","id":"...","queued":bool}
  *   server -> client  {"type":"message","id":"...","envelope":{...}}
@@ -142,6 +148,24 @@ function verifySignature(nonceB64, signatureB64, signPublicKeyB64) {
     return nacl.sign.detached.verify(
       naclUtil.decodeBase64(nonceB64),
       naclUtil.decodeBase64(signatureB64),
+      naclUtil.decodeBase64(signPublicKeyB64)
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+// --- X3DH prekeys ----------------------------------------------------------
+// Формат подписи SPK должен совпадать с клиентским (src/crypto.js).
+const SPK_SIG_PREFIX = 'licno-spk-v1|';
+const MAX_OTPS_PER_USER = 100;
+const isB64Field = (s, max = 128) => typeof s === 'string' && s.length > 0 && s.length <= max;
+
+function verifySpkSignature(spkObj, signPublicKeyB64) {
+  try {
+    return nacl.sign.detached.verify(
+      naclUtil.decodeUTF8(SPK_SIG_PREFIX + spkObj.id + '|' + spkObj.pub),
+      naclUtil.decodeBase64(spkObj.sig),
       naclUtil.decodeBase64(signPublicKeyB64)
     );
   } catch (e) {
@@ -339,7 +363,9 @@ wss.on('connection', (ws, req) => {
       if (prev && prev !== ws) try { prev.terminate(); } catch (e) {}
       online.set(ws.pubkey, ws);
       const flushed = flushQueue(ws.pubkey, ws);
-      return send(ws, { type: 'ready', queued: flushed });
+      // prekeys: сколько одноразовых prekey клиента осталось у этого релея —
+      // клиент по этому числу решает, пора ли выгрузить свежую пачку.
+      return send(ws, { type: 'ready', queued: flushed, prekeys: store.countOtps(ws.pubkey) });
     }
 
     // --- relay directory (public: allowed before auth for bootstrap) ---
@@ -365,6 +391,40 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'turn') {
       return send(ws, { type: 'turn', iceServers: turnIceServers() });
+    }
+
+    if (msg.type === 'prekeys-put') {
+      // Выгрузка СВОИХ публичных X3DH-prekey. Подпись SPK сверяется с TOFU-ключом
+      // этого соединения — чужие/битые бандлы не сохраняются.
+      const b = msg.bundle || {};
+      const spkObj = b.spk;
+      if (!spkObj || !isB64Field(spkObj.id, 32) || !isB64Field(spkObj.pub) || !isB64Field(spkObj.sig)) {
+        return send(ws, { type: 'error', error: 'prekeys-put requires bundle.spk {id,pub,sig}' });
+      }
+      const boundSpkKey = store.getSignKey(ws.pubkey);
+      if (!boundSpkKey || !verifySpkSignature(spkObj, boundSpkKey)) {
+        return send(ws, { type: 'error', error: 'bad prekey signature' });
+      }
+      const opks = (Array.isArray(b.opks) ? b.opks : [])
+        .filter((k) => k && isB64Field(k.id, 32) && isB64Field(k.pub))
+        .slice(0, MAX_OTPS_PER_USER)
+        .map((k) => ({ id: k.id, pub: k.pub }));
+      store.setSpk(ws.pubkey, { id: spkObj.id, pub: spkObj.pub, sig: spkObj.sig });
+      store.replaceOtps(ws.pubkey, opks);
+      return send(ws, { type: 'prekeys-ok', otps: store.countOtps(ws.pubkey) });
+    }
+
+    if (msg.type === 'prekeys-get') {
+      // Бандл prekey получателя для X3DH: SPK + один одноразовый (выдаётся
+      // РОВНО один раз). Публичные данные; подпись клиент сверяет сам с ключом,
+      // закреплённым при QR-знакомстве, — релею верить не обязан.
+      if (typeof msg.pubkey !== 'string' || !msg.pubkey) {
+        return send(ws, { type: 'error', error: 'prekeys-get requires pubkey' });
+      }
+      const spkRec = store.getSpk(msg.pubkey);
+      if (!spkRec) return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: null });
+      const opk = store.takeOtp(msg.pubkey);
+      return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: { spk: spkRec, opk } });
     }
 
     if (msg.type === 'register') {
