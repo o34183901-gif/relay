@@ -40,6 +40,7 @@ function createStore(dbPath, opts = {}) {
       ts        INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_queue_to ON queue(to_pk, ts);
+    CREATE INDEX IF NOT EXISTS idx_queue_from_to ON queue(from_pk, to_pk, ts);
     CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL, proven INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS push_tokens (pk TEXT PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS directory   (url TEXT PRIMARY KEY, last_seen INTEGER);
@@ -51,6 +52,11 @@ function createStore(dbPath, opts = {}) {
   // Миграция существующих БД: колонка blob (1 = тело лежит файлом в blobDir).
   const hasBlobCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='blob'").get().c;
   if (!hasBlobCol) db.exec('ALTER TABLE queue ADD COLUMN blob INTEGER DEFAULT 0');
+  // S4: колонка bytes — размер конверта (тело в БД либо файл-blob). Нужна для
+  // байтового потолка очереди и O(1)-учёта веса (см. liveBytes ниже). Старые
+  // строки получают bytes=0 и добиваются реальным размером при старте (backfill).
+  const hasBytesCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='bytes'").get().c;
+  if (!hasBytesCol) db.exec('ALTER TABLE queue ADD COLUMN bytes INTEGER DEFAULT 0');
   // Миграция (H-6): колонка proven — доказано ли владение box-ключом для этой
   // связки pk→sign_pk (см. relay.js: ECDH-proof). Старые связки остаются
   // proven=0 (легаси-совместимость), новые клиенты помечают их proven=1.
@@ -69,26 +75,35 @@ function createStore(dbPath, opts = {}) {
       fs.unlinkSync(blobPath(mid));
     } catch (e) {}
   }
+  // Удалить строку очереди и синхронно поправить счётчики веса/количества.
+  // r ДОЛЖЕН содержать поле bytes (все запросы, чьи строки сюда попадают,
+  // выбирают bytes): byId/forUser — через SELECT *, oldest* — явно.
   function dropRow(r) {
     q.delId.run(r.id);
     if (r.blob) unlinkBlob(r.id);
+    liveCount = Math.max(0, liveCount - 1);
+    liveBytes = Math.max(0, liveBytes - (r.bytes || 0));
   }
 
   const q = {
     insert: db.prepare(
-      'INSERT OR REPLACE INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob) VALUES (?,?,?,?,?,?,?,?)'
+      'INSERT OR REPLACE INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob,bytes) VALUES (?,?,?,?,?,?,?,?,?)'
     ),
     forUser: db.prepare('SELECT * FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     countFor: db.prepare('SELECT count(*) c FROM queue WHERE to_pk=?'),
-    oldestFor: db.prepare('SELECT id, blob FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
-    oldestGlobal: db.prepare('SELECT id, blob FROM queue ORDER BY ts ASC LIMIT 1'),
+    countFromTo: db.prepare('SELECT count(*) c FROM queue WHERE from_pk=? AND to_pk=?'),
+    oldestFor: db.prepare('SELECT id, blob, bytes FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
+    oldestFromTo: db.prepare('SELECT id, blob, bytes FROM queue WHERE from_pk=? AND to_pk=? ORDER BY ts ASC LIMIT 1'),
+    oldestGlobal: db.prepare('SELECT id, blob, bytes FROM queue ORDER BY ts ASC LIMIT 1'),
     byId: db.prepare('SELECT * FROM queue WHERE id=?'),
     delId: db.prepare('DELETE FROM queue WHERE id=?'),
     blobsOlder: db.prepare('SELECT id FROM queue WHERE blob=1 AND ts < ?'),
     blobIds: db.prepare('SELECT id FROM queue WHERE blob=1'),
     usersQueued: db.prepare('SELECT count(DISTINCT to_pk) c FROM queue'),
     totalQueued: db.prepare('SELECT count(*) c FROM queue'),
-    dbBytes: db.prepare('SELECT coalesce(sum(length(envelope)),0) c FROM queue'),
+    sumBytes: db.prepare('SELECT coalesce(sum(bytes),0) c FROM queue'),
+    needBackfill: db.prepare('SELECT id, blob FROM queue WHERE bytes=0'),
+    setBytes: db.prepare('UPDATE queue SET bytes=? WHERE id=?'),
     expire: db.prepare('DELETE FROM queue WHERE ts < ?'),
   };
   // null — если тело-файл пропал (например, volume почистили руками): такая
@@ -113,10 +128,29 @@ function createStore(dbPath, opts = {}) {
     };
   };
 
-  // H-3: глобальный счётчик строк очереди (по всем получателям сразу). Держим в
-  // памяти и синхронно обновляем при вставке/удалении — чтобы enqueue мог за O(1)
-  // проверить общий потолок, не сканируя таблицу на каждый кадр.
+  // Backfill bytes для строк из старых БД (bytes=0): db-строки — длина envelope,
+  // blob-строки — размер файла на диске. Разовая работа при старте; без неё учёт
+  // liveBytes «поплыл» бы при вытеснении таких строк (dropRow вычитал бы 0).
+  for (const r of q.needBackfill.all()) {
+    let b = 0;
+    if (r.blob) {
+      try {
+        b = fs.statSync(blobPath(r.id)).size;
+      } catch (e) {
+        b = 0;
+      }
+    } else {
+      const row = q.byId.get(r.id);
+      b = row ? Buffer.byteLength(row.envelope || '') : 0;
+    }
+    if (b > 0) q.setBytes.run(b, r.id);
+  }
+
+  // H-3/S4: глобальные счётчики очереди — по числу строк И по байтам (тела в БД +
+  // файлы-blob). Держим в памяти и синхронно обновляем при вставке/удалении, чтобы
+  // enqueue и /metrics работали за O(1), не сканируя таблицу/каталог на каждый кадр.
   let liveCount = q.totalQueued.get().c;
+  let liveBytes = q.sumBytes.get().c;
 
   const id = {
     get: db.prepare('SELECT sign_pk, proven FROM identities WHERE pk=?'),
@@ -151,32 +185,45 @@ function createStore(dbPath, opts = {}) {
      * Положить конверт в очередь получателя; при переполнении вытеснить старейший.
      * Тело крупнее blobThreshold уходит файлом в blobDir — в БД только ссылка.
      */
-    enqueue({ id: mid, to, from, envelope, silent, callPush, ts, maxPerUser, maxTotal }) {
-      // Потолок на получателя: вытесняем его же старейший конверт.
-      if (maxPerUser && q.countFor.get(to).c >= maxPerUser) {
-        const o = q.oldestFor.get(to);
-        if (o) {
-          dropRow(o);
-          liveCount = Math.max(0, liveCount - 1);
-        }
+    enqueue({ id: mid, to, from, envelope, silent, callPush, ts, maxPerUser, maxPerSender, maxTotal, maxTotalBytes }) {
+      const envJson = JSON.stringify(envelope);
+      const bytes = Buffer.byteLength(envJson);
+
+      // S5: квота на пару (отправитель→получатель). Один отправитель не может
+      // занять в очереди получателя больше maxPerSender конвертов — при
+      // переполнении вытесняется ЕГО ЖЕ старейший (self-eviction). Это закрывает
+      // таргетированную цензуру: флудер, зная адрес жертвы, больше не выдавит её
+      // реальные сообщения (от других отправителей) — ротирует только свой спам.
+      if (maxPerSender && from && q.countFromTo.get(from, to).c >= maxPerSender) {
+        const o = q.oldestFromTo.get(from, to);
+        if (o) dropRow(o);
       }
-      // H-3: ГЛОБАЛЬНЫЙ потолок (по всем получателям). Без него один
-      // аутентифицированный клиент мог засыпать очередь конвертами на миллионы
-      // случайных адресов (≤maxPerUser на каждый) и переполнить диск. При
-      // превышении вытесняем самый старый конверт во всей очереди (FIFO).
-      if (maxTotal) {
-        while (liveCount >= maxTotal) {
+      // Потолок на получателя (вторичный): вытесняем старейший конверт. Если
+      // отправитель известен — вытесняем ЕГО ЖЕ старейший, чтобы и здесь флудер не
+      // трогал чужие сообщения; иначе (легаси без from) — глобально старейший у to.
+      if (maxPerUser && q.countFor.get(to).c >= maxPerUser) {
+        const o = (from && q.oldestFromTo.get(from, to)) || q.oldestFor.get(to);
+        if (o) dropRow(o);
+      }
+      // S4/H-3: ГЛОБАЛЬНЫЕ потолки — по числу И по байтам. Без байтового лимита
+      // один клиент мог засыпать очередь крупными блобами (до 32 МБ) на разные
+      // адреса и переполнить диск volume: count-лимит при этом не срабатывал
+      // никогда. При превышении вытесняем самый старый конверт во всей очереди.
+      if (maxTotal || maxTotalBytes) {
+        while (
+          (maxTotal && liveCount >= maxTotal) ||
+          (maxTotalBytes && liveBytes + bytes > maxTotalBytes)
+        ) {
           const o = q.oldestGlobal.get();
           if (!o) break;
           dropRow(o);
-          liveCount = Math.max(0, liveCount - 1);
         }
       }
-      const envJson = JSON.stringify(envelope);
-      const asBlob = blobDir && Buffer.byteLength(envJson) > blobThreshold;
+      const asBlob = blobDir && bytes > blobThreshold;
       if (asBlob) writeBlob(mid, envJson);
-      q.insert.run(mid, to, from || null, asBlob ? '' : envJson, silent ? 1 : 0, callPush ? 1 : 0, ts, asBlob ? 1 : 0);
+      q.insert.run(mid, to, from || null, asBlob ? '' : envJson, silent ? 1 : 0, callPush ? 1 : 0, ts, asBlob ? 1 : 0, bytes);
       liveCount += 1;
+      liveBytes += bytes;
     },
     /** Все конверты, ждущие получателя (в порядке поступления). */
     queueFor(to) {
@@ -191,15 +238,15 @@ function createStore(dbPath, opts = {}) {
       const r = q.byId.get(mid);
       if (!r || r.to_pk !== to) return null;
       dropRow(r);
-      liveCount = Math.max(0, liveCount - 1);
       return r.from_pk || null;
     },
     /** Удалить всё старше `cutoffTs` (TTL). Вернуть число удалённых. */
     expireOlderThan(cutoffTs) {
       for (const r of q.blobsOlder.all(cutoffTs)) unlinkBlob(r.id);
       const removed = q.expire.run(cutoffTs).changes;
-      // массовое удаление — пересчитываем глобальный счётчик из БД (раз в час, дёшево).
+      // массовое удаление — пересчитываем глобальные счётчики из БД (раз в час, дёшево).
       liveCount = q.totalQueued.get().c;
+      liveBytes = q.sumBytes.get().c;
       return removed;
     },
     /**
@@ -310,26 +357,13 @@ function createStore(dbPath, opts = {}) {
       };
     },
     /**
-     * Сколько байт занимает очередь: тела в БД + blob-файлы на диске.
-     * Для /metrics — оператор видит реальный «вес» недоставленного.
+     * Сколько байт занимает очередь (тела в БД + blob-файлы). M10: раньше это
+     * сканировало ВЕСЬ каталог блобов синхронно на КАЖДЫЙ скрейп /metrics
+     * (readdirSync+statSync), блокируя event-loop при большом числе файлов. Теперь
+     * возвращаем счётчик liveBytes, который поддерживается инкрементально — O(1).
      */
     queueBytes() {
-      let bytes = q.dbBytes.get().c;
-      if (blobDir) {
-        let files;
-        try {
-          files = fs.readdirSync(blobDir);
-        } catch (e) {
-          files = [];
-        }
-        for (const f of files) {
-          if (!f.endsWith('.json')) continue;
-          try {
-            bytes += fs.statSync(path.join(blobDir, f)).size;
-          } catch (e) {}
-        }
-      }
-      return bytes;
+      return liveBytes;
     },
     close() {
       db.close();

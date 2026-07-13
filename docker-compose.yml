@@ -1,39 +1,41 @@
-# Релей «Лично» одной командой:  docker compose up -d
-#
-# Перед запуском скопируйте .env.example -> .env и заполните его. Caddy сам
-# получит TLS-сертификат Let's Encrypt для RELAY_HOST, так что приложение сразу
-# видит рабочий wss://. Звонки (TURN) включены по умолчанию — coturn поднимается
-# вместе с релеем.
-#
-# Все сервисы имеют restart: unless-stopped и поднимаются автоматически после
-# перезагрузки. watchtower авто-обновляет релей при выходе новой версии образа —
-# вручную обновлять каждый сервер не нужно (см. README, раздел «Авто-обновление»).
+# Автономный стек релея «Лично»: релей + Caddy (авто-TLS) + coturn (звонки).
+#   docker compose up -d --build
+# Конфиг и секреты — в .env (см. .env.example / relay-install.sh).
 
 services:
   relay:
-    image: ghcr.io/o34183901-gif/relay:latest
-    # Вместо готового образа можно собирать локально из репозитория, но тогда
-    # авто-обновление watchtower НЕ работает (обновлять придётся git pull +
-    # docker compose up -d --build):
-    # build: .
+    build: .
+    image: licno-relay:latest
     restart: unless-stopped
-    labels:
-      # watchtower обновляет только помеченные контейнеры (наш код)
-      - com.centurylinklabs.watchtower.enable=true
+    security_opt:
+      - no-new-privileges:true
     environment:
+      PORT: "8787"
+      RELAY_DB: /data/relay.db
+      RELAY_BLOB_DIR: /data/blobs
+      RELAY_SIGN_KEY_FILE: /data/relay-sign.key
+      # За Caddy: реальный IP клиента — в конце X-Forwarded-For (один хоп).
+      RELAY_TRUST_PROXY: "1"
       RELAY_SELF_URL: ${RELAY_SELF_URL}
       RELAY_PEERS: ${RELAY_PEERS:-}
-      TURN_SECRET: ${TURN_SECRET}
-      TURN_HOST: ${TURN_HOST}
+      RELAY_GOSSIP_TOKEN: ${RELAY_GOSSIP_TOKEN:-}
+      RELAY_METRICS_TOKEN: ${RELAY_METRICS_TOKEN:-}
+      RELAY_MAX_QUEUE_BYTES: ${RELAY_MAX_QUEUE_BYTES:-8589934592}
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_SECRET: ${TURN_SECRET:-}
+      # FCM (необязательно): положите service-account.json в том /data
+      # (relay-install.sh сделает это сам, если файл лежит рядом).
+      GOOGLE_APPLICATION_CREDENTIALS: /data/service-account.json
     volumes:
       - relay-data:/data
     expose:
       - "8787"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2
     restart: unless-stopped
-    depends_on: [relay]
+    depends_on:
+      - relay
     ports:
       - "80:80"
       - "443:443"
@@ -44,39 +46,23 @@ services:
       - caddy-data:/data
       - caddy-config:/config
 
-  # TURN-сервер для звонков (обязателен: гарантирует соединение за строгим NAT).
-  # network_mode: host — coturn слушает 3478 и диапазон 49160-49200/udp прямо на
-  # хосте; эти порты нужно открыть в firewall (см. README).
+  # TURN нужен реальный публичный IP и диапазон портов — host-сеть.
   coturn:
     image: coturn/coturn:latest
-    network_mode: host
     restart: unless-stopped
+    network_mode: host
     command:
       - -n
       - --use-auth-secret
       - --static-auth-secret=${TURN_SECRET}
       - --realm=licno
       - --listening-port=3478
-      - --external-ip=${TURN_HOST}
-      - --no-tls
-      - --no-dtls
-      - --no-cli
       - --min-port=49160
       - --max-port=49200
-
-  # Авто-обновление: раз в 5 минут проверяет ghcr на новую версию образа релея и
-  # сам пересоздаёт контейнер (данные в volume сохраняются). Так релеи обновляются
-  # сами — достаточно опубликовать новый образ (push в репозиторий relay).
-  watchtower:
-    image: containrrr/watchtower
-    restart: unless-stopped
-    environment:
-      # свежий Docker-демон требует API >= 1.40; иначе watchtower берёт старую
-      # версию (1.25) и падает "client version too old".
-      DOCKER_API_VERSION: "1.40"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 300 --cleanup --label-enable
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --external-ip=${TURN_HOST}
 
 volumes:
   relay-data:

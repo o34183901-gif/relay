@@ -1,5 +1,5 @@
-# Caddy автоматически получает и продлевает TLS-сертификат Let's Encrypt для
-# RELAY_HOST и проксирует шифрованный WebSocket (wss://) на релей внутри сети.
+# Авто-TLS (Let's Encrypt) и проксирование WebSocket на релей.
+# RELAY_HOST берётся из .env (домен или <ip>.sslip.io).
 {$RELAY_HOST} {
 	reverse_proxy relay:8787
 }

@@ -1,36 +1,25 @@
-# Самодостаточный образ релея «Лично». Оператору НЕ нужен весь репозиторий и
-# исходники приложения — только этот образ и пара переменных окружения.
-#
-#   docker run -d --name licno-relay -p 8787:8787 \
-#     -e RELAY_SELF_URL=wss://<ВАШ_HOST> \
-#     -e RELAY_PEERS=wss://89.108.83.230.sslip.io \
-#     -v licno-data:/data \
-#     ghcr.io/o34183901-gif/relay:latest
-#
-# node:20-slim (glibc) + build-tools: better-sqlite3 ставит нативный модуль
-# (prebuild или сборка из исходников) для встроенного хранилища.
-FROM node:20-slim
+# Релей «Лично» в контейнере. Видит только шифртекст; хранит очередь/ключи в
+# томе /data. Собирается автономно (docker compose up -d --build).
+FROM node:20-bookworm-slim
 WORKDIR /app
 
+# better-sqlite3 — нативный модуль; на slim-образе может собираться из исходников,
+# поэтому кладём тулчейн (для платформ без готового prebuild).
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Сначала только манифест — кешируем npm install между сборками.
 COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
-# Затем код релея (без клиентских исходников).
-COPY relay.js relays.js store.js push.js ./
+# Код релея (данные — в томе /data, сюда не копируются).
+COPY relay.js store.js relays.js push.js ./
 
-# Рантайм-данные (SQLite-БД релея + крупные вложения в /data/blobs) — в томе,
-# чтобы переживали рестарт.
-ENV RELAY_DB=/data/relay.db \
-    PORT=8787
-VOLUME ["/data"]
+ENV NODE_ENV=production
+ENV PORT=8787
+ENV RELAY_DB=/data/relay.db
+ENV RELAY_BLOB_DIR=/data/blobs
+ENV RELAY_SIGN_KEY_FILE=/data/relay-sign.key
 EXPOSE 8787
-
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "relay.js"]

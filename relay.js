@@ -38,6 +38,8 @@
  */
 
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -77,6 +79,15 @@ const MAX_QUEUE_PER_USER = 500;
 // получателям). Защита диска от абуза «рассылка на миллионы адресов». При
 // превышении вытесняется самый старый конверт целиком. Оператор меняет через env.
 const MAX_TOTAL_MESSAGES = Number(process.env.RELAY_MAX_TOTAL_MESSAGES) || 200000;
+// S4: глобальный потолок ОЧЕРЕДИ В БАЙТАХ (тела в БД + файлы-blob). Конверт
+// разрешён до 32 МБ, поэтому count-лимита мало: 200000×32 МБ ≈ 6.4 ТБ. Байтовый
+// лимит защищает диск volume от переполнения одним клиентом. Дефолт 8 ГБ —
+// оператор поднимает под свой диск через RELAY_MAX_QUEUE_BYTES.
+const MAX_QUEUE_BYTES = Number(process.env.RELAY_MAX_QUEUE_BYTES) || 8 * 1024 * 1024 * 1024;
+// S5: сколько конвертов ОДИН отправитель может держать в очереди ОДНОГО
+// получателя. При превышении вытесняется его же старейший (self-eviction) —
+// флудер не выдавливает чужие (реальные) сообщения жертвы. < MAX_QUEUE_PER_USER.
+const MAX_QUEUE_PER_SENDER = Number(process.env.RELAY_MAX_QUEUE_PER_SENDER) || 100;
 const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
 // Тела конвертов крупнее порога (вложения) лежат файлами рядом с БД (тот же
 // volume), в очереди — только ссылка: БД остаётся маленькой и быстрой при
@@ -101,6 +112,13 @@ const PEER_SEED = (process.env.RELAY_PEERS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 const GOSSIP_INTERVAL_MS = Number(process.env.RELAY_GOSSIP_MS) || 60000;
+// M1: анонимный POST /relays раньше позволял кому угодно из интернета залить
+// записи в каталог (обход намеренно закрытого WS relay-advertise). Теперь
+// пополнение каталога через HTTP требует общего токена (RELAY_GOSSIP_TOKEN),
+// который операторы федерации задают на своих узлах. Без токена HTTP-push-gossip
+// ВЫКЛЮЧЕН (безопасно по умолчанию): каталог по-прежнему читается через GET, а
+// узлы находят друг друга pull-gossip'ом (fetchPeerRelays) и WS relay-advertise.
+const GOSSIP_TOKEN = process.env.RELAY_GOSSIP_TOKEN || null;
 
 let relayDir = mergeRelays([], [SELF_URL, ...PEER_SEED, ...store.directory()].filter(Boolean));
 store.addRelays(relayDir, Date.now());
@@ -175,12 +193,20 @@ function renderMetrics() {
   return lines.join('\n') + '\n';
 }
 
+// M11: сравнение токена — константное по времени (timingSafeEqual), чтобы по
+// времени ответа нельзя было побайтово подобрать токен.
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a == null ? '' : a));
+  const bb = Buffer.from(String(b == null ? '' : b));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 function metricsAuthorized(req) {
   if (!METRICS_TOKEN) return true;
   const url = new URL(req.url, 'http://x');
-  if (url.searchParams.get('token') === METRICS_TOKEN) return true;
-  const auth = req.headers && req.headers.authorization;
-  return auth === `Bearer ${METRICS_TOKEN}`;
+  if (safeEqual(url.searchParams.get('token'), METRICS_TOKEN)) return true;
+  const auth = (req.headers && req.headers.authorization) || '';
+  return safeEqual(auth, `Bearer ${METRICS_TOKEN}`);
 }
 
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
@@ -278,10 +304,51 @@ function verifyBoxProof(nonceB64, proofB64, boxPubB64, ephSecB64) {
   }
 }
 
+// --- Подлинность релея (S6) ------------------------------------------------
+// Релей подписывает клиентский cnonce своим долговременным Ed25519-ключом; его
+// публичную половину клиент пинит (config.SEED_RELAY_KEYS) и отвергает релей без
+// валидной подписи. Ключ берём из RELAY_SIGN_SECRET (base64) либо персистим в
+// файле рядом с БД (стабильность пина между рестартами) и печатаем публичную
+// половину в лог, чтобы оператор внёс её клиентам.
+const RELAY_AUTH_PREFIX = 'licno-relay-auth-v1|';
+const RELAY_SIGN_KEY_FILE = process.env.RELAY_SIGN_KEY_FILE || path.join(path.dirname(DB_FILE), 'relay-sign.key');
+function loadOrCreateRelaySignKeys() {
+  let secB64 = process.env.RELAY_SIGN_SECRET || null;
+  if (!secB64) {
+    try {
+      secB64 = fs.readFileSync(RELAY_SIGN_KEY_FILE, 'utf8').trim();
+    } catch (e) {}
+  }
+  try {
+    if (secB64) {
+      const kp = nacl.sign.keyPair.fromSecretKey(naclUtil.decodeBase64(secB64));
+      return { pub: naclUtil.encodeBase64(kp.publicKey), sec: kp.secretKey };
+    }
+  } catch (e) {
+    console.error('[relay-key] RELAY_SIGN_SECRET некорректен — генерирую новый');
+  }
+  const kp = nacl.sign.keyPair();
+  try {
+    fs.writeFileSync(RELAY_SIGN_KEY_FILE, naclUtil.encodeBase64(kp.secretKey), { mode: 0o600 });
+  } catch (e) {}
+  return { pub: naclUtil.encodeBase64(kp.publicKey), sec: kp.secretKey };
+}
+const RELAY_KEYS = loadOrCreateRelaySignKeys();
+function signRelayAuth(cnonce) {
+  return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
+}
+
 // --- X3DH prekeys ----------------------------------------------------------
 // Формат подписи SPK должен совпадать с клиентским (src/crypto.js).
 const SPK_SIG_PREFIX = 'licno-spk-v1|';
 const MAX_OTPS_PER_USER = 100;
+// M2: троттлинг выдачи prekey на СОЕДИНЕНИЕ. Без него авторизованный клиент за
+// пару секунд (rate-limit 80 кадров/с) высасывал все OTP жертвы по её адресу,
+// деградируя forward secrecy её будущих собеседников. Легитимному клиенту
+// prekeys-get нужен изредка (новый контакт), поэтому 60/мин с запасом хватает;
+// при превышении отвечаем bundle:null (X3DH-фолбэк), OTP при этом НЕ тратится.
+const PREKEY_GET_WINDOW_MS = 60000;
+const PREKEY_GET_MAX = 60;
 const isB64Field = (s, max = 128) => typeof s === 'string' && s.length > 0 && s.length <= max;
 
 function verifySpkSignature(spkObj, signPublicKeyB64) {
@@ -329,15 +396,24 @@ const server = http.createServer((req, res) => {
     // POST — другой релей сообщает о себе/своём каталоге (push-gossip): так
     // сосед, у которого мы в peers, узнаёт про нас без ручной настройки.
     if (req.method === 'POST') {
+      // M1: учимся из POST только при совпадении общего токена. Аноним не может
+      // отравить каталог/подсунуть вредоносные релеи; при этом GET-каталог открыт.
+      const gossipOk =
+        !!GOSSIP_TOKEN && safeEqual((req.headers && req.headers['x-gossip-token']) || '', GOSSIP_TOKEN);
       let body = '';
+      let aborted = false;
       req.on('data', (c) => {
         body += c;
-        if (body.length > 200000) req.destroy();
+        if (body.length > 200000) {
+          aborted = true;
+          req.destroy();
+        }
       });
       req.on('end', () => {
+        if (aborted) return;
         try {
           const j = JSON.parse(body);
-          if (Array.isArray(j.relays)) learnRelays(j.relays.filter(isValidRelayUrl));
+          if (gossipOk && Array.isArray(j.relays)) learnRelays(j.relays.filter(isValidRelayUrl));
         } catch (e) {}
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(JSON.stringify({ relays: relayDir }));
@@ -369,7 +445,19 @@ function flushQueue(pubkey, ws) {
 function deliver(from, to, envelope, silent, callPush) {
   const id = nextId();
   // Always enqueue; the copy is removed only when the recipient acks (received).
-  store.enqueue({ id, to, from, envelope, silent, callPush, ts: Date.now(), maxPerUser: MAX_QUEUE_PER_USER, maxTotal: MAX_TOTAL_MESSAGES });
+  store.enqueue({
+    id,
+    to,
+    from,
+    envelope,
+    silent,
+    callPush,
+    ts: Date.now(),
+    maxPerUser: MAX_QUEUE_PER_USER,
+    maxPerSender: MAX_QUEUE_PER_SENDER,
+    maxTotal: MAX_TOTAL_MESSAGES,
+    maxTotalBytes: MAX_QUEUE_BYTES,
+  });
 
   const ws = online.get(to);
   if (ws) {
@@ -516,7 +604,14 @@ function handleFrameSafely(ws, msg) {
       // Публичную половинку кладём в challenge; секретку держим до auth.
       const eph = nacl.box.keyPair();
       ws.ephSec = naclUtil.encodeBase64(eph.secretKey);
-      return send(ws, { type: 'challenge', nonce: ws.nonce, eph: naclUtil.encodeBase64(eph.publicKey) });
+      const reply = { type: 'challenge', nonce: ws.nonce, eph: naclUtil.encodeBase64(eph.publicKey) };
+      // S6: если клиент прислал cnonce — подписываем его ключом релея (клиент
+      // сверит с закреплённым ключом). Старый клиент без cnonce — просто без подписи.
+      if (typeof msg.cnonce === 'string' && msg.cnonce) {
+        reply.relayPub = RELAY_KEYS.pub;
+        reply.relaySig = signRelayAuth(msg.cnonce);
+      }
+      return send(ws, reply);
     }
 
     if (msg.type === 'auth') {
@@ -634,6 +729,17 @@ function handleFrameSafely(ws, msg) {
       if (typeof msg.pubkey !== 'string' || !msg.pubkey) {
         return send(ws, { type: 'error', error: 'prekeys-get requires pubkey' });
       }
+      // M2: троттлинг на соединение — при превышении отвечаем как «prekey нет»
+      // (bundle:null), OTP не расходуется (клиент откатится на static/SPK-only).
+      const nowPk = Date.now();
+      if (nowPk - (ws.pkGetStart || 0) > PREKEY_GET_WINDOW_MS) {
+        ws.pkGetStart = nowPk;
+        ws.pkGetCount = 0;
+      }
+      ws.pkGetCount = (ws.pkGetCount || 0) + 1;
+      if (ws.pkGetCount > PREKEY_GET_MAX) {
+        return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: null });
+      }
       const spkRec = store.getSpk(msg.pubkey);
       if (!spkRec) return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: null });
       const opk = store.takeOtp(msg.pubkey);
@@ -685,55 +791,88 @@ function hostOf(wsUrl) {
     .replace(/:\d+$/, '')
     .replace(/^\[|\]$/g, '');
 }
-async function peerIsSafe(wsUrl) {
+// L7 (TOCTOU/DNS-rebinding): резолвим хост ОДИН раз, проверяем ВСЕ адреса и
+// возвращаем их для ПИННИНГА соединения. Раньше проверка (dns.lookup) и запрос
+// (fetch со своим резолвингом) были разными разрешениями имени — вредоносный DNS
+// мог отдать публичный IP на проверке и приватный на самом запросе. Теперь
+// соединение идёт ровно на проверенные IP (кастомный lookup), а имя хоста
+// сохраняется для SNI/валидации TLS-сертификата — сертификат по-прежнему сверяется.
+async function safePeerAddrs(wsUrl) {
   const host = hostOf(wsUrl);
-  if (!host || isPrivateHost(host)) return false;
+  if (!host || isPrivateHost(host)) return null;
   try {
     const addrs = await dns.lookup(host, { all: true });
-    if (!addrs.length) return false;
-    for (const a of addrs) if (isPrivateHost(a.address)) return false;
-    return true;
+    if (!addrs.length) return null;
+    for (const a of addrs) if (isPrivateHost(a.address)) return null;
+    return addrs.map((a) => ({ address: a.address, family: a.family }));
   } catch (e) {
-    return false; // не резолвится — не ходим
+    return null; // не резолвится — не ходим
   }
 }
+// Кастомный lookup для http/https: игнорирует реальный DNS и отдаёт ТОЛЬКО
+// заранее проверенные адреса (пиннинг) — между проверкой и коннектом имя уже не
+// переразрешается, окно DNS-rebinding закрыто.
+function pinnedLookup(pinned) {
+  return (hostname, options, cb) => {
+    if (options && options.all) return cb(null, pinned);
+    cb(null, pinned[0].address, pinned[0].family);
+  };
+}
+/** GET/POST JSON к пиру по проверенным IP. Возвращает распарсенный ответ или null. */
+function httpJson(urlStr, { method = 'GET', headers = {}, body = null, pinned, timeoutMs = 5000 }) {
+  return new Promise((resolve) => {
+    let mod;
+    try {
+      mod = new URL(urlStr).protocol === 'https:' ? https : http;
+    } catch (e) {
+      return resolve(null);
+    }
+    const req = mod.request(urlStr, { method, headers, lookup: pinnedLookup(pinned) }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return resolve(null);
+      }
+      let buf = '';
+      res.on('data', (c) => {
+        buf += c;
+        if (buf.length > 1000000) req.destroy(); // защита от гигантского ответа
+      });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(buf));
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(timeoutMs, () => req.destroy());
+    if (body) req.write(body);
+    req.end();
+  });
+}
 async function fetchPeerRelays(wsUrl) {
-  if (typeof fetch !== 'function') return null; // Node < 18
-  if (!(await peerIsSafe(wsUrl))) return null;
-  const url = relayHttpBase(wsUrl) + '/relays';
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 5000);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) return null;
-    const body = await res.json();
-    return Array.isArray(body.relays) ? body.relays : null;
-  } catch (e) {
-    return null;
-  } finally {
-    clearTimeout(t);
-  }
+  const pinned = await safePeerAddrs(wsUrl);
+  if (!pinned) return null;
+  const body = await httpJson(relayHttpBase(wsUrl) + '/relays', { pinned });
+  return body && Array.isArray(body.relays) ? body.relays : null;
 }
 // Push-gossip: сообщить peer'у наш каталог (включая себя). Благодаря этому
 // сосед, который сам нас в peers не прописывал (напр. самый первый релей),
 // узнаёт про нас — распространение становится двунаправленным.
 async function pushSelfTo(wsUrl) {
-  if (typeof fetch !== 'function') return;
-  if (!(await peerIsSafe(wsUrl))) return;
-  const url = relayHttpBase(wsUrl) + '/relays';
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 5000);
-  try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ relays: relayDir }),
-      signal: ctrl.signal,
-    });
-  } catch (e) {
-  } finally {
-    clearTimeout(t);
-  }
+  const pinned = await safePeerAddrs(wsUrl);
+  if (!pinned) return;
+  await httpJson(relayHttpBase(wsUrl) + '/relays', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      // M1: свой токен федерации — чтобы пир с тем же токеном принял наш каталог.
+      ...(GOSSIP_TOKEN ? { 'x-gossip-token': GOSSIP_TOKEN } : {}),
+    },
+    body: JSON.stringify({ relays: relayDir }),
+    pinned,
+  });
 }
 async function gossipOnce() {
   const peers = relayDir.filter((u) => !SELF_URL || u.toLowerCase() !== SELF_URL.toLowerCase());
@@ -786,22 +925,49 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 // C-1 (backstop): узел store-and-forward не должен умирать от одного битого
-// кадра/промиса. Любую необработанную ошибку логируем и продолжаем работу — это
+// кадра/промиса. Обычную необработанную ошибку логируем и продолжаем работу — это
 // многократно безопаснее падения всего процесса (перманентный DoS всей ноды).
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
-});
-process.on('unhandledRejection', (err) => {
-  console.error('[unhandledRejection]', err && err.stack ? err.stack : err);
-});
+//
+// L4: ИСКЛЮЧЕНИЕ — повреждение/сбой БД. Продолжать работу с битой SQLite опасно:
+// узел будет тихо деградировать (терять/недоставлять конверты) вместо честного
+// рестарта. Такие ошибки → управляемый выход, systemd (Restart=always) поднимет
+// процесс заново, при старте WAL восстановится/подчистится.
+function isFatalDbError(err) {
+  const code = (err && err.code && String(err.code)) || '';
+  const msg = (err && err.message && String(err.message)) || '';
+  return (
+    /^SQLITE_(CORRUPT|NOTADB|CANTOPEN|IOERR|FULL|READONLY)/.test(code) ||
+    /malformed|not a database|disk image is malformed|disk I\/O error/i.test(msg)
+  );
+}
+function handleTopLevelError(tag, err) {
+  console.error(`[${tag}]`, err && err.stack ? err.stack : err);
+  if (isFatalDbError(err)) {
+    console.error('[fatal] сбой/повреждение БД — управляемый выход для рестарта под systemd');
+    try {
+      store.close();
+    } catch (e) {}
+    process.exit(1);
+  }
+}
+process.on('uncaughtException', (err) => handleTopLevelError('uncaughtException', err));
+process.on('unhandledRejection', (err) => handleTopLevelError('unhandledRejection', err));
 
 server.listen(PORT, () => {
   console.log(`Лично relay listening on :${PORT} (health: /health, directory: /relays)`);
   console.log(`[dir] ${relayDir.length} relay(s) known${SELF_URL ? `, self=${SELF_URL}` : ' (set RELAY_SELF_URL to advertise self)'}`);
+  // S6: публичный ключ подлинности этого релея — впишите его клиентам в
+  // config.SEED_RELAY_KEYS для пиннинга (иначе релей не проверяется).
+  console.log(`[relay-key] RELAY_SIGN_PUBLIC=${RELAY_KEYS.pub}${SELF_URL ? `  (для ${SELF_URL})` : ''}`);
   console.log(
     '[push]',
     pushReady()
       ? 'FCM configured — wake-up pushes enabled'
       : 'FCM NOT configured — closed-app notifications will NOT be sent (add service-account.json)'
   );
+  // M11: без токена /metrics открыт всем и раскрывает размеры очередей, число
+  // соединений и память узла. Предупреждаем оператора — закрыть через env.
+  if (!METRICS_TOKEN) {
+    console.warn('[metrics] /metrics OPEN to everyone — set RELAY_METRICS_TOKEN to require a token');
+  }
 });
