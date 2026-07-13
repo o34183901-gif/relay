@@ -226,10 +226,24 @@ const ipConns = new Map();
 // pubkey -> время последнего message-пуша (троттлинг уведомлений)
 const PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_PUSH_INTERVAL_MS) || 20000;
 const lastPushAt = new Map();
+// СРВ-3: троттлинг ЗВОНКОВЫХ пушей. Раньше call-пуш (high-priority «Входящий
+// звонок») не троттлился вообще — зная адрес жертвы, атакующий устраивал шквал
+// звонковых уведомлений (спам/разряд батареи). Интервал мягче обычного (звонить
+// повторно легитимно быстрее, чем слать сообщения), но флуд отсекает.
+const CALL_PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_CALL_PUSH_INTERVAL_MS) || 5000;
+const lastCallPushAt = new Map();
 setInterval(() => {
   const cutoff = Date.now() - 10 * PUSH_MIN_INTERVAL_MS;
   for (const [pk, t] of lastPushAt) if (t < cutoff) lastPushAt.delete(pk);
+  const ccut = Date.now() - 10 * CALL_PUSH_MIN_INTERVAL_MS;
+  for (const [pk, t] of lastCallPushAt) if (t < ccut) lastCallPushAt.delete(pk);
 }, 60000).unref();
+
+// СРВ-4: потолок длины адреса получателя. box-pubkey в base64 = 44 символа; берём
+// с запасом. Без этого `to` не ограничивался ничем, кроме maxPayload (~33 МБ) и в
+// учёте байтов очереди не участвовал — крошечный envelope + гигантский `to`
+// обходили байтовый потолок и раздували диск. Кап закрывает вектор в корне.
+const MAX_ADDR_LEN = 64;
 
 // H4: сколько доверенных обратных прокси перед релеем. X-Forwarded-For клиент
 // может подделать в НАЧАЛЕ списка; честный прокси (Caddy) ДОПИСЫВАЕТ реальный IP
@@ -256,17 +270,26 @@ function clientIp(req) {
 let seq = 0;
 function nextId() {
   seq = (seq + 1) % Number.MAX_SAFE_INTEGER;
-  return Date.now().toString(36) + '-' + seq.toString(36);
+  // СРВ-8: добавляем случайный суффикс. seq сбрасывается при рестарте, а Date.now()
+  // может повториться — без энтропии теоретически возможна коллизия id, из-за
+  // которой INSERT OR REPLACE затёр бы чужой конверт и оставил сиротский blob.
+  return Date.now().toString(36) + '-' + seq.toString(36) + '-' + crypto.randomBytes(3).toString('hex');
 }
 
 // --- ownership proof helpers ---------------------------------------------
+// КРП-1: доменно-разделённая подпись challenge («licno-relay-challenge-v1|»+nonce).
+// Должна совпадать с клиентской crypto.signChallenge. Принимаем ОБА варианта:
+// новый (с префиксом) и сырой nonce (легаси-клиент до КРП-1) — переходная
+// совместимость. Оракул закрыт уже тем, что НОВЫЙ клиент сырой nonce не подписывает.
+const CHALLENGE_SIG_PREFIX = 'licno-relay-challenge-v1|';
 function verifySignature(nonceB64, signatureB64, signPublicKeyB64) {
   try {
-    return nacl.sign.detached.verify(
-      naclUtil.decodeBase64(nonceB64),
-      naclUtil.decodeBase64(signatureB64),
-      naclUtil.decodeBase64(signPublicKeyB64)
-    );
+    const sig = naclUtil.decodeBase64(signatureB64);
+    const pk = naclUtil.decodeBase64(signPublicKeyB64);
+    if (nacl.sign.detached.verify(naclUtil.decodeUTF8(CHALLENGE_SIG_PREFIX + nonceB64), sig, pk)) {
+      return true;
+    }
+    return nacl.sign.detached.verify(naclUtil.decodeBase64(nonceB64), sig, pk);
   } catch (e) {
     return false;
   }
@@ -540,8 +563,10 @@ function flushQueue(pubkey, ws) {
 
 function deliver(from, to, envelope, silent, callPush) {
   const id = nextId();
-  // Always enqueue; the copy is removed only when the recipient acks (received).
-  store.enqueue({
+  // Enqueue; the copy is removed only when the recipient acks (received).
+  // СРВ-2: enqueue возвращает false, если очередь получателя полна и у отправителя
+  // нет своих слотов (чужие сообщения не вытесняем).
+  const stored = store.enqueue({
     id,
     to,
     from,
@@ -562,6 +587,11 @@ function deliver(from, to, envelope, silent, callPush) {
     return { queued: false, id };
   }
 
+  // СРВ-2: получатель офлайн и конверт не влез в очередь — не будим пушем (нечего
+  // доставлять) и не считаем queued. Ack всё равно вернём (см. вызов), чтобы
+  // отправитель не зациклил переотправку в переполненную очередь.
+  if (!stored) return { queued: false, id };
+
   // recipient offline -> maybe wake them
   counters.queuedOffline += 1;
   const token = store.getToken(to);
@@ -570,7 +600,9 @@ function deliver(from, to, envelope, silent, callPush) {
   };
 
   if (callPush) {
-    if (token) {
+    // СРВ-3: троттлим звонковые пуши на адрес (анти-флуд), как и обычные.
+    if (token && Date.now() - (lastCallPushAt.get(to) || 0) >= CALL_PUSH_MIN_INTERVAL_MS) {
+      lastCallPushAt.set(to, Date.now());
       counters.pushes += 1;
       sendCallPush(token).then(onInvalid);
     }
@@ -687,6 +719,14 @@ function handleFrameSafely(ws, msg) {
 
     // --- handshake: hello -> challenge -> auth ---
     if (msg.type === 'hello') {
+      // СРВ-9: каждый hello генерирует randomBytes + эфемерную box-пару (дорого по
+      // CPU) ещё до аутентификации. Ограничиваем число hello на соединение, чтобы
+      // один неаутентифицированный сокет не грузил узел генерацией ключей.
+      ws.helloCount = (ws.helloCount || 0) + 1;
+      if (ws.helloCount > 20) {
+        send(ws, { type: 'error', error: 'too many hellos' });
+        return ws.terminate();
+      }
       if (typeof msg.pubkey !== 'string' || !msg.pubkey) {
         return send(ws, { type: 'error', error: 'hello requires pubkey' });
       }
@@ -756,6 +796,13 @@ function handleFrameSafely(ws, msg) {
       counters.authOk += 1;
       ws.authed = true;
       ws.pubkey = ws.pendingPubkey;
+      // H-2 (squatting): доказал ли ЭТОТ сеанс владение box-секреткой адреса.
+      // Квитанции о приёме (`received` → удаление из очереди + `delivered`
+      // отправителю) принимаем ТОЛЬКО от доказанного держателя — иначе тот, кто
+      // «сквоттил» ещё не занятый адрес, мог вычерпать очередь жертвы и подделать
+      // «доставлено». Актуальные клиенты всегда шлют boxProof, так что штатный
+      // путь не меняется; страдает лишь недоказанный сеанс (сквоттер/старый клиент).
+      ws.proven = !!boxProven;
       ws.nonce = null;
       ws.ephSec = null;
       clearTimeout(ws.authTimer);
@@ -787,6 +834,15 @@ function handleFrameSafely(ws, msg) {
       // M-1: учить каталог может ТОЛЬКО аутентифицированный клиент/релей — иначе
       // аноним отравлял бы список мусором и подсовывал вредоносные релеи (в т.ч.
       // как вектор SSRF через gossip). Плюс валидация URL (без приватных адресов).
+      // СРВ-5 (частично): плюс потолок числа advertise на соединение — легитимный
+      // клиент анонсирует свой набор релеев изредка, поэтому лимит щедрый, но
+      // отсекает заливку мусора в каталог одним сокетом. Полное закрытие (жёсткая
+      // привязка к доверенным узлам/токену федерации) вынесено в отчёт — требует
+      // операторской настройки.
+      ws.advCount = (ws.advCount || 0) + 1;
+      if (ws.advCount > 30) {
+        return send(ws, { type: 'relays', relays: relayDir });
+      }
       const urls = Array.isArray(msg.relays) ? msg.relays : [msg.url];
       const clean = urls.filter((u) => isValidRelayUrl(u));
       if (clean.length) learnRelays(clean);
@@ -859,13 +915,21 @@ function handleFrameSafely(ws, msg) {
     }
 
     if (msg.type === 'received') {
-      if (typeof msg.id === 'string') ackReceived(ws.pubkey, msg.id);
+      // H-2: квитанцию принимаем только от доказанного владельца адреса. Недоказанный
+      // держатель (сквоттер незанятого адреса) не может удалить конверт из очереди
+      // и не спровоцирует ложный `delivered` — реальный владелец потом заберёт своё.
+      if (typeof msg.id === 'string' && ws.proven) ackReceived(ws.pubkey, msg.id);
       return;
     }
 
     if (msg.type === 'send') {
-      if (typeof msg.to !== 'string' || !msg.envelope) {
+      if (typeof msg.to !== 'string' || !msg.to || !msg.envelope) {
         return send(ws, { type: 'error', error: 'send requires to + envelope' });
+      }
+      // СРВ-4: адрес получателя ограничен по длине (см. MAX_ADDR_LEN) — иначе
+      // гигантский `to` при крошечном envelope обходил байтовый потолок очереди.
+      if (msg.to.length > MAX_ADDR_LEN) {
+        return send(ws, { type: 'error', error: 'invalid recipient' });
       }
       const size = Buffer.byteLength(JSON.stringify(msg.envelope));
       if (size > MAX_ENVELOPE_BYTES) {
