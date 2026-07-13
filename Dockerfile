@@ -12,20 +12,23 @@
 FROM node:20-slim
 WORKDIR /app
 
-# python3/make/g++ — сборка нативного better-sqlite3; coturn — TURN-сервер,
-# который релей запускает дочерним процессом (RELAY_EMBED_COTURN): отдельного
-# контейнера coturn нет, весь TURN (секрет+конфиг+процесс) едет в этом образе и
-# обновляется через watchtower автономно.
+# python3/make/g++ — сборка нативного better-sqlite3; coturn — встроенный TURN
+# (RELAY_EMBED_COTURN, дочерний процесс релея); gosu — безопасный дроп привилегий
+# в entrypoint (ДПЛ-5). Создаём непривилегированного пользователя licno.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ coturn \
-  && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends python3 make g++ coturn gosu \
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd -r licno && useradd -r -g licno -s /usr/sbin/nologin licno
 
-# Сначала только манифест — кешируем npm install между сборками.
-COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+# ДПЛ-5: манифест + lock и `npm ci` — воспроизводимая установка ровно по локу
+# (не «резолвим заново» на каждой сборке). Кешируется между сборками.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
 # Затем код релея (без клиентских исходников).
 COPY relay.js relays.js store.js push.js ./
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # Рантайм-данные (SQLite-БД релея + крупные вложения в /data/blobs) — в томе,
 # чтобы переживали рестарт.
@@ -37,4 +40,6 @@ EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+# ДПЛ-5: entrypoint приводит владение /data и запускает релей под licno (non-root).
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "relay.js"]

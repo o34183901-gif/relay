@@ -1,14 +1,19 @@
 name: Build relay image
 
-# Собирает, ПОДПИСЫВАЕТ (cosign keyless) и публикует Docker-образ релея в GHCR.
-# H-1 (supply-chain):
+# Собирает, СМОУК-ТЕСТИРУЕТ, ПОДПИСЫВАЕТ (cosign keyless) и публикует Docker-образ
+# релея в GHCR.
+#
+# ДПЛ-5 (non-root) + ДПЛ-6 (гейт деплоя):
+#  • образ сначала СОБИРАЕТСЯ ЛОКАЛЬНО и ПРОВЕРЯЕТСЯ смоук-тестом (запуск контейнера,
+#    /health, работа под non-root, миграция root-owned тома) — и только пройдя тест
+#    публикуется и подписывается. Битый образ на флот НЕ уедет: без успешного
+#    смоука шага публикации нет;
+#  • авто-публикация идёт ТОЛЬКО в :canary и :sha-<commit>. Канал :stable, за которым
+#    следит весь флот, переставляется ВРУЧНУЮ через workflow «Promote / rollback»
+#    (canary → stable) — после обкатки на канареечном сервере. Это ограничивает
+#    радиус поражения: одно нажатие на выкат вместо тихого авто-раската на весь флот.
 #  • least-privilege GITHUB_TOKEN + OIDC (id-token) только для подписи;
-#  • все actions запинены по коммит-SHA (не по подвижным тегам);
-#  • provenance (SLSA) + SBOM прикладываются к образу;
-#  • образ подписывается cosign БЕЗ ключа (identity = этот workflow на main),
-#    сервера проверяют подпись перед применением (см. deploy/licno-update.sh);
-#  • теги: :sha-<commit> (иммутабельный, для отката/форензики), :canary
-#    (для канареечных релеев), :stable (за ним следит флот), :latest (легаси).
+#  • все actions запинены по коммит-SHA; provenance (SLSA) + SBOM прикладываются.
 
 on:
   push:
@@ -19,7 +24,9 @@ on:
       - 'store.js'
       - 'push.js'
       - 'package.json'
+      - 'package-lock.json'
       - 'Dockerfile'
+      - 'docker-entrypoint.sh'
       - '.github/workflows/image.yml'
   workflow_dispatch:
 
@@ -51,7 +58,57 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Build & push (with provenance + SBOM)
+      # 1) Сборка ЛОКАЛЬНО (load, без публикации) — чтобы прогнать смоук-тест ДО выката.
+      - name: Build image locally (for smoke-test)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: licno-relay:smoke
+
+      # 2a) Смоук: свежий (пустой, root-owned по умолчанию) том — базовый запуск,
+      #     non-root, создание БД. --security-opt no-new-privileges повторяет compose.
+      - name: Smoke-test (fresh volume, non-root, /health)
+        run: |
+          set -euxo pipefail
+          docker volume create smoke-fresh
+          docker run -d --name s1 --security-opt no-new-privileges -e PORT=8787 -v smoke-fresh:/data licno-relay:smoke
+          ok=0
+          for i in $(seq 1 40); do
+            if docker exec s1 node -e "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs s1 | tail -40 || true
+          [ "$ok" = 1 ] || { echo "FAIL: /health не поднялся (fresh)"; exit 1; }
+          uid=$(docker exec s1 id -u)
+          [ "$uid" != "0" ] || { echo "FAIL: релей работает под root"; exit 1; }
+          docker exec s1 test -f /data/relay.db || { echo "FAIL: БД не создана"; exit 1; }
+          docker rm -f s1
+          docker volume rm smoke-fresh
+
+      # 2b) Смоук: том принадлежит root с mode 700 — как /data на УЖЕ работающих
+      #     серверах (раньше контейнер был root). Проверяем, что entrypoint приводит
+      #     владение и non-root успешно пишет БД. Это и есть безопасность миграции.
+      - name: Smoke-test (root-owned volume — миграция существующего сервера)
+        run: |
+          set -euxo pipefail
+          docker volume create smoke-old
+          docker run --rm -v smoke-old:/data busybox sh -c 'mkdir -p /data && chown -R 0:0 /data && chmod 700 /data'
+          docker run -d --name s2 --security-opt no-new-privileges -e PORT=8787 -v smoke-old:/data licno-relay:smoke
+          ok=0
+          for i in $(seq 1 40); do
+            if docker exec s2 node -e "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs s2 | tail -40 || true
+          [ "$ok" = 1 ] || { echo "FAIL: /health не поднялся на root-owned томе — миграция non-root сломана"; exit 1; }
+          docker exec s2 test -f /data/relay.db || { echo "FAIL: БД не создана на мигрированном томе"; exit 1; }
+          docker rm -f s2
+          docker volume rm smoke-old
+
+      # 3) Смоук пройден -> публикуем и подписываем ТОЛЬКО :canary и :sha
+      #    (тот же контекст/Dockerfile -> идентичный образ из кеша). :stable — вручную.
+      - name: Build & push (canary + sha, provenance + SBOM)
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -60,8 +117,6 @@ jobs:
           provenance: true
           sbom: true
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:stable
             ${{ env.IMAGE }}:canary
             ${{ env.IMAGE }}:sha-${{ github.sha }}
 
@@ -69,3 +124,10 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Итог
+        run: |
+          echo "Образ проверен смоуком, подписан и опубликован в :canary и :sha-${{ github.sha }}."
+          echo "Флот (:stable) НЕ обновлён автоматически (ДПЛ-6)."
+          echo "Обкатайте на канареечном сервере (LICNO_CHANNEL=canary), затем выкат на весь флот:"
+          echo "  Actions -> Promote / rollback relay channel -> source=canary target=stable"
