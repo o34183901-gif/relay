@@ -56,10 +56,20 @@ mkdir -p "$APP_DIR"
 # скрипт лежит рядом с relay.js/package.json — копируем их
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/store.js" "$SRC_DIR/push.js" "$SRC_DIR/package.json" "$APP_DIR/"
+# C-4: тащим и lockfile — установка должна быть воспроизводимой (как npm ci в Docker).
+[[ -f "$SRC_DIR/package-lock.json" ]] && cp "$SRC_DIR/package-lock.json" "$APP_DIR/"
 cd "$APP_DIR"
 # build-tools нужны для нативного модуля better-sqlite3 (встроенное хранилище)
 apt-get install -y --no-install-recommends python3 make g++ || true
-npm install --omit=dev
+# C-4: при наличии лока ставим строго по нему (npm ci) — фиксированные версии на
+# security-critical узле (typosquat/сдвиг версии не подъедет). Без лока — деградируем
+# до npm install с явным предупреждением.
+if [[ -f "$APP_DIR/package-lock.json" ]]; then
+  npm ci --omit=dev
+else
+  echo "WARN: package-lock.json отсутствует — установка без фиксации версий (npm install)" >&2
+  npm install --omit=dev
+fi
 
 # Optional FCM push: if a Firebase service-account JSON is present next to the
 # installer, wire it in so offline users get wake-up notifications. Project id
@@ -111,7 +121,18 @@ denied-peer-ip=127.0.0.0-127.255.255.255
 denied-peer-ip=169.254.0.0-169.254.255.255
 denied-peer-ip=172.16.0.0-172.31.255.255
 denied-peer-ip=192.168.0.0-192.168.255.255
+# C-3: IPv6-диапазоны (dual-stack VPS обычно имеет публичный IPv6). Без них
+# coturn ретранслировал бы на внутренний IPv6 / IPv6 облачных метаданных —
+# неполный M-4 на bare-metal. Совпадает с COTURN_DENIED_RANGES в relays.js.
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 TURN
+# C-2: конфиг содержит static-auth-secret — закрываем от чтения другими локальными
+# пользователями (раньше создавался с umask по умолчанию, 0644 = мир мог прочитать
+# TURN-секрет и минтить валидные эфемерные креды). Владелец — пользователь coturn.
+chmod 600 /etc/turnserver.conf
+chown turnserver:turnserver /etc/turnserver.conf 2>/dev/null || true
 
 # enable the coturn systemd service
 sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null || true
@@ -123,7 +144,10 @@ ufw allow 3478/udp || true
 ufw allow 49160:49200/udp || true
 log "TURN готов на ${PUBIP}:3478"
 
-TURN_ENV="Environment=TURN_SECRET=${TURN_SECRET}
+# C-1: НЕ прокидываем сам секрет в systemd-юнит (юнит пишется 0644 — мир прочёл бы
+# TURN_SECRET через файл юнита или `systemctl show -p Environment`). Передаём ПУТЬ к
+# файлу-секрету (0600, владелец licno) — relay.js читает его через resolveTurnSecret.
+TURN_ENV="Environment=TURN_SECRET_FILE=${TURN_SECRET_FILE}
 Environment=TURN_HOST=${PUBIP}"
 
 # --- каталог релеев (gossip): анонсируем себя и стартовых соседей ------------

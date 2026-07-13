@@ -69,6 +69,18 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    # C-6: харденинг Caddy — сбрасываем ВСЕ Linux-capabilities, оставляя только
+    # NET_BIND_SERVICE (нужен для привязки к 80/443), и делаем корень контейнера
+    # read-only. Caddy пишет только в тома /data (сертификаты) и /config и в /tmp
+    # (tmpfs ниже) — этого достаточно. Сужает поверхность при компрометации Caddy.
+    # ВАЖНО: проверить на канареечном сервере перед раскаткой на флот.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
     mem_limit: 256m

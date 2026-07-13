@@ -98,9 +98,12 @@ curl https://<RELAY_HOST>/metrics
 ```
 
 Формат стандартный (Prometheus text), подключается к Prometheus/Grafana как
-обычный scrape-target. По умолчанию endpoint открыт (секретов в нём нет);
-чтобы закрыть — задайте `RELAY_METRICS_TOKEN` в `.env`, тогда нужен
-`?token=...` или заголовок `Authorization: Bearer ...`.
+обычный scrape-target. **По умолчанию `/metrics` доступен ТОЛЬКО из приватной
+сети/localhost** (M-1): внешний scrape через Caddy отклоняется (403) — команда
+`curl https://<RELAY_HOST>/metrics` снаружи вернёт `forbidden`. Скрейпить можно с
+самого хоста/из внутренней сети, либо задать `RELAY_METRICS_TOKEN` в `.env` —
+тогда endpoint доступен извне по `?token=...` или заголовку
+`Authorization: Bearer ...`.
 
 ## Пуши при закрытом приложении (FCM)
 
