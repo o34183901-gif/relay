@@ -80,8 +80,12 @@ jobs:
           done
           docker logs s1 | tail -40 || true
           [ "$ok" = 1 ] || { echo "FAIL: /health не поднялся (fresh)"; exit 1; }
-          uid=$(docker exec s1 id -u)
-          [ "$uid" != "0" ] || { echo "FAIL: релей работает под root"; exit 1; }
+          # ВАЖНО: проверяем пользователя РЕАЛЬНОГО процесса релея (PID 1), а НЕ
+          # `docker exec id -u` — exec стартует под дефолтным пользователем образа
+          # (root), тогда как сам релей после gosu работает под licno. Владелец
+          # /proc/1 = uid процесса-релея.
+          uid=$(docker exec s1 stat -c %u /proc/1)
+          [ "$uid" != "0" ] || { echo "FAIL: релей (PID 1) работает под root"; exit 1; }
           docker exec s1 test -f /data/relay.db || { echo "FAIL: БД не создана"; exit 1; }
           docker rm -f s1
           docker volume rm smoke-fresh
