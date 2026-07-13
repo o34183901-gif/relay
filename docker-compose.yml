@@ -48,6 +48,13 @@ services:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49160-49200:49160-49200/udp"
+    # M-3/M-7: харденинг и ресурсные лимиты — RCE/утечка в контейнере не должна
+    # повышать права или положить хост памятью/форк-бомбой. Значения tunable под
+    # нагрузку (RELAY_MEM_LIMIT/RELAY_PIDS_LIMIT в .env); дефолты — с запасом.
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${RELAY_MEM_LIMIT:-2g}
+    pids_limit: ${RELAY_PIDS_LIMIT:-1024}
 
   caddy:
     image: caddy:2-alpine
@@ -62,6 +69,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 256
 
   # TURN-сервер для звонков теперь ВСТРОЕН в контейнер relay (RELAY_EMBED_COTURN):
   # релей сам запускает turnserver дочерним процессом и владеет секретом/конфигом.

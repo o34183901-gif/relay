@@ -98,6 +98,16 @@ min-port=49160
 max-port=49200
 external-ip=${PUBIP}
 simple-log
+# M-4: не ретранслировать во внутренние сети/облачные метаданные/loopback/multicast
+# (иначе coturn становится open-relay и SSRF-плацдармом во внутреннюю сеть).
+no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
 TURN
 
 # enable the coturn systemd service
@@ -133,6 +143,15 @@ fi
 log "Этот релей анонсирует себя как: ${SELF_URL}"
 
 log "Создание systemd-сервиса ${SERVICE}"
+# M-2: за Caddy (TLS-режим) реальный IP клиента приходит в X-Forwarded-For —
+# доверяем одному прокси, чтобы per-IP лимиты считались по клиенту, а не по адресу
+# Caddy. В plain-режиме прокси нет, поэтому XFF НЕ доверяем (его можно подделать).
+if [[ "$MODE" == "tls" ]]; then
+  PROXY_ENV="Environment=RELAY_TRUST_PROXY=1"
+else
+  PROXY_ENV=""
+fi
+
 cat >/etc/systemd/system/${SERVICE}.service <<UNIT
 [Unit]
 Description=Licno relay (encrypted store-and-forward)
@@ -147,9 +166,17 @@ Environment=RELAY_DB=${APP_DIR}/relay.db
 ${DIR_ENV}
 ${FCM_ENV}
 ${TURN_ENV}
+${PROXY_ENV}
 Restart=always
 RestartSec=3
 User=root
+# M-3: базовый харденинг systemd — RCE в релее не должен давать доступ ко всей ФС.
+# ProtectSystem=full делает /usr,/boot,/etc только для чтения (релей пишет лишь в
+# APP_DIR); NoNewPrivileges запрещает повышение прав.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
