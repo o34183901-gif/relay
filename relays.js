@@ -167,7 +167,7 @@ const COTURN_DENIED_RANGES = [
   'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // link-local
 ];
 
-function coturnConfigText(secret, { turnHost } = {}) {
+function coturnConfigText(secret, { turnHost, pidfile } = {}) {
   const lines = [
     'listening-port=3478',
     'fingerprint',
@@ -180,7 +180,14 @@ function coturnConfigText(secret, { turnHost } = {}) {
     'no-multicast-peers',
     'min-port=49160',
     'max-port=49200',
+    // ДПЛ-5: релей (и его дочерний coturn) работает под non-root, поэтому coturn
+    // НЕ может писать в root-only /var/run и /var/log. Лог направляем в stdout
+    // (виден в `docker logs`), pid — в переданный writable путь (data-том, который
+    // entrypoint chown'ит под пользователя релея). Без этого под non-root coturn
+    // ругался «Cannot create pid file: /var/run/turnserver.pid: Permission denied».
+    'log-file=stdout',
   ];
+  if (pidfile) lines.push(`pidfile=${pidfile}`);
   if (turnHost) lines.push(`external-ip=${turnHost}`);
   for (const r of COTURN_DENIED_RANGES) lines.push(`denied-peer-ip=${r}`);
   lines.push('');

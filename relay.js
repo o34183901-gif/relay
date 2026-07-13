@@ -431,7 +431,16 @@ function stopEmbeddedCoturn() {
 if (TURN_HOST) {
   turnSecret = resolveTurnSecret();
   try {
-    fs.writeFileSync(COTURN_CONF_FILE, coturnConfigText(turnSecret, { turnHost: TURN_HOST }), { mode: 0o600 });
+    fs.writeFileSync(
+      COTURN_CONF_FILE,
+      // ДПЛ-5: pid coturn — рядом с конфигом в data-томе (writable под non-root),
+      // а не в root-only /var/run.
+      coturnConfigText(turnSecret, {
+        turnHost: TURN_HOST,
+        pidfile: path.join(path.dirname(COTURN_CONF_FILE), 'turnserver.pid'),
+      }),
+      { mode: 0o600 }
+    );
     console.log(`[turn] coturn config -> ${COTURN_CONF_FILE} (секрет во владении релея, 0600)`);
   } catch (e) {
     console.warn('[turn] не удалось записать конфиг coturn:', e && e.message);
