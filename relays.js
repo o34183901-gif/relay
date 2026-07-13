@@ -187,6 +187,14 @@ function coturnConfigText(secret, { turnHost } = {}) {
   return lines.join('\n');
 }
 
+// Скользящее окно-счётчик (чистый, для троттлингов). state = { start, count } | null.
+// Возвращает { allow, state }: allow=false, когда в текущем окне уже >= max событий.
+// Инкремент счётчика — на стороне вызывающего (чтобы считать только реальные события).
+function rateGate(state, now, windowMs, max) {
+  const s = !state || now - state.start > windowMs ? { start: now, count: 0 } : state;
+  return { allow: s.count < max, state: s };
+}
+
 module.exports = {
   MAX_RELAYS,
   normalizeRelayUrl,
@@ -195,4 +203,5 @@ module.exports = {
   mergeRelays,
   coturnConfigText,
   COTURN_DENIED_RANGES,
+  rateGate,
 };

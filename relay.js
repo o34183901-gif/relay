@@ -47,7 +47,7 @@ const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady } = require('./push');
-const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText } = require('./relays');
+const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
 
 const TURN_HOST = process.env.TURN_HOST;
@@ -427,6 +427,20 @@ const MAX_OTPS_PER_USER = 100;
 // при превышении отвечаем bundle:null (X3DH-фолбэк), OTP при этом НЕ тратится.
 const PREKEY_GET_WINDOW_MS = 60000;
 const PREKEY_GET_MAX = 60;
+// H-4: троттлинг ВЫДАЧИ одноразовых prekey по ЦЕЛЕВОМУ адресу — ГЛОБАЛЬНО по всем
+// соединениям. M2 (выше) считал на соединение и обходился числом соединений:
+// атакующий открывал много сессий и высасывал OTP жертвы, деградируя forward
+// secrecy её первых сообщений. Теперь на адрес выдаётся не больше PREKEY_TARGET_MAX
+// OTP за окно; сверх лимита отдаём SPK без OTP (opk:null) — X3DH всё равно работает
+// (SPK forward-secret), но одноразовые ключи не расходуются. Порог щедрый:
+// легитимно OTP жертвы запрашивают редко (новый контакт).
+const PREKEY_TARGET_WINDOW_MS = Number(process.env.RELAY_PREKEY_TARGET_MS) || 60000;
+const PREKEY_TARGET_MAX = Number(process.env.RELAY_PREKEY_TARGET_MAX) || 30;
+const otpDrain = new Map(); // targetPubkey -> { start, count } (реально выданные OTP в окне)
+setInterval(() => {
+  const cutoff = Date.now() - PREKEY_TARGET_WINDOW_MS;
+  for (const [pk, d] of otpDrain) if (d.start < cutoff) otpDrain.delete(pk);
+}, PREKEY_TARGET_WINDOW_MS).unref();
 const isB64Field = (s, max = 128) => typeof s === 'string' && s.length > 0 && s.length <= max;
 
 function verifySpkSignature(spkObj, signPublicKeyB64) {
@@ -820,7 +834,16 @@ function handleFrameSafely(ws, msg) {
       }
       const spkRec = store.getSpk(msg.pubkey);
       if (!spkRec) return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: null });
-      const opk = store.takeOtp(msg.pubkey);
+      // H-4: глобальный лимит выдачи OTP на целевой адрес. Сверх лимита — SPK без OTP
+      // (opk:null): X3DH работает через SPK, одноразовые ключи жертвы не сливаются.
+      const nowT = Date.now();
+      const gate = rateGate(otpDrain.get(msg.pubkey), nowT, PREKEY_TARGET_WINDOW_MS, PREKEY_TARGET_MAX);
+      otpDrain.set(msg.pubkey, gate.state);
+      let opk = null;
+      if (gate.allow) {
+        opk = store.takeOtp(msg.pubkey);
+        if (opk) gate.state.count += 1; // считаем только реально выданные
+      }
       return send(ws, { type: 'prekeys', pubkey: msg.pubkey, bundle: { spk: spkRec, opk } });
     }
 
