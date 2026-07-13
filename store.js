@@ -40,7 +40,7 @@ function createStore(dbPath, opts = {}) {
       ts        INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_queue_to ON queue(to_pk, ts);
-    CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL, proven INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS push_tokens (pk TEXT PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS directory   (url TEXT PRIMARY KEY, last_seen INTEGER);
     -- X3DH: публичные prekey пользователей (подписанный + одноразовые).
@@ -51,6 +51,11 @@ function createStore(dbPath, opts = {}) {
   // Миграция существующих БД: колонка blob (1 = тело лежит файлом в blobDir).
   const hasBlobCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='blob'").get().c;
   if (!hasBlobCol) db.exec('ALTER TABLE queue ADD COLUMN blob INTEGER DEFAULT 0');
+  // Миграция (H-6): колонка proven — доказано ли владение box-ключом для этой
+  // связки pk→sign_pk (см. relay.js: ECDH-proof). Старые связки остаются
+  // proven=0 (легаси-совместимость), новые клиенты помечают их proven=1.
+  const hasProvenCol = db.prepare("SELECT count(*) c FROM pragma_table_info('identities') WHERE name='proven'").get().c;
+  if (!hasProvenCol) db.exec('ALTER TABLE identities ADD COLUMN proven INTEGER DEFAULT 0');
 
   const blobPath = (mid) => path.join(blobDir, mid + '.json');
   function writeBlob(mid, envJson) {
@@ -76,6 +81,7 @@ function createStore(dbPath, opts = {}) {
     forUser: db.prepare('SELECT * FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     countFor: db.prepare('SELECT count(*) c FROM queue WHERE to_pk=?'),
     oldestFor: db.prepare('SELECT id, blob FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
+    oldestGlobal: db.prepare('SELECT id, blob FROM queue ORDER BY ts ASC LIMIT 1'),
     byId: db.prepare('SELECT * FROM queue WHERE id=?'),
     delId: db.prepare('DELETE FROM queue WHERE id=?'),
     blobsOlder: db.prepare('SELECT id FROM queue WHERE blob=1 AND ts < ?'),
@@ -107,9 +113,15 @@ function createStore(dbPath, opts = {}) {
     };
   };
 
+  // H-3: глобальный счётчик строк очереди (по всем получателям сразу). Держим в
+  // памяти и синхронно обновляем при вставке/удалении — чтобы enqueue мог за O(1)
+  // проверить общий потолок, не сканируя таблицу на каждый кадр.
+  let liveCount = q.totalQueued.get().c;
+
   const id = {
-    get: db.prepare('SELECT sign_pk FROM identities WHERE pk=?'),
-    set: db.prepare('INSERT OR IGNORE INTO identities (pk,sign_pk) VALUES (?,?)'),
+    get: db.prepare('SELECT sign_pk, proven FROM identities WHERE pk=?'),
+    set: db.prepare('INSERT OR IGNORE INTO identities (pk,sign_pk,proven) VALUES (?,?,?)'),
+    rebind: db.prepare('INSERT OR REPLACE INTO identities (pk,sign_pk,proven) VALUES (?,?,?)'),
   };
   const tok = {
     get: db.prepare('SELECT token FROM push_tokens WHERE pk=?'),
@@ -139,15 +151,32 @@ function createStore(dbPath, opts = {}) {
      * Положить конверт в очередь получателя; при переполнении вытеснить старейший.
      * Тело крупнее blobThreshold уходит файлом в blobDir — в БД только ссылка.
      */
-    enqueue({ id: mid, to, from, envelope, silent, callPush, ts, maxPerUser }) {
+    enqueue({ id: mid, to, from, envelope, silent, callPush, ts, maxPerUser, maxTotal }) {
+      // Потолок на получателя: вытесняем его же старейший конверт.
       if (maxPerUser && q.countFor.get(to).c >= maxPerUser) {
         const o = q.oldestFor.get(to);
-        if (o) dropRow(o);
+        if (o) {
+          dropRow(o);
+          liveCount = Math.max(0, liveCount - 1);
+        }
+      }
+      // H-3: ГЛОБАЛЬНЫЙ потолок (по всем получателям). Без него один
+      // аутентифицированный клиент мог засыпать очередь конвертами на миллионы
+      // случайных адресов (≤maxPerUser на каждый) и переполнить диск. При
+      // превышении вытесняем самый старый конверт во всей очереди (FIFO).
+      if (maxTotal) {
+        while (liveCount >= maxTotal) {
+          const o = q.oldestGlobal.get();
+          if (!o) break;
+          dropRow(o);
+          liveCount = Math.max(0, liveCount - 1);
+        }
       }
       const envJson = JSON.stringify(envelope);
       const asBlob = blobDir && Buffer.byteLength(envJson) > blobThreshold;
       if (asBlob) writeBlob(mid, envJson);
       q.insert.run(mid, to, from || null, asBlob ? '' : envJson, silent ? 1 : 0, callPush ? 1 : 0, ts, asBlob ? 1 : 0);
+      liveCount += 1;
     },
     /** Все конверты, ждущие получателя (в порядке поступления). */
     queueFor(to) {
@@ -162,12 +191,16 @@ function createStore(dbPath, opts = {}) {
       const r = q.byId.get(mid);
       if (!r || r.to_pk !== to) return null;
       dropRow(r);
+      liveCount = Math.max(0, liveCount - 1);
       return r.from_pk || null;
     },
     /** Удалить всё старше `cutoffTs` (TTL). Вернуть число удалённых. */
     expireOlderThan(cutoffTs) {
       for (const r of q.blobsOlder.all(cutoffTs)) unlinkBlob(r.id);
-      return q.expire.run(cutoffTs).changes;
+      const removed = q.expire.run(cutoffTs).changes;
+      // массовое удаление — пересчитываем глобальный счётчик из БД (раз в час, дёшево).
+      liveCount = q.totalQueued.get().c;
+      return removed;
     },
     /**
      * Убрать из blobDir файлы, на которые не ссылается ни одна строка очереди
@@ -197,8 +230,24 @@ function createStore(dbPath, opts = {}) {
       const r = id.get.get(pk);
       return r ? r.sign_pk : null;
     },
-    bindSignKey(pk, signPk) {
-      id.set.run(pk, signPk); // INSERT OR IGNORE — первый выигрывает (TOFU)
+    /** Полная запись связки: { signPk, proven } либо null. */
+    getIdentity(pk) {
+      const r = id.get.get(pk);
+      return r ? { signPk: r.sign_pk, proven: !!r.proven } : null;
+    },
+    bindSignKey(pk, signPk, proven = false) {
+      // INSERT OR IGNORE — первый выигрывает (TOFU). proven=1 только если владение
+      // box-ключом реально доказано (ECDH-proof в relay.js).
+      id.set.run(pk, signPk, proven ? 1 : 0);
+    },
+    /**
+     * Переписать связку (H-6): разрешено ТОЛЬКО когда предъявитель доказал
+     * владение box-ключом адреса — тогда он может перебить чужую (в т.ч.
+     * сквоттерскую) привязку и закрепить её как proven. Легаси-путь этого не
+     * умеет, поэтому proven-связку нельзя перехватить без секретки box-ключа.
+     */
+    rebindSignKey(pk, signPk) {
+      id.rebind.run(pk, signPk, 1);
     },
 
     // --- push tokens --------------------------------------------------------

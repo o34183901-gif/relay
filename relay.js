@@ -40,11 +40,12 @@
 const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady } = require('./push');
-const { mergeRelays, isValidRelayUrl, normalizeRelayUrl } = require('./relays');
+const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost } = require('./relays');
 const { createStore } = require('./store');
 
 const TURN_SECRET = process.env.TURN_SECRET;
@@ -72,6 +73,10 @@ const PORT = process.env.PORT || 8787;
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
 const DB_FILE = process.env.RELAY_DB || path.join(__dirname, 'relay.db');
 const MAX_QUEUE_PER_USER = 500;
+// H-3: глобальный потолок числа недоставленных конвертов во ВСЕЙ очереди (по всем
+// получателям). Защита диска от абуза «рассылка на миллионы адресов». При
+// превышении вытесняется самый старый конверт целиком. Оператор меняет через env.
+const MAX_TOTAL_MESSAGES = Number(process.env.RELAY_MAX_TOTAL_MESSAGES) || 200000;
 const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
 // Тела конвертов крупнее порога (вложения) лежат файлами рядом с БД (тот же
 // volume), в очереди — только ссылка: БД остаётся маленькой и быстрой при
@@ -190,10 +195,26 @@ setInterval(() => {
   for (const [pk, t] of lastPushAt) if (t < cutoff) lastPushAt.delete(pk);
 }, 60000).unref();
 
+// H4: сколько доверенных обратных прокси перед релеем. X-Forwarded-For клиент
+// может подделать в НАЧАЛЕ списка; честный прокси (Caddy) ДОПИСЫВАЕТ реальный IP
+// в КОНЕЦ. Поэтому доверяем XFF только за известным числом прокси и берём
+// hops-й элемент С КОНЦА. По умолчанию 0 — XFF игнорируется (безопасно для
+// прямого режима); за Caddy оператор ставит RELAY_TRUST_PROXY=1.
+const TRUST_PROXY_HOPS = Math.max(0, Number(process.env.RELAY_TRUST_PROXY) || 0);
 function clientIp(req) {
-  const xff = req && req.headers && req.headers['x-forwarded-for'];
-  if (xff) return String(xff).split(',')[0].trim();
-  return (req && req.socket && req.socket.remoteAddress) || 'unknown';
+  const remote = (req && req.socket && req.socket.remoteAddress) || 'unknown';
+  if (TRUST_PROXY_HOPS > 0) {
+    const xff = req && req.headers && req.headers['x-forwarded-for'];
+    if (xff) {
+      const parts = String(xff)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const idx = parts.length - TRUST_PROXY_HOPS;
+      if (idx >= 0 && parts[idx]) return parts[idx];
+    }
+  }
+  return remote;
 }
 
 let seq = 0;
@@ -210,6 +231,48 @@ function verifySignature(nonceB64, signatureB64, signPublicKeyB64) {
       naclUtil.decodeBase64(signatureB64),
       naclUtil.decodeBase64(signPublicKeyB64)
     );
+  } catch (e) {
+    return false;
+  }
+}
+
+// H5/H6: доказательство владения box-ключом адреса. Должно совпадать с клиентским
+// crypto.proveBoxOwnership: HMAC-SHA512(ECDH(eph, boxPub), "licno-box-proof-v1|"||nonce).
+// Держим примитивы локально, чтобы релей оставался самодостаточным (server/).
+const BOX_PROOF_PREFIX = 'licno-box-proof-v1|';
+function hmacSha512(key, data) {
+  const B = 128;
+  let k = key;
+  if (k.length > B) k = nacl.hash(k);
+  if (k.length < B) {
+    const t = new Uint8Array(B);
+    t.set(k);
+    k = t;
+  }
+  const ipad = new Uint8Array(B);
+  const opad = new Uint8Array(B);
+  for (let i = 0; i < B; i++) {
+    ipad[i] = k[i] ^ 0x36;
+    opad[i] = k[i] ^ 0x5c;
+  }
+  const inner = nacl.hash(concatU8(ipad, data));
+  return nacl.hash(concatU8(opad, inner));
+}
+function concatU8(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+/** true, если boxProof доказывает владение box-секреткой адреса boxPubB64. */
+function verifyBoxProof(nonceB64, proofB64, boxPubB64, ephSecB64) {
+  try {
+    const shared = nacl.scalarMult(naclUtil.decodeBase64(ephSecB64), naclUtil.decodeBase64(boxPubB64));
+    const data = concatU8(naclUtil.decodeUTF8(BOX_PROOF_PREFIX), naclUtil.decodeBase64(nonceB64));
+    const expected = hmacSha512(shared, data).slice(0, 32);
+    const got = naclUtil.decodeBase64(proofB64);
+    if (got.length !== expected.length) return false;
+    return nacl.verify(got, expected); // constant-time
   } catch (e) {
     return false;
   }
@@ -306,7 +369,7 @@ function flushQueue(pubkey, ws) {
 function deliver(from, to, envelope, silent, callPush) {
   const id = nextId();
   // Always enqueue; the copy is removed only when the recipient acks (received).
-  store.enqueue({ id, to, from, envelope, silent, callPush, ts: Date.now(), maxPerUser: MAX_QUEUE_PER_USER });
+  store.enqueue({ id, to, from, envelope, silent, callPush, ts: Date.now(), maxPerUser: MAX_QUEUE_PER_USER, maxTotal: MAX_TOTAL_MESSAGES });
 
   const ws = online.get(to);
   if (ws) {
@@ -382,6 +445,7 @@ wss.on('connection', (ws, req) => {
   ws.pendingPubkey = null;
   ws.pendingSpk = null;
   ws.nonce = null;
+  ws.ephSec = null;
   ws.rateStart = Date.now();
   ws.rateCount = 0;
   ws.on('pong', () => (ws.isAlive = true));
@@ -407,6 +471,35 @@ wss.on('connection', (ws, req) => {
     } catch (e) {
       return send(ws, { type: 'error', error: 'bad json' });
     }
+    try {
+      handleFrameSafely(ws, msg);
+    } catch (e) {
+      console.error('[frame]', e && e.stack ? e.stack : e);
+      try { send(ws, { type: 'error', error: 'server error' }); } catch (e2) {}
+    }
+  });
+
+  ws.on('close', () => {
+    clearTimeout(ws.authTimer);
+    if (ws.ip) {
+      const c = (ipConns.get(ws.ip) || 1) - 1;
+      if (c <= 0) ipConns.delete(ws.ip);
+      else ipConns.set(ws.ip, c);
+    }
+    if (ws.pubkey && online.get(ws.pubkey) === ws) online.delete(ws.pubkey);
+  });
+});
+
+// Обработка одного разобранного кадра. Вынесено в отдельную функцию, чтобы
+// вызывающий мог обернуть её в try/catch (C-1: одна ошибка не роняет процесс).
+function handleFrameSafely(ws, msg) {
+    // C-1: JSON.parse принимает не только объекты — "null", "true", "1", "[...]"
+    // это валидный JSON. Обращение msg.type к такому значению роняло обработчик
+    // (напр. null.type -> TypeError), а глобального перехватчика нет — падал ВЕСЬ
+    // процесс от одного кадра неаутентифицированного клиента. Требуем объект.
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+      return send(ws, { type: 'error', error: 'bad frame' });
+    }
 
     // --- handshake: hello -> challenge -> auth ---
     if (msg.type === 'hello') {
@@ -419,7 +512,11 @@ wss.on('connection', (ws, req) => {
       ws.pendingPubkey = msg.pubkey;
       ws.pendingSpk = msg.signPublicKey;
       ws.nonce = naclUtil.encodeBase64(crypto.randomBytes(32));
-      return send(ws, { type: 'challenge', nonce: ws.nonce });
+      // H5/H6: эфемерная X25519-пара для доказательства владения box-ключом.
+      // Публичную половинку кладём в challenge; секретку держим до auth.
+      const eph = nacl.box.keyPair();
+      ws.ephSec = naclUtil.encodeBase64(eph.secretKey);
+      return send(ws, { type: 'challenge', nonce: ws.nonce, eph: naclUtil.encodeBase64(eph.publicKey) });
     }
 
     if (msg.type === 'auth') {
@@ -429,21 +526,47 @@ wss.on('connection', (ws, req) => {
       if (typeof msg.signature !== 'string') {
         return send(ws, { type: 'error', error: 'auth requires signature' });
       }
-      // TOFU: the signPublicKey bound to this pubkey must not change.
-      const boundSpk = store.getSignKey(ws.pendingPubkey);
-      const spk = boundSpk || ws.pendingSpk;
-      if (boundSpk && boundSpk !== ws.pendingSpk) {
-        return send(ws, { type: 'error', error: 'pubkey bound to a different key' });
-      }
-      if (!verifySignature(ws.nonce, msg.signature, spk)) {
+      // Шаг 1 (всегда, первым): подпись challenge доказывает владение ЗАЯВЛЕННЫМ
+      // Ed25519-ключом. Проверяем против предъявленного spk — если не сходится,
+      // это 'bad signature' независимо от состояния привязки.
+      if (!verifySignature(ws.nonce, msg.signature, ws.pendingSpk)) {
         return send(ws, { type: 'error', error: 'bad signature' });
       }
-      if (!boundSpk) store.bindSignKey(ws.pendingPubkey, ws.pendingSpk);
+      // Шаг 2 (H5/H6): доказательство владения BOX-ключом адреса. Новые клиенты
+      // всегда присылают boxProof; старые — нет (легаси-путь, ниже).
+      const boxProven =
+        typeof msg.boxProof === 'string' &&
+        ws.ephSec &&
+        verifyBoxProof(ws.nonce, msg.boxProof, ws.pendingPubkey, ws.ephSec);
+
+      const bound = store.getIdentity(ws.pendingPubkey); // { signPk, proven } | null
+      if (bound && bound.proven) {
+        // Адрес доказанно принадлежит владельцу box-ключа: подтвердить/сменить
+        // связку можно ТОЛЬКО снова доказав владение box-ключом. Это закрывает
+        // и oracle подписи (H5: перехваченной подписи мало), и захват (H6).
+        if (!boxProven) {
+          return send(ws, { type: 'error', error: 'box ownership proof required' });
+        }
+        if (bound.signPk !== ws.pendingSpk) store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk);
+      } else if (bound && !bound.proven) {
+        if (boxProven) {
+          // Владелец box-ключа перебивает прежнюю (возможно сквоттерскую) связку
+          // и закрепляет её как доказанную — сквоттер потом уже не отберёт.
+          store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk);
+        } else if (bound.signPk !== ws.pendingSpk) {
+          // Легаси-путь (TOFU): сменить незакреплённый sign-ключ нельзя.
+          return send(ws, { type: 'error', error: 'pubkey bound to a different key' });
+        }
+      } else {
+        // Первая регистрация: закрепляем; proven только при доказанном владении.
+        store.bindSignKey(ws.pendingPubkey, ws.pendingSpk, boxProven);
+      }
       // authenticated: take ownership of this pubkey
       counters.authOk += 1;
       ws.authed = true;
       ws.pubkey = ws.pendingPubkey;
       ws.nonce = null;
+      ws.ephSec = null;
       clearTimeout(ws.authTimer);
       // If a stale socket still claims this pubkey, replace it.
       const prev = online.get(ws.pubkey);
@@ -455,15 +578,8 @@ wss.on('connection', (ws, req) => {
       return send(ws, { type: 'ready', queued: flushed, prekeys: store.countOtps(ws.pubkey) });
     }
 
-    // --- relay directory (public: allowed before auth for bootstrap) ---
+    // --- relay directory (public READ allowed before auth for bootstrap) ---
     if (msg.type === 'relays') {
-      return send(ws, { type: 'relays', relays: relayDir });
-    }
-    if (msg.type === 'relay-advertise') {
-      // кто-то (клиент/релей) сообщает об известном релее — валидируем и учим
-      const urls = Array.isArray(msg.relays) ? msg.relays : [msg.url];
-      const clean = urls.filter((u) => isValidRelayUrl(u));
-      if (clean.length) learnRelays(clean);
       return send(ws, { type: 'relays', relays: relayDir });
     }
 
@@ -475,6 +591,16 @@ wss.on('connection', (ws, req) => {
 
     // --- everything past here requires authentication ---
     if (!ws.authed) return send(ws, { type: 'error', error: 'not authenticated' });
+
+    if (msg.type === 'relay-advertise') {
+      // M-1: учить каталог может ТОЛЬКО аутентифицированный клиент/релей — иначе
+      // аноним отравлял бы список мусором и подсовывал вредоносные релеи (в т.ч.
+      // как вектор SSRF через gossip). Плюс валидация URL (без приватных адресов).
+      const urls = Array.isArray(msg.relays) ? msg.relays : [msg.url];
+      const clean = urls.filter((u) => isValidRelayUrl(u));
+      if (clean.length) learnRelays(clean);
+      return send(ws, { type: 'relays', relays: relayDir });
+    }
 
     if (msg.type === 'turn') {
       return send(ws, { type: 'turn', iceServers: turnIceServers() });
@@ -540,18 +666,7 @@ wss.on('connection', (ws, req) => {
     }
 
     send(ws, { type: 'error', error: 'unknown type' });
-  });
-
-  ws.on('close', () => {
-    clearTimeout(ws.authTimer);
-    if (ws.ip) {
-      const c = (ipConns.get(ws.ip) || 1) - 1;
-      if (c <= 0) ipConns.delete(ws.ip);
-      else ipConns.set(ws.ip, c);
-    }
-    if (ws.pubkey && online.get(ws.pubkey) === ws) online.delete(ws.pubkey);
-  });
-});
+}
 
 // --- gossip: периодически синхронизируем каталог с известными релеями --------
 // Каждый релей тянет /relays у пиров и сливает списки — так новый узел за
@@ -559,8 +674,32 @@ wss.on('connection', (ws, req) => {
 function relayHttpBase(wsUrl) {
   return wsUrl.replace(/^ws:\/\//i, 'http://').replace(/^wss:\/\//i, 'https://');
 }
+// M-1 (SSRF): перед исходящим запросом к пиру резолвим его хост и отказываемся,
+// если он указывает на приватный/loopback/link-local адрес. isValidRelayUrl уже
+// блокирует ЛИТЕРАЛЬНЫЕ приватные IP; здесь ловим ХОСТНЕЙМЫ, которые резолвятся
+// внутрь сети (DNS-rebinding-подобный вектор через отравленный каталог).
+function hostOf(wsUrl) {
+  return String(wsUrl)
+    .replace(/^wss?:\/\//i, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/^\[|\]$/g, '');
+}
+async function peerIsSafe(wsUrl) {
+  const host = hostOf(wsUrl);
+  if (!host || isPrivateHost(host)) return false;
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    if (!addrs.length) return false;
+    for (const a of addrs) if (isPrivateHost(a.address)) return false;
+    return true;
+  } catch (e) {
+    return false; // не резолвится — не ходим
+  }
+}
 async function fetchPeerRelays(wsUrl) {
   if (typeof fetch !== 'function') return null; // Node < 18
+  if (!(await peerIsSafe(wsUrl))) return null;
   const url = relayHttpBase(wsUrl) + '/relays';
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 5000);
@@ -580,6 +719,7 @@ async function fetchPeerRelays(wsUrl) {
 // узнаёт про нас — распространение становится двунаправленным.
 async function pushSelfTo(wsUrl) {
   if (typeof fetch !== 'function') return;
+  if (!(await peerIsSafe(wsUrl))) return;
   const url = relayHttpBase(wsUrl) + '/relays';
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 5000);
@@ -644,6 +784,16 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// C-1 (backstop): узел store-and-forward не должен умирать от одного битого
+// кадра/промиса. Любую необработанную ошибку логируем и продолжаем работу — это
+// многократно безопаснее падения всего процесса (перманентный DoS всей ноды).
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err && err.stack ? err.stack : err);
+});
 
 server.listen(PORT, () => {
   console.log(`Лично relay listening on :${PORT} (health: /health, directory: /relays)`);
