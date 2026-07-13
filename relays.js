@@ -167,7 +167,7 @@ const COTURN_DENIED_RANGES = [
   'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // link-local
 ];
 
-function coturnConfigText(secret, { turnHost, pidfile } = {}) {
+function coturnConfigText(secret, { turnHost, pidfile, userdb } = {}) {
   const lines = [
     'listening-port=3478',
     'fingerprint',
@@ -188,6 +188,11 @@ function coturnConfigText(secret, { turnHost, pidfile } = {}) {
     'log-file=stdout',
   ];
   if (pidfile) lines.push(`pidfile=${pidfile}`);
+  // ДПЛ-5: coturn открывает SQLite-базу пользователей при старте даже когда
+  // аутентификация идёт через use-auth-secret (REST/эфемерные креды) и БД не нужна.
+  // Дефолт /var/lib/turn/turndb — root-only, под non-root даёт «unable to open
+  // database file». Уводим в writable data-том (пустая БД, для auth не используется).
+  if (userdb) lines.push(`userdb=${userdb}`);
   if (turnHost) lines.push(`external-ip=${turnHost}`);
   for (const r of COTURN_DENIED_RANGES) lines.push(`denied-peer-ip=${r}`);
   lines.push('');

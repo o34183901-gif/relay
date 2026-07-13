@@ -438,6 +438,7 @@ if (TURN_HOST) {
       coturnConfigText(turnSecret, {
         turnHost: TURN_HOST,
         pidfile: path.join(path.dirname(COTURN_CONF_FILE), 'turnserver.pid'),
+        userdb: path.join(path.dirname(COTURN_CONF_FILE), 'turndb'),
       }),
       { mode: 0o600 }
     );
