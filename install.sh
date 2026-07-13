@@ -42,7 +42,10 @@ apt-get update -y
 apt-get install -y curl ca-certificates gnupg ufw
 
 log "Установка Node.js 20 (если нужно)"
-if ! command -v node >/dev/null || [[ "$(node -v | cut -c2-3)" -lt 18 ]]; then
+# ДПЛ-7: корректно извлекаем МАЖОРНУЮ версию. Прежнее `cut -c2-3` на однозначном
+# мажоре (`v8.x` -> "8.") давало нечисловое сравнение и ломало ветку установки.
+NODE_MAJOR="$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')"
+if ! command -v node >/dev/null || [ "${NODE_MAJOR:-0}" -lt 18 ]; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 fi
@@ -153,6 +156,14 @@ else
   PROXY_ENV=""
 fi
 
+# ДПЛ-2: выделенный непривилегированный пользователь. Сетевой сервис с недоверенным
+# вводом не должен работать от root — RCE/повреждение памяти иначе даёт root на всей
+# машине. Создаём пользователя и передаём ему рабочий каталог (БД/blobs/секреты).
+if ! id -u licno >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin licno
+fi
+chown -R licno:licno "${APP_DIR}"
+
 cat >/etc/systemd/system/${SERVICE}.service <<UNIT
 [Unit]
 Description=Licno relay (encrypted store-and-forward)
@@ -170,12 +181,13 @@ ${TURN_ENV}
 ${PROXY_ENV}
 Restart=always
 RestartSec=3
-User=root
-# M-3: базовый харденинг systemd — RCE в релее не должен давать доступ ко всей ФС.
-# ProtectSystem=full делает /usr,/boot,/etc только для чтения (релей пишет лишь в
-# APP_DIR); NoNewPrivileges запрещает повышение прав.
+# ДПЛ-2: под выделенным пользователем + ProtectSystem=strict (вся ФС read-only,
+# кроме ReadWritePaths). RCE в релее не даёт ни root, ни записи вне рабочего каталога.
+User=licno
+Group=licno
 NoNewPrivileges=yes
-ProtectSystem=full
+ProtectSystem=strict
+ReadWritePaths=${APP_DIR}
 ProtectHome=yes
 PrivateTmp=yes
 

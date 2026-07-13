@@ -29,8 +29,22 @@ if ! command -v cosign >/dev/null 2>&1; then
     aarch64|arm64) A=arm64 ;;
     *) A=amd64 ;;
   esac
-  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${A}" -o /usr/local/bin/cosign
-  chmod 0755 /usr/local/bin/cosign
+  base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+  tmp="$(mktemp -d)"
+  # ДПЛ-3: НЕ ставим бинарь «как есть». cosign — корень доверия всей проверки
+  # подписей образов, поэтому сверяем SHA256 скачанного бинаря с ОПУБЛИКОВАННЫМ
+  # sigstore файлом контрольных сумм этого релиза. Несовпадение (MITM/подмена) —
+  # прерываем установку, а не «успешно проверяем» любой образ подделанным cosign.
+  curl -fsSL "${base}/cosign-linux-${A}" -o "${tmp}/cosign"
+  curl -fsSL "${base}/cosign_checksums.txt" -o "${tmp}/sums.txt"
+  expected="$(awk -v f="cosign-linux-${A}" '$2==f {print $1}' "${tmp}/sums.txt")"
+  actual="$(sha256sum "${tmp}/cosign" | awk '{print $1}')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "ОШИБКА: контрольная сумма cosign не совпала (ожидалось '$expected', получено '$actual') — прерываю." >&2
+    rm -rf "$tmp"; exit 1
+  fi
+  install -m 0755 "${tmp}/cosign" /usr/local/bin/cosign
+  rm -rf "$tmp"
 fi
 cosign version >/dev/null 2>&1 || { echo "cosign не работает"; exit 1; }
 

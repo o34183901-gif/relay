@@ -1,5 +1,8 @@
 # Caddy автоматически получает и продлевает TLS-сертификат Let's Encrypt для
 # RELAY_HOST и проксирует шифрованный WebSocket (wss://) на релей внутри сети.
 {$RELAY_HOST} {
+	# ДПЛ-7: HSTS — принуждаем клиентов к HTTPS/WSS на год вперёд (downgrade к ws:// по
+	# этому хосту не выполнится). TLS Caddy выпускает автоматически.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	reverse_proxy relay:8787
 }
