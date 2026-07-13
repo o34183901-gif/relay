@@ -47,19 +47,25 @@ const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady } = require('./push');
-const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost } = require('./relays');
+const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText } = require('./relays');
 const { createStore } = require('./store');
 
-const TURN_SECRET = process.env.TURN_SECRET;
 const TURN_HOST = process.env.TURN_HOST;
+// H-2: секрет TURN больше НЕ передаётся открытым аргументом coturn или отдельной
+// переменной окружения на каждый сервер (виден в ps/`docker inspect`/world-
+// readable файлах). Источник разрешается при старте (resolveTurnSecret ниже,
+// после определения DB_FILE) в turnSecret; сам релей владеет секретом и пишет
+// конфиг coturn в data-том. Всё это едет в образе через watchtower, поэтому фикс
+// автономен: серверы подхватывают его сами.
+let turnSecret = null;
 
 // Ephemeral coturn REST credentials (valid ~1h), so no long-lived TURN
 // password ships in the app.
 function turnIceServers() {
   const base = [{ urls: 'stun:stun.l.google.com:19302' }];
-  if (!TURN_SECRET || !TURN_HOST) return base;
+  if (!turnSecret || !TURN_HOST) return base;
   const username = `${Math.floor(Date.now() / 1000) + 3600}:licno`;
-  const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+  const credential = crypto.createHmac('sha1', turnSecret).update(username).digest('base64');
   return [
     { urls: `stun:${TURN_HOST}:3478` },
     {
@@ -336,6 +342,78 @@ function loadOrCreateRelaySignKeys() {
 const RELAY_KEYS = loadOrCreateRelaySignKeys();
 function signRelayAuth(cnonce) {
   return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
+}
+
+// --- TURN: секрет и конфиг coturn во владении релея (H-2/M-4) --------------
+// Автономность: релей сам владеет секретом TURN и пишет конфиг coturn в data-том
+// (0600). coturn стартует с `-c <data>/turnserver.conf` и читает секрет ОТТУДА —
+// секрета больше нет в аргументах процесса, env и world-readable файлах. Приоритет
+// источника: TURN_SECRET (совместимость/override) -> TURN_SECRET_FILE -> само-
+// генерация + персист (как relay-sign.key). Всё это едет в образе через watchtower.
+const TURN_SECRET_FILE = process.env.TURN_SECRET_FILE || path.join(path.dirname(DB_FILE), 'turn-secret');
+const COTURN_CONF_FILE = process.env.RELAY_COTURN_CONF || path.join(path.dirname(DB_FILE), 'turnserver.conf');
+function resolveTurnSecret() {
+  if (process.env.TURN_SECRET) return process.env.TURN_SECRET; // явный override оператора
+  try {
+    const f = fs.readFileSync(TURN_SECRET_FILE, 'utf8').trim();
+    if (f) return f;
+  } catch (e) {}
+  const gen = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.writeFileSync(TURN_SECRET_FILE, gen, { mode: 0o600 });
+  } catch (e) {}
+  return gen;
+}
+
+// Встроенный coturn (флаг RELAY_EMBED_COTURN): в Docker-образе релей сам запускает
+// turnserver дочерним процессом — отдельного контейнера coturn НЕТ, весь TURN
+// (секрет+конфиг+процесс) живёт в образе, который watchtower обновляет → будущие
+// правки TURN автономны. Флаг ставит ТОЛЬКО compose образа; bare-metal (системный
+// coturn под systemd) его не ставит, поэтому второго coturn не поднимается.
+let coturnChild = null;
+let coturnStopped = false;
+function startEmbeddedCoturn() {
+  if (coturnChild || coturnStopped) return;
+  const { spawn } = require('child_process');
+  try {
+    coturnChild = spawn('turnserver', ['-c', COTURN_CONF_FILE], { stdio: ['ignore', 'inherit', 'inherit'] });
+  } catch (e) {
+    console.warn('[turn] встроенный coturn не запустился:', e && e.message);
+    coturnChild = null;
+    return;
+  }
+  coturnChild.on('error', (e) => console.warn('[turn] coturn:', e && e.message));
+  coturnChild.on('exit', (code, sig) => {
+    coturnChild = null;
+    if (coturnStopped) return;
+    console.warn(`[turn] coturn завершился (code=${code} sig=${sig}) — перезапуск через 3с`);
+    setTimeout(startEmbeddedCoturn, 3000).unref();
+  });
+  console.log(`[turn] встроенный coturn запущен: turnserver -c ${COTURN_CONF_FILE}`);
+}
+function stopEmbeddedCoturn() {
+  coturnStopped = true;
+  if (coturnChild) {
+    try {
+      coturnChild.kill('SIGTERM');
+    } catch (e) {}
+    coturnChild = null;
+  }
+}
+
+if (TURN_HOST) {
+  turnSecret = resolveTurnSecret();
+  try {
+    fs.writeFileSync(COTURN_CONF_FILE, coturnConfigText(turnSecret, { turnHost: TURN_HOST }), { mode: 0o600 });
+    console.log(`[turn] coturn config -> ${COTURN_CONF_FILE} (секрет во владении релея, 0600)`);
+  } catch (e) {
+    console.warn('[turn] не удалось записать конфиг coturn:', e && e.message);
+  }
+  // Встроенный coturn стартуем только по флагу (Docker-образ) — bare-metal нет.
+  if (process.env.RELAY_EMBED_COTURN) startEmbeddedCoturn();
+} else {
+  // Без TURN_HOST TURN не анонсируется (только STUN) — поведение как раньше.
+  turnSecret = process.env.TURN_SECRET || null;
 }
 
 // --- X3DH prekeys ----------------------------------------------------------
@@ -916,6 +994,7 @@ setInterval(() => {
 }, 3600 * 1000).unref();
 
 function shutdown() {
+  stopEmbeddedCoturn();
   try {
     store.close();
   } catch (e) {}
