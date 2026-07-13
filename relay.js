@@ -208,7 +208,11 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 function metricsAuthorized(req) {
-  if (!METRICS_TOKEN) return true;
+  // M-1: без заданного токена /metrics больше НЕ открыт всему интернету. Разрешаем
+  // только приватный/loopback источник (внутренняя сеть/localhost/Docker) — публичный
+  // скрейп через Caddy (реальный клиент виден по X-Forwarded-For) отвергается. Задан
+  // токен — как раньше: пускаем по ?token=/Bearer с любого адреса.
+  if (!METRICS_TOKEN) return isPrivateHost(clientIp(req));
   const url = new URL(req.url, 'http://x');
   if (safeEqual(url.searchParams.get('token'), METRICS_TOKEN)) return true;
   const auth = (req.headers && req.headers.authorization) || '';
@@ -1067,9 +1071,9 @@ server.listen(PORT, () => {
       ? 'FCM configured — wake-up pushes enabled'
       : 'FCM NOT configured — closed-app notifications will NOT be sent (add service-account.json)'
   );
-  // M11: без токена /metrics открыт всем и раскрывает размеры очередей, число
-  // соединений и память узла. Предупреждаем оператора — закрыть через env.
+  // M-1: без токена /metrics доступен ТОЛЬКО из приватной сети/localhost (публичный
+  // скрейп отвергается). Для внешнего мониторинга задайте RELAY_METRICS_TOKEN.
   if (!METRICS_TOKEN) {
-    console.warn('[metrics] /metrics OPEN to everyone — set RELAY_METRICS_TOKEN to require a token');
+    console.log('[metrics] /metrics доступен только из приватной сети/localhost (задайте RELAY_METRICS_TOKEN для внешнего доступа)');
   }
 });
