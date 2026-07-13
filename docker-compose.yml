@@ -11,15 +11,13 @@
 
 services:
   relay:
-    image: ghcr.io/o34183901-gif/relay:latest
-    # Вместо готового образа можно собирать локально из репозитория, но тогда
-    # авто-обновление watchtower НЕ работает (обновлять придётся git pull +
-    # docker compose up -d --build):
+    # Флот следит за каналом :stable. Обновление применяет верифицированный
+    # апдейтер на хосте (deploy/licno-update.sh): он ПРОВЕРЯЕТ cosign-подпись
+    # образа перед тем как поднять его (H-1). Никакого контейнера с docker.sock.
+    image: ghcr.io/o34183901-gif/relay:${LICNO_CHANNEL:-stable}
+    # Локальная сборка вместо готового образа (тогда авто-обновление не работает):
     # build: .
     restart: unless-stopped
-    labels:
-      # watchtower обновляет только помеченные контейнеры (наш код)
-      - com.centurylinklabs.watchtower.enable=true
     environment:
       RELAY_SELF_URL: ${RELAY_SELF_URL}
       RELAY_PEERS: ${RELAY_PEERS:-}
@@ -70,19 +68,11 @@ services:
   # Отдельного сервиса coturn больше нет — его удаление применяется командой
   # `docker compose up -d --remove-orphans`.
 
-  # Авто-обновление: раз в 5 минут проверяет ghcr на новую версию образа релея и
-  # сам пересоздаёт контейнер (данные в volume сохраняются). Так релеи обновляются
-  # сами — достаточно опубликовать новый образ (push в репозиторий relay).
-  watchtower:
-    image: containrrr/watchtower
-    restart: unless-stopped
-    environment:
-      # свежий Docker-демон требует API >= 1.40; иначе watchtower берёт старую
-      # версию (1.25) и падает "client version too old".
-      DOCKER_API_VERSION: "1.40"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 300 --cleanup --label-enable
+  # Авто-обновление БОЛЬШЕ НЕ через watchtower (H-1): его заменил верифицированный
+  # апдейтер на хосте — systemd-таймер, который проверяет cosign-подпись образа
+  # :stable ПЕРЕД применением и не монтирует docker.sock в контейнер. Установка
+  # разово: `sudo bash deploy/install-updater.sh` (см. deploy/ и README).
+  # Старый сервис watchtower удаляется командой `docker compose up -d --remove-orphans`.
 
 volumes:
   relay-data:

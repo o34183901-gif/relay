@@ -1,0 +1,53 @@
+name: Promote / rollback relay channel
+
+# Рычаг для E (иммутабельные теги) и D (канареечный выкат):
+#  • promote  — перевести канал :stable на образ из :canary или конкретный :sha-…
+#               (после «отстоя» канарейки), чтобы обновить весь флот;
+#  • rollback — вернуть :stable на заведомо хороший прошлый :sha-… при инциденте.
+#
+# Ретег делается через `docker buildx imagetools create` — БЕЗ пула слоёв и с
+# сохранением digest, поэтому уже поставленная cosign-подпись остаётся валидной
+# (сервера проверяют подпись именно по digest). Запуск — вручную (Actions →
+# Run workflow), доступ ограничивается branch/environment-правилами репозитория.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Источник (тег или sha-…), напр. canary или sha-<commit>'
+        required: true
+        default: 'canary'
+      target:
+        description: 'Целевой канал'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - canary
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/relay
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag ${{ inputs.source }} -> ${{ inputs.target }} (digest preserved)
+        run: |
+          set -euo pipefail
+          echo "Promote ${IMAGE}:${{ inputs.source }} -> ${IMAGE}:${{ inputs.target }}"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${{ inputs.target }}" \
+            "${IMAGE}:${{ inputs.source }}"
+          echo "Готово. Флот на канале ${{ inputs.target }} подтянет образ (после cosign-проверки)."

@@ -1,0 +1,12 @@
+[Unit]
+Description=Licno relay verified auto-update (cosign-verified pull)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# Каталог с docker-compose.yml подставляет install-updater.sh:
+Environment=LICNO_COMPOSE_DIR=/opt/licno-relay
+# Канал (stable/canary) задаётся в .env стека (LICNO_CHANNEL) — апдейтер берёт
+# реальный образ из `docker compose config`, поэтому здесь дублировать не нужно.
+ExecStart=/usr/local/bin/licno-update.sh
