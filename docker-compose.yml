@@ -33,12 +33,23 @@ services:
       RELAY_GOSSIP_TOKEN: ${RELAY_GOSSIP_TOKEN:-}
       RELAY_METRICS_TOKEN: ${RELAY_METRICS_TOKEN:-}
       RELAY_MAX_QUEUE_BYTES: ${RELAY_MAX_QUEUE_BYTES:-8589934592}
-      TURN_SECRET: ${TURN_SECRET}
+      # H-2: TURN_SECRET релею больше НЕ передаётся — он сам генерирует секрет и
+      # хранит его в data-томе (0600), сам пишет конфиг coturn. RELAY_EMBED_COTURN=1
+      # включает встроенный coturn (turnserver дочерним процессом ЭТОГО контейнера)
+      # — отдельный сервис coturn не нужен, весь TURN едет в образе (автономно).
       TURN_HOST: ${TURN_HOST}
+      RELAY_EMBED_COTURN: "1"
     volumes:
       - relay-data:/data
     expose:
       - "8787"
+    # Порты TURN для звонков: сигналинг/STUN (3478) и диапазон медиа-ретрансляции.
+    # Публичный IP клиентам сообщается через external-ip=TURN_HOST в конфиге coturn.
+    # Открыть в firewall: 3478/tcp, 3478/udp, 49160-49200/udp.
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
 
   caddy:
     image: caddy:2-alpine
@@ -54,25 +65,10 @@ services:
       - caddy-data:/data
       - caddy-config:/config
 
-  # TURN-сервер для звонков (обязателен: гарантирует соединение за строгим NAT).
-  # network_mode: host — coturn слушает 3478 и диапазон 49160-49200/udp прямо на
-  # хосте; эти порты нужно открыть в firewall (см. README).
-  coturn:
-    image: coturn/coturn:latest
-    network_mode: host
-    restart: unless-stopped
-    command:
-      - -n
-      - --use-auth-secret
-      - --static-auth-secret=${TURN_SECRET}
-      - --realm=licno
-      - --listening-port=3478
-      - --external-ip=${TURN_HOST}
-      - --no-tls
-      - --no-dtls
-      - --no-cli
-      - --min-port=49160
-      - --max-port=49200
+  # TURN-сервер для звонков теперь ВСТРОЕН в контейнер relay (RELAY_EMBED_COTURN):
+  # релей сам запускает turnserver дочерним процессом и владеет секретом/конфигом.
+  # Отдельного сервиса coturn больше нет — его удаление применяется командой
+  # `docker compose up -d --remove-orphans`.
 
   # Авто-обновление: раз в 5 минут проверяет ghcr на новую версию образа релея и
   # сам пересоздаёт контейнер (данные в volume сохраняются). Так релеи обновляются

@@ -12,8 +12,12 @@
 FROM node:20-slim
 WORKDIR /app
 
+# python3/make/g++ — сборка нативного better-sqlite3; coturn — TURN-сервер,
+# который релей запускает дочерним процессом (RELAY_EMBED_COTURN): отдельного
+# контейнера coturn нет, весь TURN (секрет+конфиг+процесс) едет в этом образе и
+# обновляется через watchtower автономно.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
+  && apt-get install -y --no-install-recommends python3 make g++ coturn \
   && rm -rf /var/lib/apt/lists/*
 
 # Сначала только манифест — кешируем npm install между сборками.
