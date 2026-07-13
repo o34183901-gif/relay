@@ -133,8 +133,9 @@ if [[ "$MODE" == "tls" ]]; then
 else
   SELF_URL="ws://${PUBIP:-$(curl -fsSL https://api.ipify.org || echo 127.0.0.1)}:8787"
 fi
-DIR_ENV="Environment=RELAY_SELF_URL=${SELF_URL}
-Environment=RELAY_DIR=${APP_DIR}/relays.json"
+# L-8: RELAY_DIR удалён — relay.js его не читает (мёртвая настройка). Каталог
+# релеев живёт в SQLite-БД (RELAY_DB), отдельный путь не нужен.
+DIR_ENV="Environment=RELAY_SELF_URL=${SELF_URL}"
 if [[ -n "${RELAY_PEERS:-}" ]]; then
   DIR_ENV="${DIR_ENV}
 Environment=RELAY_PEERS=${RELAY_PEERS}"
