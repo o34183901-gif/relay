@@ -167,6 +167,7 @@ const counters = {
   acked: 0, // квитанций received (сообщение реально дошло)
   pushes: 0, // отправлено wake-up пушей
   authOk: 0, // успешных аутентификаций
+  dropped: 0, // СРВ-2: конверт отброшен (очередь получателя полна, нет своих слотов)
 };
 
 function renderMetrics() {
@@ -191,6 +192,7 @@ function renderMetrics() {
   metric('licno_messages_in_total', 'counter', 'Envelopes accepted from senders since start.', counters.msgsIn);
   metric('licno_messages_delivered_online_total', 'counter', 'Envelopes pushed to an online recipient since start.', counters.deliveredOnline);
   metric('licno_messages_queued_offline_total', 'counter', 'Envelopes queued for an offline recipient since start.', counters.queuedOffline);
+  metric('licno_messages_dropped_total', 'counter', 'Envelopes dropped (recipient queue full, no own slots) since start.', counters.dropped);
   metric('licno_messages_acked_total', 'counter', 'Envelopes confirmed received by recipients since start.', counters.acked);
   metric('licno_push_sent_total', 'counter', 'Wake-up pushes sent since start.', counters.pushes);
   metric('licno_auth_success_total', 'counter', 'Successful client authentications since start.', counters.authOk);
@@ -597,10 +599,16 @@ function deliver(from, to, envelope, silent, callPush) {
     return { queued: false, id };
   }
 
-  // СРВ-2: получатель офлайн и конверт не влез в очередь — не будим пушем (нечего
-  // доставлять) и не считаем queued. Ack всё равно вернём (см. вызов), чтобы
-  // отправитель не зациклил переотправку в переполненную очередь.
-  if (!stored) return { queued: false, id };
+  // СРВ-2: получатель офлайн и конверт НЕ влез в очередь (полная + нет своих слотов).
+  // Возвращаем dropped:true — отправитель узнаёт, что конверт ОТБРОШЕН, и не считает
+  // это доставкой. Раньше был обычный queued:false, неотличимый от онлайн-доставки,
+  // из-за чего отброшенное сообщение молча показывалось как «отправлено» (тихая
+  // потеря). Ack всё равно шлём (не зацикливать ретрай в полную очередь), но со
+  // флагом — клиент помечает «не доставлено» и не выдаёт ложный ✓.
+  if (!stored) {
+    counters.dropped += 1;
+    return { queued: false, dropped: true, id };
+  }
 
   // recipient offline -> maybe wake them
   counters.queuedOffline += 1;
@@ -947,7 +955,9 @@ function handleFrameSafely(ws, msg) {
       }
       counters.msgsIn += 1;
       const r = deliver(ws.pubkey, msg.to, msg.envelope, !!msg.silent, !!msg.callPush);
-      return send(ws, { type: 'ack', ref: msg.ref, id: r.id, queued: r.queued });
+      // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
+      // доставлено» вместо ложного «отправлено». Старый клиент поле игнорирует.
+      return send(ws, { type: 'ack', ref: msg.ref, id: r.id, queued: r.queued, dropped: !!r.dropped });
     }
 
     send(ws, { type: 'error', error: 'unknown type' });
