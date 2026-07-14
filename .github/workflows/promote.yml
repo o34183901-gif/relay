@@ -1,4 +1,4 @@
-name: Promote / rollback relay channel
+name: Промоушен/откат образа релея (canary ↔ stable)
 
 # Рычаг для E (иммутабельные теги) и D (канареечный выкат):
 #  • promote  — перевести канал :stable на образ из :canary или конкретный :sha-…

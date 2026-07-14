@@ -1,4 +1,4 @@
-name: Build relay image
+name: Сборка и публикация Docker-образа релея
 
 # Собирает, СМОУК-ТЕСТИРУЕТ, ПОДПИСЫВАЕТ (cosign keyless) и публикует Docker-образ
 # релея в GHCR.
@@ -15,19 +15,9 @@ name: Build relay image
 #  • least-privilege GITHUB_TOKEN + OIDC (id-token) только для подписи;
 #  • все actions запинены по коммит-SHA; provenance (SLSA) + SBOM прикладываются.
 
+# ТОЛЬКО ручной запуск (Actions → Run workflow). Push-триггеры убраны — образ
+# собирается/подписывается/публикуется вручную, минуты Actions не тратятся на коммиты.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'relay.js'
-      - 'relays.js'
-      - 'store.js'
-      - 'push.js'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'Dockerfile'
-      - 'docker-entrypoint.sh'
-      - '.github/workflows/image.yml'
   workflow_dispatch:
 
 # Минимально необходимые права. id-token — только для keyless-подписи cosign.
