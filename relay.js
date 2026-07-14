@@ -46,7 +46,7 @@ const dns = require('dns').promises;
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
-const { sendPush, sendCallPush, pushReady } = require('./push');
+const { sendPush, sendCallPush, pushReady, setVapidKeys, vapidPublicKey, generateVapidKeys } = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
 
@@ -95,6 +95,12 @@ const MAX_QUEUE_BYTES = Number(process.env.RELAY_MAX_QUEUE_BYTES) || 8 * 1024 * 
 // флудер не выдавливает чужие (реальные) сообщения жертвы. < MAX_QUEUE_PER_USER.
 const MAX_QUEUE_PER_SENDER = Number(process.env.RELAY_MAX_QUEUE_PER_SENDER) || 100;
 const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
+// M-02: глобальный потолок числа зарегистрированных identity. У таблиц identities/
+// prekeys/push_tokens (в отличие от очереди) не было ни TTL, ни лимита, ни
+// вытеснения — Sybil-регистрация (hello→auth→prekeys-put→register в цикле) могла
+// неограниченно раздувать каталог и переполнить диск. При превышении вытесняем
+// самые холодные identity БЕЗ ожидающих конвертов (см. store.evictColdIdentities).
+const MAX_IDENTITIES = Number(process.env.RELAY_MAX_IDENTITIES) || 500000;
 // Тела конвертов крупнее порога (вложения) лежат файлами рядом с БД (тот же
 // volume), в очереди — только ссылка: БД остаётся маленькой и быстрой при
 // потоке фото/видео офлайн-получателям.
@@ -372,6 +378,40 @@ const RELAY_KEYS = loadOrCreateRelaySignKeys();
 function signRelayAuth(cnonce) {
   return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
 }
+
+// --- VAPID для web-push (UnifiedPush) --------------------------------------
+// Пара ключей web-push (RFC 8292). Источник: env RELAY_VAPID_PUBLIC/PRIVATE →
+// файл рядом с БД → генерация+персист (как relay-sign.key). Публичный ключ
+// отдаётся клиенту в кадре ready; приватным релей подписывает web-push. Во флоте
+// оператор ставит ОДНУ пару на свои релеи (иначе подписка, сделанная под ключ
+// релея A, не примется релеем B) — как и с общим FCM service-account.
+const RELAY_VAPID_KEY_FILE = process.env.RELAY_VAPID_KEY_FILE || path.join(path.dirname(DB_FILE), 'vapid.json');
+function resolveVapidKeys() {
+  let pub = process.env.RELAY_VAPID_PUBLIC || null;
+  let priv = process.env.RELAY_VAPID_PRIVATE || null;
+  if (!pub || !priv) {
+    try {
+      const f = JSON.parse(fs.readFileSync(RELAY_VAPID_KEY_FILE, 'utf8'));
+      if (f && f.publicKey && f.privateKey) {
+        pub = f.publicKey;
+        priv = f.privateKey;
+      }
+    } catch (e) {}
+  }
+  if (!pub || !priv) {
+    try {
+      const kp = generateVapidKeys();
+      pub = kp.publicKey;
+      priv = kp.privateKey;
+      fs.writeFileSync(RELAY_VAPID_KEY_FILE, JSON.stringify({ publicKey: pub, privateKey: priv }), { mode: 0o600 });
+    } catch (e) {
+      console.warn('[push] не удалось создать/сохранить VAPID:', e && e.message);
+      return;
+    }
+  }
+  setVapidKeys(pub, priv, process.env.RELAY_VAPID_SUBJECT);
+}
+resolveVapidKeys();
 
 // --- TURN: секрет и конфиг coturn во владении релея (H-2/M-4) --------------
 // Автономность: релей сам владеет секретом TURN и пишет конфиг coturn в data-том
@@ -796,19 +836,19 @@ function handleFrameSafely(ws, msg) {
         if (!boxProven) {
           return send(ws, { type: 'error', error: 'box ownership proof required' });
         }
-        if (bound.signPk !== ws.pendingSpk) store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk);
+        if (bound.signPk !== ws.pendingSpk) store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk, Date.now());
       } else if (bound && !bound.proven) {
         if (boxProven) {
           // Владелец box-ключа перебивает прежнюю (возможно сквоттерскую) связку
           // и закрепляет её как доказанную — сквоттер потом уже не отберёт.
-          store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk);
+          store.rebindSignKey(ws.pendingPubkey, ws.pendingSpk, Date.now());
         } else if (bound.signPk !== ws.pendingSpk) {
           // Легаси-путь (TOFU): сменить незакреплённый sign-ключ нельзя.
           return send(ws, { type: 'error', error: 'pubkey bound to a different key' });
         }
       } else {
         // Первая регистрация: закрепляем; proven только при доказанном владении.
-        store.bindSignKey(ws.pendingPubkey, ws.pendingSpk, boxProven);
+        store.bindSignKey(ws.pendingPubkey, ws.pendingSpk, boxProven, Date.now());
       }
       // authenticated: take ownership of this pubkey
       counters.authOk += 1;
@@ -828,10 +868,18 @@ function handleFrameSafely(ws, msg) {
       const prev = online.get(ws.pubkey);
       if (prev && prev !== ws) try { prev.terminate(); } catch (e) {}
       online.set(ws.pubkey, ws);
+      // M-02: отмечаем активность identity и держим каталог под глобальным потолком
+      // (вытеснение самых холодных identity без ожидающих конвертов). Текущий pk
+      // только что «тёплый», поэтому под вытеснение не попадает.
+      store.touchIdentity(ws.pubkey, Date.now());
+      const evicted = store.evictColdIdentities(MAX_IDENTITIES);
+      if (evicted) console.log(`[identities] evicted ${evicted} cold identity(ies) over cap`);
       const flushed = flushQueue(ws.pubkey, ws);
       // prekeys: сколько одноразовых prekey клиента осталось у этого релея —
       // клиент по этому числу решает, пора ли выгрузить свежую пачку.
-      return send(ws, { type: 'ready', queued: flushed, prekeys: store.countOtps(ws.pubkey) });
+      // vapidPublicKey: web-push (UnifiedPush) публичный ключ релея — клиент передаёт
+      // его в expo-unified-push registerDevice(). null, если web-push не настроен.
+      return send(ws, { type: 'ready', queued: flushed, prekeys: store.countOtps(ws.pubkey), vapidPublicKey: vapidPublicKey() });
     }
 
     // --- relay directory (public READ allowed before auth for bootstrap) ---
@@ -926,7 +974,10 @@ function handleFrameSafely(ws, msg) {
     }
 
     if (msg.type === 'register') {
-      if (typeof msg.pushToken === 'string' && msg.pushToken) {
+      // Токен пробуждения: FCM-токен ЛИБО web-push подписка UnifiedPush (JSON-строка
+      // {endpoint,keys} — F-Droid/FOSS/hybrid). Тип определяется в push.js по форме.
+      // Потолок длины — подписка (endpoint + ключи) длиннее FCM-токена.
+      if (typeof msg.pushToken === 'string' && msg.pushToken && msg.pushToken.length <= 1024) {
         store.setToken(ws.pubkey, msg.pushToken);
       }
       return send(ws, { type: 'registered' });
@@ -1153,7 +1204,13 @@ server.listen(PORT, () => {
     '[push]',
     pushReady()
       ? 'FCM configured — wake-up pushes enabled'
-      : 'FCM NOT configured — closed-app notifications will NOT be sent (add service-account.json)'
+      : 'FCM NOT configured — FCM clients get no wake-ups'
+  );
+  console.log(
+    '[push]',
+    vapidPublicKey()
+      ? 'UnifiedPush web-push (VAPID) enabled'
+      : 'UnifiedPush web-push (VAPID) NOT configured'
   );
   // M-1: без токена /metrics доступен ТОЛЬКО из приватной сети/localhost (публичный
   // скрейп отвергается). Для внешнего мониторинга задайте RELAY_METRICS_TOKEN.

@@ -62,6 +62,11 @@ function createStore(dbPath, opts = {}) {
   // proven=0 (легаси-совместимость), новые клиенты помечают их proven=1.
   const hasProvenCol = db.prepare("SELECT count(*) c FROM pragma_table_info('identities') WHERE name='proven'").get().c;
   if (!hasProvenCol) db.exec('ALTER TABLE identities ADD COLUMN proven INTEGER DEFAULT 0');
+  // M-02: колонка last_seen — время последней аутентификации связки. Нужна для
+  // LRU-вытеснения холодных identity при достижении глобального потолка (защита
+  // диска от неограниченного роста каталога identity/prekey под Sybil-регистрацией).
+  const hasLastSeenCol = db.prepare("SELECT count(*) c FROM pragma_table_info('identities') WHERE name='last_seen'").get().c;
+  if (!hasLastSeenCol) db.exec('ALTER TABLE identities ADD COLUMN last_seen INTEGER DEFAULT 0');
 
   const blobPath = (mid) => path.join(blobDir, mid + '.json');
   function writeBlob(mid, envJson) {
@@ -154,8 +159,16 @@ function createStore(dbPath, opts = {}) {
 
   const id = {
     get: db.prepare('SELECT sign_pk, proven FROM identities WHERE pk=?'),
-    set: db.prepare('INSERT OR IGNORE INTO identities (pk,sign_pk,proven) VALUES (?,?,?)'),
-    rebind: db.prepare('INSERT OR REPLACE INTO identities (pk,sign_pk,proven) VALUES (?,?,?)'),
+    set: db.prepare('INSERT OR IGNORE INTO identities (pk,sign_pk,proven,last_seen) VALUES (?,?,?,?)'),
+    rebind: db.prepare('INSERT OR REPLACE INTO identities (pk,sign_pk,proven,last_seen) VALUES (?,?,?,?)'),
+    touch: db.prepare('UPDATE identities SET last_seen=? WHERE pk=?'),
+    count: db.prepare('SELECT count(*) c FROM identities'),
+    // M-02: холодные identity без ожидающих конвертов — кандидаты на вытеснение
+    // (identity с непрочитанной очередью НЕ трогаем, чтобы не потерять сообщения).
+    coldNoQueue: db.prepare(
+      'SELECT i.pk FROM identities i WHERE NOT EXISTS (SELECT 1 FROM queue q WHERE q.to_pk = i.pk) ORDER BY i.last_seen ASC LIMIT ?'
+    ),
+    del: db.prepare('DELETE FROM identities WHERE pk=?'),
   };
   const tok = {
     get: db.prepare('SELECT token FROM push_tokens WHERE pk=?'),
@@ -170,6 +183,7 @@ function createStore(dbPath, opts = {}) {
   const spk = {
     get: db.prepare('SELECT id, pub, sig FROM prekeys_spk WHERE pk=?'),
     set: db.prepare('INSERT OR REPLACE INTO prekeys_spk (pk,id,pub,sig) VALUES (?,?,?,?)'),
+    delFor: db.prepare('DELETE FROM prekeys_spk WHERE pk=?'),
   };
   const otp = {
     insert: db.prepare('INSERT OR IGNORE INTO prekeys_otp (pk,id,pub) VALUES (?,?,?)'),
@@ -221,17 +235,21 @@ function createStore(dbPath, opts = {}) {
       }
       // S4/H-3: ГЛОБАЛЬНЫЕ потолки — по числу И по байтам. Без байтового лимита
       // один клиент мог засыпать очередь крупными блобами (до 32 МБ) на разные
-      // адреса и переполнить диск volume: count-лимит при этом не срабатывал
-      // никогда. При превышении вытесняем самый старый конверт во всей очереди.
-      if (maxTotal || maxTotalBytes) {
-        while (
-          (maxTotal && liveCount >= maxTotal) ||
-          (maxTotalBytes && liveBytes + bytes > maxTotalBytes)
-        ) {
-          const o = q.oldestGlobal.get();
-          if (!o) break;
-          dropRow(o);
-        }
+      // адреса и переполнить диск volume: count-лимит при этом не срабатывал никогда.
+      //
+      // H-03: при достижении глобального потолка НЕ вытесняем старейший конверт во
+      // всей очереди — раньше это молча удаляло уже принятые сообщения ДРУГИХ
+      // получателей. Sybil-флудер (много одноразовых identity, по 1 конверту)
+      // заполнял очередь до потолка, и каждый следующий конверт вычёркивал глобально
+      // старейший — то есть реальные сообщения честных офлайн-пользователей (цензура/
+      // тихая потеря). Теперь отклоняем НОВЫЙ конверт (drop-new, как СРВ-2 на уровне
+      // получателя): чужие принятые конверты неприкосновенны, очередь дренируется по
+      // TTL. deliver() вернёт dropped:true, клиент переотправит позже.
+      if (
+        (maxTotal && liveCount >= maxTotal) ||
+        (maxTotalBytes && liveBytes + bytes > maxTotalBytes)
+      ) {
+        return false;
       }
       const asBlob = blobDir && bytes > blobThreshold;
       if (asBlob) writeBlob(mid, envJson);
@@ -297,10 +315,10 @@ function createStore(dbPath, opts = {}) {
       const r = id.get.get(pk);
       return r ? { signPk: r.sign_pk, proven: !!r.proven } : null;
     },
-    bindSignKey(pk, signPk, proven = false) {
+    bindSignKey(pk, signPk, proven = false, now = 0) {
       // INSERT OR IGNORE — первый выигрывает (TOFU). proven=1 только если владение
-      // box-ключом реально доказано (ECDH-proof в relay.js).
-      id.set.run(pk, signPk, proven ? 1 : 0);
+      // box-ключом реально доказано (ECDH-proof в relay.js). last_seen=now (M-02).
+      id.set.run(pk, signPk, proven ? 1 : 0, now);
     },
     /**
      * Переписать связку (H-6): разрешено ТОЛЬКО когда предъявитель доказал
@@ -308,8 +326,39 @@ function createStore(dbPath, opts = {}) {
      * сквоттерскую) привязку и закрепить её как proven. Легаси-путь этого не
      * умеет, поэтому proven-связку нельзя перехватить без секретки box-ключа.
      */
-    rebindSignKey(pk, signPk) {
-      id.rebind.run(pk, signPk, 1);
+    rebindSignKey(pk, signPk, now = 0) {
+      id.rebind.run(pk, signPk, 1, now);
+    },
+    /** M-02: отметить активность identity (последняя аутентификация). */
+    touchIdentity(pk, now) {
+      id.touch.run(now, pk);
+    },
+    /** M-02: текущее число зарегистрированных identity. */
+    identityCount() {
+      return id.count.get().c;
+    },
+    /**
+     * M-02: удержать число identity под глобальным потолком `max`. Вытесняем самые
+     * ХОЛОДНЫЕ (давно не выходившие на связь) identity, у которых НЕТ ожидающих
+     * конвертов в очереди (identity с недоставленными сообщениями не трогаем),
+     * каскадно удаляя их prekey (SPK+OTP) и push-токен. Так каталог не растёт
+     * бесконечно под Sybil-регистрацией, а активные/имеющие очередь пользователи не
+     * страдают. Возвращает число вытесненных.
+     */
+    evictColdIdentities(max) {
+      const over = id.count.get().c - max;
+      if (over <= 0) return 0;
+      const victims = id.coldNoQueue.all(over).map((r) => r.pk);
+      const tx = db.transaction((pks) => {
+        for (const pk of pks) {
+          otp.delAll.run(pk);
+          spk.delFor.run(pk);
+          tok.del.run(pk);
+          id.del.run(pk);
+        }
+      });
+      tx(victims);
+      return victims.length;
     },
 
     // --- push tokens --------------------------------------------------------
