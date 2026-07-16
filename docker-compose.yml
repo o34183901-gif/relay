@@ -6,8 +6,9 @@
 # вместе с релеем.
 #
 # Все сервисы имеют restart: unless-stopped и поднимаются автоматически после
-# перезагрузки. watchtower авто-обновляет релей при выходе новой версии образа —
-# вручную обновлять каждый сервер не нужно (см. README, раздел «Авто-обновление»).
+# перезагрузки. Авто-обновление — верифицированный апдейтер на хосте (systemd-
+# таймер + cosign, ставится `sudo bash deploy/install-updater.sh`) — вручную
+# обновлять каждый сервер не нужно (см. README, раздел «Авто-обновление»).
 
 services:
   relay:
@@ -26,7 +27,8 @@ services:
       RELAY_TRUST_PROXY: "1"
       # Опционально (безопасность/эксплуатация). Пусто/дефолт — мягкий режим:
       #   RELAY_GOSSIP_TOKEN   — общий токен HTTP-gossip между вашими релеями
-      #   RELAY_METRICS_TOKEN  — токен для /metrics (без него endpoint открыт)
+      #   RELAY_METRICS_TOKEN  — токен внешнего доступа к /metrics (без него
+      #                          endpoint доступен только из приватной сети/localhost)
       #   RELAY_MAX_QUEUE_BYTES— байтовый потолок очереди (по умолчанию 8 ГБ)
       RELAY_GOSSIP_TOKEN: ${RELAY_GOSSIP_TOKEN:-}
       RELAY_METRICS_TOKEN: ${RELAY_METRICS_TOKEN:-}

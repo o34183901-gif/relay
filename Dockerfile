@@ -5,7 +5,7 @@
 #     -e RELAY_SELF_URL=wss://<ВАШ_HOST> \
 #     -e RELAY_PEERS=wss://89.108.83.230.sslip.io \
 #     -v licno-data:/data \
-#     ghcr.io/o34183901-gif/relay:latest
+#     ghcr.io/o34183901-gif/relay:stable
 #
 # node:20-slim (glibc) + build-tools: better-sqlite3 ставит нативный модуль
 # (prebuild или сборка из исходников) для встроенного хранилища.
