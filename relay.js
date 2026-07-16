@@ -11,7 +11,9 @@
  *   server -> client  {"type":"challenge","nonce":"<b64>"}
  *   client -> server  {"type":"auth","signature":"<b64>"}
  *       подпись nonce ключом Ed25519 — доказательство владения pubkey
- *   server -> client  {"type":"ready","queued":N}       — после успешной auth
+ *   server -> client  {"type":"ready","queued":N,"prekeys":N,"vapidPublicKey":...}
+ *       — после успешной auth; prekeys — остаток одноразовых prekey клиента,
+ *       vapidPublicKey — публичный web-push ключ релея (null, если не настроен)
  *   client -> server  {"type":"prekeys-put","bundle":{spk:{id,pub,sig},opks:[{id,pub}]}}
  *       выгрузка СВОИХ публичных X3DH-prekey (sig сверяется с TOFU-ключом)
  *   server -> client  {"type":"prekeys-ok","otps":N}
@@ -55,8 +57,8 @@ const TURN_HOST = process.env.TURN_HOST;
 // переменной окружения на каждый сервер (виден в ps/`docker inspect`/world-
 // readable файлах). Источник разрешается при старте (resolveTurnSecret ниже,
 // после определения DB_FILE) в turnSecret; сам релей владеет секретом и пишет
-// конфиг coturn в data-том. Всё это едет в образе через watchtower, поэтому фикс
-// автономен: серверы подхватывают его сами.
+// конфиг coturn в data-том. Всё это едет в образе (авто-обновление через
+// верифицированный апдейтер), поэтому фикс автономен: серверы подхватывают его сами.
 let turnSecret = null;
 
 // Ephemeral coturn REST credentials (valid ~1h), so no long-lived TURN
@@ -418,7 +420,7 @@ resolveVapidKeys();
 // (0600). coturn стартует с `-c <data>/turnserver.conf` и читает секрет ОТТУДА —
 // секрета больше нет в аргументах процесса, env и world-readable файлах. Приоритет
 // источника: TURN_SECRET (совместимость/override) -> TURN_SECRET_FILE -> само-
-// генерация + персист (как relay-sign.key). Всё это едет в образе через watchtower.
+// генерация + персист (как relay-sign.key). Всё это едет в образе (авто-обновление).
 const TURN_SECRET_FILE = process.env.TURN_SECRET_FILE || path.join(path.dirname(DB_FILE), 'turn-secret');
 const COTURN_CONF_FILE = process.env.RELAY_COTURN_CONF || path.join(path.dirname(DB_FILE), 'turnserver.conf');
 function resolveTurnSecret() {
@@ -436,8 +438,8 @@ function resolveTurnSecret() {
 
 // Встроенный coturn (флаг RELAY_EMBED_COTURN): в Docker-образе релей сам запускает
 // turnserver дочерним процессом — отдельного контейнера coturn НЕТ, весь TURN
-// (секрет+конфиг+процесс) живёт в образе, который watchtower обновляет → будущие
-// правки TURN автономны. Флаг ставит ТОЛЬКО compose образа; bare-metal (системный
+// (секрет+конфиг+процесс) живёт в образе, который обновляет верифицированный
+// апдейтер (systemd-таймер + cosign) → будущие правки TURN автономны. Флаг ставит ТОЛЬКО compose образа; bare-metal (системный
 // coturn под systemd) его не ставит, поэтому второго coturn не поднимается.
 let coturnChild = null;
 let coturnStopped = false;

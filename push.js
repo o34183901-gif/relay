@@ -1,17 +1,23 @@
 /**
- * push.js — send FCM (Firebase Cloud Messaging) pushes so a recipient gets a
- * notification even when the app is fully closed.
+ * push.js — wake-up pushes so a recipient gets a notification even when the
+ * app is fully closed. Два канала:
+ *   - FCM (Firebase Cloud Messaging) — сборки с Google-сервисами;
+ *   - web-push (VAPID, RFC 8291) — UnifiedPush для F-Droid/de-Googled сборок.
+ * Канал выбирается по форме сохранённого pushToken: JSON-подписка {endpoint,keys}
+ * — это web-push, иначе FCM-токен (см. parseSubscription/sendPush).
  *
  * Privacy: the push carries NO message content and NO contact name — the server
  * only knows public keys. It just says "new encrypted message". The real text
  * is pulled from the queue (still E2E-encrypted) when the app opens.
  *
- * Config — ЛЮБОЙ из способов:
+ * Config FCM — ЛЮБОЙ из способов:
  *   1. Просто положить service-account.json в каталог данных (/data в Docker,
  *      рядом с relay.js на bare-metal) — файл найдётся сам, project_id
  *      прочитается из него. Ничего настраивать не нужно.
  *   2. Классически через env: FCM_PROJECT_ID + GOOGLE_APPLICATION_CREDENTIALS.
- * If unset, pushes are silently skipped (relay still works, just no wake-ups).
+ * If unset, FCM pushes are silently skipped (relay still works, just no FCM
+ * wake-ups). Конфиг web-push (VAPID-пара) — см. блок UnifiedPush ниже:
+ * relay.js передаёт ключи через setVapidKeys (env RELAY_VAPID_* или персист).
  */
 const fs = require('fs');
 const path = require('path');
