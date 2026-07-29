@@ -15,10 +15,30 @@ name: Сборка и публикация Docker-образа релея
 #  • least-privilege GITHUB_TOKEN + OIDC (id-token) только для подписи;
 #  • все actions запинены по коммит-SHA; provenance (SLSA) + SBOM прикладываются.
 
-# ТОЛЬКО ручной запуск (Actions → Run workflow). Push-триггеры убраны — образ
-# собирается/подписывается/публикуется вручную, минуты Actions не тратятся на коммиты.
+# Запускается АВТОМАТИЧЕСКИ при коммите кода релея в main — в том числе когда код
+# приезжает сюда синхронизацией из репозитория messege. Репозиторий публичный,
+# поэтому минуты GitHub-раннера не тарифицируются.
+#
+# Автоматическая часть заканчивается на :canary — на флот (:stable) по-прежнему
+# переводит человек кнопкой «Промоушен/откат». Изменения деплой-обвязки
+# (compose/Caddy/апдейтер) образа не касаются и сборку не поднимают.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'deploy/**'
+      - 'docker-compose.yml'
+      - 'Caddyfile'
+      - '.env.example'
+      - '.github/workflows/promote.yml'
+
+# Публикация тега :canary — по одному запуску за раз, иначе два билда переставят
+# один и тот же тег в непредсказуемом порядке.
+concurrency:
+  group: relay-image
+  cancel-in-progress: false
 
 # Минимально необходимые права. id-token — только для keyless-подписи cosign.
 permissions:
