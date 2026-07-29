@@ -14,6 +14,11 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 
+// S9: потолок и TTL реплицированного каталога релеев. Держим только N самых свежих
+// анонсов и вычищаем протухшие — иначе gossip-мусор навсегда забивал каталог.
+const RELAY_DIR_MAX = 500;
+const RELAY_DIR_TTL_MS = 14 * 24 * 3600 * 1000; // 14 дней без анонса — забываем релей
+
 /**
  * opts.blobDir       — каталог для тел крупных конвертов (обычно рядом с БД, в
  *                      том же volume). Не задан — всё хранится в БД, как раньше.
@@ -95,6 +100,9 @@ function createStore(dbPath, opts = {}) {
       'INSERT OR REPLACE INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob,bytes) VALUES (?,?,?,?,?,?,?,?,?)'
     ),
     forUser: db.prepare('SELECT * FROM queue WHERE to_pk=? ORDER BY ts ASC'),
+    // S1: только id (без тел) — для потокового flush с backpressure, чтобы не
+    // материализовать всю очередь получателя в память разом.
+    idsForUser: db.prepare('SELECT id FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     countFor: db.prepare('SELECT count(*) c FROM queue WHERE to_pk=?'),
     countFromTo: db.prepare('SELECT count(*) c FROM queue WHERE from_pk=? AND to_pk=?'),
     oldestFor: db.prepare('SELECT id, blob, bytes FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
@@ -123,10 +131,21 @@ function createStore(dbPath, opts = {}) {
         return null;
       }
     }
+    // S6: тело могло испортиться (сбой питания между записью blob-файла и fsync;
+    // порча строки БД). Без try/catch JSON.parse бросал бы на КАЖДОМ чтении очереди
+    // этого получателя — flushQueue падал, клиент вместо `ready` получал ошибку и
+    // зацикливал реконнекты (заблокирован до истечения TTL). Битую строку сносим.
+    let envelope;
+    try {
+      envelope = JSON.parse(envJson);
+    } catch (e) {
+      dropRow(r);
+      return null;
+    }
     return {
       id: r.id,
       from: r.from_pk || undefined,
-      envelope: JSON.parse(envJson),
+      envelope,
       silent: !!r.silent,
       callPush: !!r.call_push,
       ts: r.ts,
@@ -179,6 +198,12 @@ function createStore(dbPath, opts = {}) {
     all: db.prepare('SELECT url FROM directory ORDER BY last_seen DESC'),
     upsert: db.prepare('INSERT OR REPLACE INTO directory (url,last_seen) VALUES (?,?)'),
     count: db.prepare('SELECT count(*) c FROM directory'),
+    // S9: удалить записи старше TTL (протухшие анонсы).
+    expire: db.prepare('DELETE FROM directory WHERE last_seen < ?'),
+    // S9: оставить только N самых свежих (по last_seen) — вытеснение мусора.
+    trim: db.prepare(
+      'DELETE FROM directory WHERE url NOT IN (SELECT url FROM directory ORDER BY last_seen DESC LIMIT ?)'
+    ),
   };
   const spk = {
     get: db.prepare('SELECT id, pub, sig FROM prekeys_spk WHERE pk=?'),
@@ -261,6 +286,11 @@ function createStore(dbPath, opts = {}) {
     /** Все конверты, ждущие получателя (в порядке поступления). */
     queueFor(to) {
       return q.forUser.all(to).map(rowToItem).filter(Boolean);
+    },
+    /** S1: только id ожидающих конвертов (в порядке поступления) — дёшево, без тел.
+     *  Для потокового flush: тело каждого берётся getItem по одному, с backpressure. */
+    queueIdsFor(to) {
+      return q.idsForUser.all(to).map((r) => r.id);
     },
     getItem(mid) {
       const r = q.byId.get(mid);
@@ -402,12 +432,21 @@ function createStore(dbPath, opts = {}) {
     },
 
     // --- relay directory ----------------------------------------------------
+    // S9: каталог отдаём уже усечённым до потолка (самые свежие вперёд), чтобы
+    // мусор из gossip не раздувал ответы даже если чистка ещё не отработала.
     directory() {
-      return dir.all.all().map((r) => r.url);
+      return dir.all.all().slice(0, RELAY_DIR_MAX).map((r) => r.url);
     },
     addRelays(urls, now) {
       const tx = db.transaction((list) => {
         for (const u of list) dir.upsert.run(u, now);
+        // S9: раньше каталог только пополнялся (upsert) и НИКОГДА не чистился —
+        // любой аутентифицированный клиент через relay-advertise заливал 500
+        // валидных URL, после чего настоящие релеи не добавлялись, а gossip слал
+        // запросы к мусорным адресам. Теперь на каждое пополнение вычищаем
+        // протухшие (TTL) и вытесняем всё сверх потолка по свежести.
+        if (Number.isFinite(now)) dir.expire.run(now - RELAY_DIR_TTL_MS);
+        dir.trim.run(RELAY_DIR_MAX);
       });
       tx(urls);
     },

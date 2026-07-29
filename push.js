@@ -16,8 +16,20 @@
 const fs = require('fs');
 const path = require('path');
 const dns = require('dns').promises;
+const https = require('https');
 const webpush = require('web-push');
 const { isPrivateHost } = require('./relays');
+
+// S13: кастомный lookup для web-push — отдаёт ТОЛЬКО заранее проверенные адреса
+// (пиннинг), игнорируя повторное разрешение имени. Между проверкой и коннектом имя
+// уже не переразрешается → окно DNS-rebinding (TOCTOU) закрыто. Имя хоста
+// сохраняется для SNI/валидации TLS-сертификата (сертификат по-прежнему сверяется).
+function pinnedLookup(pinned) {
+  return (hostname, options, cb) => {
+    if (options && options.all) return cb(null, pinned);
+    cb(null, pinned[0].address, pinned[0].family);
+  };
+}
 
 let GoogleAuth;
 try {
@@ -126,7 +138,9 @@ let vapidPub = null;
 /** Задать VAPID-пару релея (зовётся из relay.js после resolveVapidKeys). */
 function setVapidKeys(publicKey, privateKey, subject) {
   try {
-    webpush.setVapidDetails(subject || 'mailto:relay@licno.invalid', publicKey, privateKey);
+    // RFC 8292 contact URI. Реальный HTTPS-домен лучше .invalid: push-сервис
+    // может использовать subject для связи с оператором при злоупотреблениях.
+    webpush.setVapidDetails(subject || 'https://lichno.pro/', publicKey, privateKey);
     vapidPub = publicKey;
     vapidConfigured = true;
     return true;
@@ -193,19 +207,25 @@ async function unifiedPushSend(sub, notification) {
   if (!vapidConfigured) return false; // VAPID не задан — web-push не шлём
   const parsed = typeof sub === 'string' ? parseSubscription(sub) : sub;
   if (!parsed) return 'invalid';
+  let pinned;
   try {
     const host = new URL(parsed.endpoint).hostname;
     if (isPrivateHost(host)) return 'invalid';
     const addrs = await dns.lookup(host, { all: true });
     if (!addrs.length) return false;
     for (const a of addrs) if (isPrivateHost(a.address)) return 'invalid';
+    pinned = addrs.map((a) => ({ address: a.address, family: a.family }));
   } catch (e) {
     return false; // не резолвится — не ходим
   }
   try {
     notifSeq = (notifSeq + 1) % 1e9;
     const body = JSON.stringify({ id: notifSeq, ...notification });
-    const res = await webpush.sendNotification(parsed, body, { TTL: 3600 });
+    // S13: коннектимся РОВНО на проверенные IP (пиннинг через agent.lookup). Раньше
+    // web-push резолвил хост заново своим стеком — вредоносный DNS мог отдать
+    // публичный IP на проверке и приватный на самом запросе (self-SSRF/rebinding).
+    const agent = new https.Agent({ lookup: pinnedLookup(pinned), keepAlive: false });
+    const res = await webpush.sendNotification(parsed, body, { TTL: 3600, agent });
     return !!res && res.statusCode >= 200 && res.statusCode < 300;
   } catch (e) {
     const code = e && e.statusCode;

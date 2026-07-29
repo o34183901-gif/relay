@@ -49,6 +49,21 @@ const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady, setVapidKeys, vapidPublicKey, generateVapidKeys } = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
+const {
+  loadFleetConfig,
+  memberFor,
+  memberAcceptsKey,
+  validVapidPair,
+  signVapidBundle,
+  verifyVapidBundle,
+  createVapidRequest,
+  verifyVapidRequest,
+  createVapidResponse,
+  openVapidResponse,
+  sourceMatchesResolved,
+  readJsonFile,
+  writeJsonAtomic,
+} = require('./vapid-fleet');
 
 const TURN_HOST = process.env.TURN_HOST;
 // H-2: секрет TURN больше НЕ передаётся открытым аргументом coturn или отдельной
@@ -227,6 +242,117 @@ function metricsAuthorized(req) {
   return safeEqual(auth, `Bearer ${METRICS_TOKEN}`);
 }
 
+// --- HTTP bootstrap общей VAPID-пары между разрешёнными релеями ------------
+const vapidRequestRate = new Map(); // source IP -> {start,count}
+const vapidRequestNonces = new Map(); // relayPub|nonce -> timestamp (anti-replay)
+let vapidGlobalRate = null;
+
+function readJsonRequest(req, maxBytes = 32 * 1024) {
+  return new Promise((resolve) => {
+    let body = '';
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    req.on('error', () => finish(null));
+    req.on('aborted', () => finish(null));
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (Buffer.byteLength(body) > maxBytes) {
+        finish(null);
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (done) return;
+      try {
+        finish(JSON.parse(body));
+      } catch (e) {
+        finish(null);
+      }
+    });
+  });
+}
+
+function vapidRequestRateAllowed(ip) {
+  const now = Date.now();
+  let gate = rateGate(vapidGlobalRate, now, 60000, 120);
+  vapidGlobalRate = gate.state;
+  if (!gate.allow) return false;
+  vapidGlobalRate.count += 1;
+
+  const key = String(ip || 'unknown');
+  gate = rateGate(vapidRequestRate.get(key), now, 60000, 12);
+  vapidRequestRate.set(key, gate.state);
+  if (!gate.allow) return false;
+  gate.state.count += 1;
+  if (vapidRequestRate.size > 10000) vapidRequestRate.clear();
+  return true;
+}
+
+function rememberVapidRequest(request) {
+  const now = Date.now();
+  const key = `${request.relayPub}|${request.nonce}`;
+  if (vapidRequestNonces.has(key)) return false;
+  vapidRequestNonces.set(key, now);
+  if (vapidRequestNonces.size > 5000) {
+    const cutoff = now - 10 * 60 * 1000;
+    for (const [nonce, timestamp] of vapidRequestNonces) {
+      if (timestamp < cutoff) vapidRequestNonces.delete(nonce);
+    }
+    if (vapidRequestNonces.size > 5000) vapidRequestNonces.clear();
+  }
+  return true;
+}
+
+async function handleVapidFleetHttp(req, res) {
+  const ip = clientIp(req);
+  if (!VAPID_FLEET || !VAPID_MEMBER || !vapidFleetBundle || !vapidRequestRateAllowed(ip)) {
+    res.writeHead(vapidFleetBundle ? 429 : 503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
+    return;
+  }
+  const request = await readJsonRequest(req);
+  const requestMember = verifyVapidRequest(request, VAPID_FLEET);
+  if (!requestMember || !rememberVapidRequest(request)) {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
+    return;
+  }
+
+  // Подпись доказывает владение relay-sign.key, а совпадение сетевого источника
+  // с DNS/IP разрешённого URL не даёт скопировать публичный образ на чужой сервер
+  // и запросить приватный VAPID под именем участника флота.
+  const resolved = await safePeerAddrs(requestMember.url, { allowPrivate: VAPID_FLEET_ALLOW_PRIVATE });
+  if (!resolved || !sourceMatchesResolved(ip, resolved)) {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
+    return;
+  }
+
+  try {
+    const response = createVapidResponse({
+      config: VAPID_FLEET,
+      request,
+      bundle: vapidFleetBundle,
+      senderUrl: SELF_URL,
+      senderRelayPub: RELAY_KEYS.pub,
+      senderRelaySecret: RELAY_KEYS.sec,
+    });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify(response));
+  } catch (e) {
+    console.warn('[vapid-fleet] не удалось сформировать ответ:', e && e.message);
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
+  }
+}
+
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
 const online = new Map();
 // ip -> число активных соединений (за Caddy берём X-Forwarded-For)
@@ -379,37 +505,110 @@ function signRelayAuth(cnonce) {
   return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
 }
 
-// --- VAPID для web-push (UnifiedPush) --------------------------------------
-// Пара ключей web-push (RFC 8292). Источник: env RELAY_VAPID_PUBLIC/PRIVATE →
-// файл рядом с БД → генерация+персист (как relay-sign.key). Публичный ключ
-// отдаётся клиенту в кадре ready; приватным релей подписывает web-push. Во флоте
-// оператор ставит ОДНУ пару на свои релеи (иначе подписка, сделанная под ключ
-// релея A, не примется релеем B) — как и с общим FCM service-account.
+// --- VAPID для web-push: одна P2P-синхронизируемая пара на весь флот --------
+// В публичном образе нет приватного VAPID. Genesis-релей из vapid-fleet.json
+// создаёт/подписывает одну пару, остальные разрешённые узлы получают тот же
+// подписанный bundle по NaCl-box через POST /vapid-fleet. Выдача разрешена только
+// URL из списка флота, чей relay-sign.key совпал и чей публичный IP является
+// источником запроса. Поэтому произвольный узел из открытого gossip ключ не получит.
 const RELAY_VAPID_KEY_FILE = process.env.RELAY_VAPID_KEY_FILE || path.join(path.dirname(DB_FILE), 'vapid.json');
-function resolveVapidKeys() {
-  let pub = process.env.RELAY_VAPID_PUBLIC || null;
-  let priv = process.env.RELAY_VAPID_PRIVATE || null;
-  if (!pub || !priv) {
-    try {
-      const f = JSON.parse(fs.readFileSync(RELAY_VAPID_KEY_FILE, 'utf8'));
-      if (f && f.publicKey && f.privateKey) {
-        pub = f.publicKey;
-        priv = f.privateKey;
-      }
-    } catch (e) {}
+const RELAY_VAPID_FLEET_FILE =
+  process.env.RELAY_VAPID_FLEET_FILE || path.join(__dirname, 'vapid-fleet.json');
+const VAPID_FLEET_ALLOW_PRIVATE = process.env.RELAY_VAPID_FLEET_ALLOW_PRIVATE === '1'; // только интеграционные тесты
+const VAPID_STANDALONE = process.env.RELAY_VAPID_STANDALONE === '1';
+const VAPID_SYNC_INTERVAL_MS = Math.max(10000, Number(process.env.RELAY_VAPID_SYNC_MS) || 60000);
+
+let VAPID_FLEET = null;
+try {
+  VAPID_FLEET = loadFleetConfig(RELAY_VAPID_FLEET_FILE, { allowPrivate: VAPID_FLEET_ALLOW_PRIVATE });
+} catch (e) {
+  // Bare-metal/сторонний запуск без fleet-файла остаётся совместимым: ниже
+  // сработает прежний standalone-путь. В официальном образе файл обязателен.
+  if (fs.existsSync(RELAY_VAPID_FLEET_FILE)) {
+    console.error('[vapid-fleet] конфигурация некорректна:', e && e.message);
   }
-  if (!pub || !priv) {
-    try {
-      const kp = generateVapidKeys();
-      pub = kp.publicKey;
-      priv = kp.privateKey;
-      fs.writeFileSync(RELAY_VAPID_KEY_FILE, JSON.stringify({ publicKey: pub, privateKey: priv }), { mode: 0o600 });
-    } catch (e) {
-      console.warn('[push] не удалось создать/сохранить VAPID:', e && e.message);
+}
+const VAPID_MEMBER = VAPID_FLEET && SELF_URL ? memberFor(VAPID_FLEET, SELF_URL) : null;
+let vapidFleetBundle = null;
+let vapidKeySource = 'disabled';
+let onVapidActivated = null;
+
+function activateVapid(publicKey, privateKey, source, bundle) {
+  if (!validVapidPair(publicKey, privateKey)) return false;
+  const before = vapidPublicKey();
+  if (!setVapidKeys(publicKey, privateKey, process.env.RELAY_VAPID_SUBJECT)) return false;
+  vapidFleetBundle = bundle || null;
+  vapidKeySource = source;
+  if (before !== publicKey && onVapidActivated) onVapidActivated(publicKey);
+  return true;
+}
+
+function resolveVapidKeys() {
+  const fromEnv = {
+    publicKey: process.env.RELAY_VAPID_PUBLIC || null,
+    privateKey: process.env.RELAY_VAPID_PRIVATE || null,
+  };
+  const fromFile = readJsonFile(RELAY_VAPID_KEY_FILE);
+
+  if (VAPID_FLEET && SELF_URL) {
+    if (!VAPID_MEMBER) {
+      // Ошибка/чужой узел не должен тихо создать четвёртую VAPID-пару и отдать её
+      // PWA-клиентам. Явный standalone override оставлен для независимых операторов.
+      if (!VAPID_STANDALONE) {
+        console.warn(`[vapid-fleet] ${SELF_URL} не входит в разрешённый флот — web-push выключен`);
+        return;
+      }
+    } else if (!memberAcceptsKey(VAPID_MEMBER, RELAY_KEYS.pub)) {
+      console.error(
+        `[vapid-fleet] relay-sign.key не совпадает с разрешённым ключом для ${SELF_URL} — web-push выключен`
+      );
+      return;
+    } else {
+      if (verifyVapidBundle(fromFile, VAPID_FLEET)) {
+        activateVapid(fromFile.publicKey, fromFile.privateKey, 'fleet-file', fromFile);
+        return;
+      }
+
+      if (SELF_URL.toLowerCase() !== VAPID_FLEET.genesis.toLowerCase()) {
+        // Не принимаем старый локально сгенерированный vapid.json: follower ждёт
+        // подписанный genesis bundle и затем безопасно заменит файл атомарно.
+        console.log('[vapid-fleet] общий VAPID ещё не получен — ожидаю разрешённый peer');
+        return;
+      }
+
+      // Genesis может принять уже существующую пару (важно при миграции с живыми
+      // подписками) или env override, затем подписывает её своим relay-sign.key.
+      let pair = validVapidPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
+      if (!pair && fromFile && validVapidPair(fromFile.publicKey, fromFile.privateKey)) {
+        pair = { publicKey: fromFile.publicKey, privateKey: fromFile.privateKey };
+      }
+      if (!pair) pair = generateVapidKeys();
+      try {
+        const bundle = signVapidBundle(pair, VAPID_FLEET, RELAY_KEYS.sec);
+        writeJsonAtomic(RELAY_VAPID_KEY_FILE, bundle);
+        activateVapid(bundle.publicKey, bundle.privateKey, 'fleet-genesis', bundle);
+        console.log(`[vapid-fleet] genesis создал/подписал общий VAPID epoch=${bundle.epoch}`);
+      } catch (e) {
+        console.warn('[vapid-fleet] не удалось создать/сохранить общий VAPID:', e && e.message);
+      }
       return;
     }
   }
-  setVapidKeys(pub, priv, process.env.RELAY_VAPID_SUBJECT);
+
+  // Совместимость для bare-metal/стороннего standalone-релея без fleet-конфига.
+  let pair = validVapidPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
+  if (!pair && fromFile && validVapidPair(fromFile.publicKey, fromFile.privateKey)) {
+    pair = { publicKey: fromFile.publicKey, privateKey: fromFile.privateKey };
+  }
+  if (!pair) pair = generateVapidKeys();
+  try {
+    if (!fromFile || fromFile.publicKey !== pair.publicKey || fromFile.privateKey !== pair.privateKey) {
+      writeJsonAtomic(RELAY_VAPID_KEY_FILE, pair);
+    }
+    activateVapid(pair.publicKey, pair.privateKey, 'standalone', null);
+  } catch (e) {
+    console.warn('[push] не удалось создать/сохранить VAPID:', e && e.message);
+  }
 }
 resolveVapidKeys();
 
@@ -545,8 +744,23 @@ const server = http.createServer((req, res) => {
         queued: st.usersQueued,
         messages: st.totalQueued,
         relays: relayDir.length,
+        vapid: !!vapidPublicKey(),
+        vapidPublicKey: vapidPublicKey(),
+        vapidSource: vapidKeySource,
+        vapidFleetMember: !!VAPID_MEMBER,
       })
     );
+    return;
+  }
+  // P2P-выдача общей VAPID-пары. Ответ всегда зашифрован на одноразовый NaCl-box
+  // ключ разрешённого релея; браузер/обычный клиент этот endpoint использовать не
+  // может. Обработчик сам проверяет relay-sign подпись и IP заявленного URL.
+  if (req.method === 'POST' && req.url === '/vapid-fleet') {
+    handleVapidFleetHttp(req, res).catch((e) => {
+      console.warn('[vapid-fleet] HTTP handler failed:', e && e.message);
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ ok: false }));
+    });
     return;
   }
   // Метрики для мониторинга (Prometheus text format). Закрывается токеном
@@ -573,6 +787,11 @@ const server = http.createServer((req, res) => {
         !!GOSSIP_TOKEN && safeEqual((req.headers && req.headers['x-gossip-token']) || '', GOSSIP_TOKEN);
       let body = '';
       let aborted = false;
+      // СРВ-11: обрыв клиента посреди тела (ECONNRESET) эмитит 'error' на req; без
+      // слушателя это штатное сетевое событие уходило в uncaughtException-backstop.
+      req.on('error', () => {
+        aborted = true;
+      });
       req.on('data', (c) => {
         body += c;
         if (body.length > 200000) {
@@ -602,15 +821,49 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, maxPayload: MAX_ENVELOPE_BYTES + 1024 * 1024 });
 
 function send(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
 }
 
-// Re-send everything still queued for pubkey (nothing is deleted until the
-// recipient acks each id with `received`). Safe to call on every (re)connect.
+// Follower может получить общий VAPID уже после того, как PWA аутентифицировалась.
+// Не заставляем пользователя ждать следующего реконнекта: сообщаем новый публичный
+// ключ всем уже готовым клиентам отдельным совместимым кадром.
+onVapidActivated = (publicKey) => {
+  for (const ws of wss.clients) {
+    if (ws.authed) send(ws, { type: 'vapid-key', vapidPublicKey: publicKey });
+  }
+};
+
+// S1: vergüt поток с backpressure. Раньше flushQueue материализовал ВСЮ очередь
+// получателя разом (queueFor → JSON.parse каждого тела) и синхронно писал всё в
+// буфер сокета без учёта bufferedAmount: 400 конвертов по 16 МБ (в пределах квот)
+// давали ~6 ГБ аллокаций в одном тике → OOM/блокировка event loop, а реконнекты
+// превращали это в устойчивый DoS. Теперь берём только СПИСОК id (дёшево), тело
+// достаём по одному и приостанавливаемся, когда буфер сокета вырос выше отметки.
+const FLUSH_HIGH_WATER = 4 * 1024 * 1024; // порог bufferedAmount, при котором ждём
+const FLUSH_RESUME_MS = 25; // пауза перед проверкой backpressure
+
 function flushQueue(pubkey, ws) {
-  const q = store.queueFor(pubkey);
-  for (const item of q) send(ws, { type: 'message', id: item.id, envelope: item.envelope });
-  return q.length;
+  const ids = store.queueIdsFor(pubkey);
+  let i = 0;
+  function pump() {
+    if (ws.readyState !== ws.OPEN) return; // получатель ушёл — прекращаем
+    while (i < ids.length) {
+      // backpressure: не заливаем сокет, если предыдущее ещё не ушло в сеть.
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > FLUSH_HIGH_WATER) {
+        setTimeout(pump, FLUSH_RESUME_MS);
+        return;
+      }
+      const item = store.getItem(ids[i]);
+      i += 1;
+      if (item) send(ws, { type: 'message', id: item.id, envelope: item.envelope });
+    }
+  }
+  pump();
+  return ids.length;
 }
 
 function deliver(from, to, envelope, silent, callPush) {
@@ -633,18 +886,20 @@ function deliver(from, to, envelope, silent, callPush) {
   });
 
   const ws = online.get(to);
-  if (ws) {
-    send(ws, { type: 'message', id, envelope });
+  // СРВ-5: доставку онлайн засчитываем ТОЛЬКО если кадр реально ушёл в ОТКРЫТЫЙ
+  // сокет (send вернул true). Раньше ветка `if (ws)` слепо возвращала queued:false
+  // (=доставлено), даже когда сокет уже CLOSING и send молча ничего не отправил, —
+  // отправитель видел ложный ✓, а конверт при полной очереди (stored=false) нигде
+  // не оставался. Теперь при закрытом сокете проваливаемся ниже (в push/queue/drop).
+  if (ws && send(ws, { type: 'message', id, envelope })) {
     counters.deliveredOnline += 1;
     return { queued: false, id };
   }
 
-  // СРВ-2: получатель офлайн и конверт НЕ влез в очередь (полная + нет своих слотов).
-  // Возвращаем dropped:true — отправитель узнаёт, что конверт ОТБРОШЕН, и не считает
-  // это доставкой. Раньше был обычный queued:false, неотличимый от онлайн-доставки,
-  // из-за чего отброшенное сообщение молча показывалось как «отправлено» (тихая
-  // потеря). Ack всё равно шлём (не зацикливать ретрай в полную очередь), но со
-  // флагом — клиент помечает «не доставлено» и не выдаёт ложный ✓.
+  // СРВ-2/СРВ-5: конверт НЕ влез в очередь (полная + нет своих слотов) и не ушёл
+  // живьём. Возвращаем dropped:true — отправитель не считает это доставкой и покажет
+  // «не доставлено». Ack всё равно шлём (не зацикливать ретрай в полную очередь), но
+  // со флагом — клиент помечает «не доставлено» и не выдаёт ложный ✓.
   if (!stored) {
     counters.dropped += 1;
     return { queued: false, dropped: true, id };
@@ -723,6 +978,15 @@ wss.on('connection', (ws, req) => {
   ws.rateStart = Date.now();
   ws.rateCount = 0;
   ws.on('pong', () => (ws.isAlive = true));
+  // СРВ-4: без слушателя 'error' ошибка сокета (ECONNRESET при обрыве, превышение
+  // maxPayload) бросается из EventEmitter → uncaughtException. Глобальный backstop
+  // ловил, но стек раскручивался из произвольной точки (риск неконсистентности), а
+  // это штатная, частая ситуация (любой RST от клиента). Гасим на месте.
+  ws.on('error', () => {
+    try {
+      ws.terminate();
+    } catch (e) {}
+  });
 
   // Drop connections that never authenticate.
   ws.authTimer = setTimeout(() => {
@@ -748,6 +1012,15 @@ wss.on('connection', (ws, req) => {
     try {
       handleFrameSafely(ws, msg);
     } catch (e) {
+      // СРВ-5: фатальный сбой БД (SQLITE_CORRUPT/FULL/IOERR/READONLY) НЕ глушим здесь.
+      // Раньше почти все обращения к БД шли внутри handleFrameSafely, и этот catch
+      // отвечал `server error`, из-за чего механизм L4 (честный выход под рестарт
+      // systemd) не срабатывал: узел «работал», ничего не доставляя и не удаляя.
+      // Пробрасываем такие ошибки в top-level обработчик для управляемого выхода.
+      if (isFatalDbError(e)) {
+        handleTopLevelError('frame-fatal-db', e);
+        return;
+      }
       console.error('[frame]', e && e.stack ? e.stack : e);
       try { send(ws, { type: 'error', error: 'server error' }); } catch (e2) {}
     }
@@ -777,6 +1050,13 @@ function handleFrameSafely(ws, msg) {
 
     // --- handshake: hello -> challenge -> auth ---
     if (msg.type === 'hello') {
+      // СРВ-6: hello после успешной аутентификации не принимаем. Раньше клиент,
+      // авторизованный как A, мог повторным hello+auth встать как B: online.set(B)
+      // добавлялся, а мёртвая запись A→ws оставалась навсегда (close снимает только
+      // текущий ws.pubkey) — утечка + доставка для A уходила в закрытый сокет.
+      if (ws.authed) {
+        return send(ws, { type: 'error', error: 'already authenticated' });
+      }
       // СРВ-9: каждый hello генерирует randomBytes + эфемерную box-пару (дорого по
       // CPU) ещё до аутентификации. Ограничиваем число hello на соединение, чтобы
       // один неаутентифицированный сокет не грузил узел генерацией ключей.
@@ -791,6 +1071,14 @@ function handleFrameSafely(ws, msg) {
       if (typeof msg.signPublicKey !== 'string' || !msg.signPublicKey) {
         return send(ws, { type: 'error', error: 'hello requires signPublicKey' });
       }
+      // СРВ-7: длина адресов ограничена (валидный X25519/Ed25519 base64 ≈ 44 симв.).
+      // Раньше box-`pubkey` на легаси-пути НИКОГДА не декодировался и попадал как есть
+      // в БД/online/prekeys — мусорная строка в десятки МБ проходила auth (TOFU) и
+      // забивала диск (лимит MAX_IDENTITIES считает штуки, не байты). MAX_ADDR_LEN
+      // применялся только к полю `to` в send — теперь и к hello.
+      if (msg.pubkey.length > MAX_ADDR_LEN || msg.signPublicKey.length > MAX_ADDR_LEN) {
+        return send(ws, { type: 'error', error: 'invalid key' });
+      }
       ws.pendingPubkey = msg.pubkey;
       ws.pendingSpk = msg.signPublicKey;
       ws.nonce = naclUtil.encodeBase64(crypto.randomBytes(32));
@@ -801,7 +1089,9 @@ function handleFrameSafely(ws, msg) {
       const reply = { type: 'challenge', nonce: ws.nonce, eph: naclUtil.encodeBase64(eph.publicKey) };
       // S6: если клиент прислал cnonce — подписываем его ключом релея (клиент
       // сверит с закреплённым ключом). Старый клиент без cnonce — просто без подписи.
-      if (typeof msg.cnonce === 'string' && msg.cnonce) {
+      // СРВ-8: cnonce ограничен по длине (валидный nonce ≈ 44 симв.) — иначе релей
+      // подписывал бы строку до ~33 МБ, а при флуде соединений это CPU-DoS без auth.
+      if (typeof msg.cnonce === 'string' && msg.cnonce && msg.cnonce.length <= MAX_ADDR_LEN) {
         reply.relayPub = RELAY_KEYS.pub;
         reply.relaySig = signRelayAuth(msg.cnonce);
       }
@@ -1037,13 +1327,15 @@ function hostOf(wsUrl) {
 // мог отдать публичный IP на проверке и приватный на самом запросе. Теперь
 // соединение идёт ровно на проверенные IP (кастомный lookup), а имя хоста
 // сохраняется для SNI/валидации TLS-сертификата — сертификат по-прежнему сверяется.
-async function safePeerAddrs(wsUrl) {
+async function safePeerAddrs(wsUrl, { allowPrivate = false } = {}) {
   const host = hostOf(wsUrl);
-  if (!host || isPrivateHost(host)) return null;
+  if (!host || (!allowPrivate && isPrivateHost(host))) return null;
   try {
     const addrs = await dns.lookup(host, { all: true });
     if (!addrs.length) return null;
-    for (const a of addrs) if (isPrivateHost(a.address)) return null;
+    if (!allowPrivate) {
+      for (const a of addrs) if (isPrivateHost(a.address)) return null;
+    }
     return addrs.map((a) => ({ address: a.address, family: a.family }));
   } catch (e) {
     return null; // не резолвится — не ходим
@@ -1061,31 +1353,47 @@ function pinnedLookup(pinned) {
 /** GET/POST JSON к пиру по проверенным IP. Возвращает распарсенный ответ или null. */
 function httpJson(urlStr, { method = 'GET', headers = {}, body = null, pinned, timeoutMs = 5000 }) {
   return new Promise((resolve) => {
+    // СРВ-9: единый идемпотентный финиш. Раньше при req.destroy() на гигантском
+    // ответе (без аргумента 'error' НЕ эмитится) и при отсутствии res.on('error')
+    // промис мог не зарезолвиться НИКОГДА — gossipOnce вставал на await навсегда, а
+    // интервал каждые 60 с плодил новые зависшие контексты/сокеты. Теперь любой
+    // исход (ответ, ошибка, таймаут, close, oversize) резолвит ровно один раз.
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
     let mod;
     try {
       mod = new URL(urlStr).protocol === 'https:' ? https : http;
     } catch (e) {
-      return resolve(null);
+      return finish(null);
     }
     const req = mod.request(urlStr, { method, headers, lookup: pinnedLookup(pinned) }, (res) => {
       if (res.statusCode !== 200) {
         res.resume();
-        return resolve(null);
+        return finish(null);
       }
       let buf = '';
       res.on('data', (c) => {
         buf += c;
-        if (buf.length > 1000000) req.destroy(); // защита от гигантского ответа
+        if (buf.length > 1000000) {
+          req.destroy(); // защита от гигантского ответа
+          finish(null); // destroy не эмитит 'error' — резолвим явно
+        }
       });
       res.on('end', () => {
         try {
-          resolve(JSON.parse(buf));
+          finish(JSON.parse(buf));
         } catch (e) {
-          resolve(null);
+          finish(null);
         }
       });
+      res.on('error', () => finish(null)); // преждевременный обрыв со стороны пира
     });
-    req.on('error', () => resolve(null));
+    req.on('error', () => finish(null));
+    req.on('close', () => finish(null)); // страховка: закрытие без end/error
     req.setTimeout(timeoutMs, () => req.destroy());
     if (body) req.write(body);
     req.end();
@@ -1114,6 +1422,79 @@ async function pushSelfTo(wsUrl) {
     pinned,
   });
 }
+
+let vapidSyncRunning = false;
+async function vapidSyncOnce() {
+  if (
+    vapidSyncRunning ||
+    vapidFleetBundle ||
+    !VAPID_FLEET ||
+    !VAPID_MEMBER ||
+    !SELF_URL ||
+    !memberAcceptsKey(VAPID_MEMBER, RELAY_KEYS.pub)
+  ) {
+    return;
+  }
+  vapidSyncRunning = true;
+  try {
+    // Сначала genesis, затем остальные участники: после первой раздачи любой
+    // получивший bundle может помочь новому узлу, поэтому падение genesis не
+    // становится постоянной точкой отказа.
+    const peers = [...VAPID_FLEET.relays]
+      .filter((entry) => entry.url.toLowerCase() !== SELF_URL.toLowerCase())
+      .sort((a, b) => Number(b.url === VAPID_FLEET.genesis) - Number(a.url === VAPID_FLEET.genesis));
+    for (const peer of peers) {
+      const pinned = await safePeerAddrs(peer.url, { allowPrivate: VAPID_FLEET_ALLOW_PRIVATE });
+      if (!pinned) continue;
+      let pending;
+      try {
+        pending = createVapidRequest({
+          config: VAPID_FLEET,
+          relayUrl: SELF_URL,
+          relayPub: RELAY_KEYS.pub,
+          relaySecret: RELAY_KEYS.sec,
+        });
+      } catch (e) {
+        console.warn('[vapid-fleet] локальная идентичность не разрешена:', e && e.message);
+        return;
+      }
+      const response = await httpJson(relayHttpBase(peer.url) + '/vapid-fleet', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(pending.request),
+        pinned,
+        timeoutMs: 8000,
+      });
+      if (
+        !response ||
+        typeof response.senderUrl !== 'string' ||
+        response.senderUrl.toLowerCase() !== peer.url.toLowerCase()
+      ) {
+        continue;
+      }
+      const bundle = openVapidResponse({
+        config: VAPID_FLEET,
+        request: pending.request,
+        response,
+        boxSecret: pending.boxSecret,
+      });
+      if (!bundle) continue;
+      try {
+        writeJsonAtomic(RELAY_VAPID_KEY_FILE, bundle);
+        if (!activateVapid(bundle.publicKey, bundle.privateKey, `fleet-peer:${peer.url}`, bundle)) {
+          throw new Error('web-push rejected the verified VAPID pair');
+        }
+        console.log(`[vapid-fleet] общий VAPID epoch=${bundle.epoch} получен от ${peer.url}`);
+        return;
+      } catch (e) {
+        console.warn('[vapid-fleet] не удалось сохранить полученный VAPID:', e && e.message);
+      }
+    }
+  } finally {
+    vapidSyncRunning = false;
+  }
+}
+
 async function gossipOnce() {
   const peers = relayDir.filter((u) => !SELF_URL || u.toLowerCase() !== SELF_URL.toLowerCase());
   let learned = false;
@@ -1128,6 +1509,10 @@ if (SELF_URL || PEER_SEED.length) {
   setInterval(() => {
     gossipOnce().catch(() => {});
   }, GOSSIP_INTERVAL_MS).unref();
+}
+if (VAPID_FLEET && VAPID_MEMBER && !vapidFleetBundle) {
+  setTimeout(() => vapidSyncOnce().catch(() => {}), 2000).unref();
+  setInterval(() => vapidSyncOnce().catch(() => {}), VAPID_SYNC_INTERVAL_MS).unref();
 }
 
 // drop dead connections + backpressure (H4): рвём сокеты, чей буфер отправки
@@ -1193,6 +1578,25 @@ function handleTopLevelError(tag, err) {
 }
 process.on('uncaughtException', (err) => handleTopLevelError('uncaughtException', err));
 process.on('unhandledRejection', (err) => handleTopLevelError('unhandledRejection', err));
+
+// СРВ-10: без слушателя 'error' у http.Server ошибка listen (напр. EADDRINUSE)
+// уходила в uncaughtException-backstop, isFatalDbError=false → процесс продолжал
+// жить, НЕ слушая порт (зомби; systemd не рестартует, т.к. процесс жив). Теперь на
+// ошибке старта честно выходим — под рестарт супервизора.
+server.on('error', (err) => {
+  console.error('[server] listen/HTTP error:', err && err.stack ? err.stack : err);
+  if (err && (err.code === 'EADDRINUSE' || err.code === 'EACCES')) {
+    try {
+      store.close();
+    } catch (e) {}
+    process.exit(1);
+  }
+});
+// СРВ-4: ошибки на уровне ws-сервера (до/во время апгрейда) — тоже гасим, чтобы не
+// уходили в uncaughtException.
+wss.on('error', (err) => {
+  console.error('[wss] error:', err && err.message ? err.message : err);
+});
 
 server.listen(PORT, () => {
   console.log(`Лично relay listening on :${PORT} (health: /health, directory: /relays)`);

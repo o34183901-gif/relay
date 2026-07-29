@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "fleetId": "licno-production-v1",
+  "epoch": 1,
+  "genesis": "wss://89.108.83.230.sslip.io",
+  "relays": [
+    {
+      "url": "wss://89.108.83.230.sslip.io",
+      "relayPub": "Nkb8Dl2hAvpBD4ws3aJOWgvVP8oRjd+O3Cj10JR0HeM="
+    },
+    {
+      "url": "wss://46.226.162.166.sslip.io",
+      "relayPub": "MKNZHytyBJiZv+2ODeO7brz6KLWZ+N4gHhcNkJrfBGQ="
+    },
+    {
+      "url": "wss://77.221.137.215.sslip.io",
+      "relayPub": "T2JyXclQfQZL6jWLdKOonLLF0Ngta88ppRLnr4ypeSw="
+    }
+  ]
+}
