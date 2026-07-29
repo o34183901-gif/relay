@@ -55,7 +55,11 @@ log "Копирование релея в ${APP_DIR}"
 mkdir -p "$APP_DIR"
 # скрипт лежит рядом с relay.js/package.json — копируем их
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/store.js" "$SRC_DIR/push.js" "$SRC_DIR/package.json" "$APP_DIR/"
+cp \
+  "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/store.js" "$SRC_DIR/push.js" \
+  "$SRC_DIR/vapid-fleet.js" "$SRC_DIR/vapid-fleet.json" \
+  "$SRC_DIR/package.json" \
+  "$APP_DIR/"
 # C-4: тащим и lockfile — установка должна быть воспроизводимой (как npm ci в Docker).
 [[ -f "$SRC_DIR/package-lock.json" ]] && cp "$SRC_DIR/package-lock.json" "$APP_DIR/"
 cd "$APP_DIR"
