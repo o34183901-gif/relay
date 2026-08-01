@@ -5,7 +5,7 @@
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js",
-    "test": "node store.test.js && node push.test.js && node vapid-fleet.test.js && node vapid-fleet.integration.test.js && node test.js"
+    "test": "node linked-devices.test.js && node store.test.js && node push.test.js && node vapid-fleet.test.js && node vapid-fleet.integration.test.js && node test.js"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

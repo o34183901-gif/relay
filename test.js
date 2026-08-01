@@ -9,6 +9,7 @@ const os = require('os');
 const fs = require('fs');
 const WebSocket = require('ws');
 const crypto = require('./test-crypto');
+const linked = require('./linked-devices');
 
 const PORT = 8799;
 const URL = `ws://127.0.0.1:${PORT}`;
@@ -32,9 +33,19 @@ function waitForServer(timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const tryOnce = () => {
       const req = http.get({ host: '127.0.0.1', port: PORT, path: '/health', timeout: 1000 }, (res) => {
-        res.resume();
-        if (res.statusCode === 200) return resolve();
-        retry();
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          body += chunk;
+        });
+        res.on('end', () => {
+          if (res.statusCode !== 200) return retry();
+          try {
+            resolve(JSON.parse(body));
+          } catch (_) {
+            retry();
+          }
+        });
       });
       req.on('error', retry);
       req.on('timeout', () => req.destroy());
@@ -54,6 +65,19 @@ function waitFor(inbox, type, timeout = 2000) {
       const m = inbox.find((x) => x.type === type);
       if (m) return resolve(m);
       if (Date.now() - started > timeout) return reject(new Error('timeout waiting for ' + type));
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
+function waitForAfter(inbox, type, startIndex, timeout = 2000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      const m = inbox.slice(startIndex).find((x) => x.type === type);
+      if (m) return resolve(m);
+      if (Date.now() - started > timeout) return reject(new Error('timeout waiting for new ' + type));
       setTimeout(tick, 20);
     };
     tick();
@@ -114,7 +138,7 @@ async function main() {
     },
     stdio: 'ignore',
   });
-  await waitForServer(); // СРВ-14: ждём готовности (poll /health), а не фикс. паузу
+  const health = await waitForServer(); // СРВ-14: ждём готовности (poll /health), а не фикс. паузу
   let passed = 0;
   const ok = (name) => {
     console.log('  ✓ ' + name);
@@ -122,6 +146,12 @@ async function main() {
   };
 
   try {
+    assert.strictEqual(health.protocol, 2);
+    assert.ok(Array.isArray(health.capabilities));
+    assert.ok(health.capabilities.includes('linked-devices-v2'));
+    assert.strictEqual(health.maxLinkedDevices, linked.MAX_ACTIVE_DEVICES);
+    ok('health reports linked-device protocol capabilities');
+
     const alice = crypto.generateIdentity();
     const bob = crypto.generateIdentity();
 
@@ -155,6 +185,122 @@ async function main() {
     const dr = await waitFor(a.inbox, 'delivered');
     assert.strictEqual(dr.id, delivered.id);
     ok('sender receives ack + delivered receipt');
+
+    // --- linked devices v2 + mixed legacy recipient -----------------------
+    const desktop = crypto.generateIdentity();
+    const issuedAt = Date.now();
+    const capabilities = ['messages', 'files', 'voice', 'history-sync', 'notifications'];
+    const phoneCert = linked.createDeviceCertificate(
+      {
+        accountPublicKey: alice.publicKey,
+        accountSignPublicKey: alice.signPublicKey,
+        deviceId: linked.deriveDeviceId(alice.publicKey),
+        devicePublicKey: alice.publicKey,
+        deviceSignPublicKey: alice.signPublicKey,
+        name: 'Телефон Android',
+        platform: 'android',
+        issuedAt,
+        capabilities,
+      },
+      alice.signSecretKey
+    );
+    const desktopCert = linked.createDeviceCertificate(
+      {
+        accountPublicKey: alice.publicKey,
+        accountSignPublicKey: alice.signPublicKey,
+        deviceId: linked.deriveDeviceId(desktop.publicKey),
+        devicePublicKey: desktop.publicKey,
+        deviceSignPublicKey: desktop.signPublicKey,
+        name: 'Домашний компьютер',
+        platform: 'windows',
+        issuedAt: issuedAt + 1,
+        capabilities,
+      },
+      alice.signSecretKey
+    );
+    const rosterV1 = linked.createSignedRoster(
+      {
+        accountPublicKey: alice.publicKey,
+        accountSignPublicKey: alice.signPublicKey,
+        version: 1,
+        updatedAt: issuedAt + 2,
+        devices: [
+          { certificate: phoneCert, revokedAt: null },
+          { certificate: desktopCert, revokedAt: null },
+        ],
+      },
+      alice.signSecretKey
+    );
+    a.ws.send(JSON.stringify({ type: 'device-roster-put', roster: rosterV1 }));
+    await waitFor(a.inbox, 'device-roster-ok');
+    a.ws.send(JSON.stringify({ type: 'device-bind', certificate: phoneCert }));
+    await waitFor(a.inbox, 'device-bound');
+
+    const desktopClient = await client(desktop);
+    await waitFor(desktopClient.inbox, 'ready');
+    desktopClient.ws.send(JSON.stringify({ type: 'device-bind', certificate: desktopCert }));
+    const desktopBound = await waitFor(desktopClient.inbox, 'device-bound');
+    assert.strictEqual(desktopBound.accountPublicKey, alice.publicKey);
+    assert.strictEqual(desktopBound.roster.version, 1);
+    ok('signed roster binds root and independent desktop device');
+
+    const bobStart = b.inbox.length;
+    const desktopEnvelope = crypto.encryptMessage({
+      plaintext: 'сообщение с компьютера',
+      mySecretKey: desktop.secretKey,
+      myPublicKey: desktop.publicKey,
+      theirPublicKey: bob.publicKey,
+    });
+    desktopClient.ws.send(
+      JSON.stringify({ type: 'send', to: bob.publicKey, envelope: desktopEnvelope, ref: 'desktop-r1' })
+    );
+    const fromDesktop = await waitForAfter(b.inbox, 'message', bobStart);
+    assert.strictEqual(fromDesktop.from, desktop.publicKey);
+    assert.strictEqual(fromDesktop.fromAccount, alice.publicKey);
+    assert.strictEqual(fromDesktop.fromDeviceId, desktopCert.deviceId);
+    assert.deepStrictEqual(fromDesktop.deviceCertificate, desktopCert);
+    assert.strictEqual(fromDesktop.deviceRoster.version, 1);
+    assert.strictEqual(
+      crypto.decryptMessage({
+        envelope: fromDesktop.envelope,
+        mySecretKey: bob.secretKey,
+        senderPublicKey: desktop.publicKey,
+      }),
+      'сообщение с компьютера'
+    );
+    ok('v2 device metadata reaches an unchanged legacy queue/delivery path');
+
+    const rosterStart = desktopClient.inbox.length;
+    desktopClient.ws.send(JSON.stringify({ type: 'device-roster-get' }));
+    const rosterFrame = await waitForAfter(desktopClient.inbox, 'device-roster', rosterStart);
+    assert.strictEqual(rosterFrame.roster.version, 1);
+
+    const rosterV2 = linked.createSignedRoster(
+      {
+        accountPublicKey: alice.publicKey,
+        accountSignPublicKey: alice.signPublicKey,
+        version: 2,
+        updatedAt: issuedAt + 3,
+        devices: [
+          { certificate: phoneCert, revokedAt: null },
+          { certificate: desktopCert, revokedAt: issuedAt + 3 },
+        ],
+      },
+      alice.signSecretKey
+    );
+    const revokeStart = desktopClient.inbox.length;
+    const rosterAckStart = a.inbox.length;
+    a.ws.send(JSON.stringify({ type: 'device-roster-put', roster: rosterV2 }));
+    await waitForAfter(a.inbox, 'device-roster-ok', rosterAckStart);
+    await waitForAfter(desktopClient.inbox, 'device-revoked', revokeStart);
+
+    const desktopAgain = await client(desktop);
+    await waitFor(desktopAgain.inbox, 'ready');
+    desktopAgain.ws.send(JSON.stringify({ type: 'device-bind', certificate: desktopCert }));
+    const revokedError = await waitFor(desktopAgain.inbox, 'device-bind-error');
+    assert.match(revokedError.error, /revoked/);
+    desktopAgain.ws.close();
+    ok('signed roster revokes a device and prevents certificate replay');
 
     // --- offline queue: bob disconnects, alice sends, bob reconnects ---
     b.ws.close();

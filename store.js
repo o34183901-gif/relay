@@ -53,6 +53,31 @@ function createStore(dbPath, opts = {}) {
     -- Релей хранит ТОЛЬКО публичные половинки; расшифровать ими ничего нельзя.
     CREATE TABLE IF NOT EXISTS prekeys_spk (pk TEXT PRIMARY KEY, id TEXT NOT NULL, pub TEXT NOT NULL, sig TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS prekeys_otp (pk TEXT NOT NULL, id TEXT NOT NULL, pub TEXT NOT NULL, PRIMARY KEY (pk, id));
+    -- Связанные устройства v2. Существующие таблицы/адреса не меняются:
+    -- account_pk равен прежнему публичному ключу основного телефона, а device_pk
+    -- адресует отдельную очередь/токен/prekey конкретного устройства.
+    CREATE TABLE IF NOT EXISTS accounts (
+      account_pk     TEXT PRIMARY KEY,
+      root_sign_pk   TEXT NOT NULL,
+      roster_version INTEGER NOT NULL DEFAULT 0,
+      roster_json    TEXT,
+      updated_at     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS account_devices (
+      account_pk     TEXT NOT NULL,
+      device_id      TEXT NOT NULL,
+      device_pk      TEXT NOT NULL UNIQUE,
+      device_sign_pk TEXT NOT NULL,
+      certificate    TEXT NOT NULL,
+      name           TEXT NOT NULL,
+      platform       TEXT NOT NULL,
+      issued_at      INTEGER NOT NULL,
+      revoked_at     INTEGER,
+      last_seen      INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (account_pk, device_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_devices_account ON account_devices(account_pk, revoked_at, issued_at);
+    CREATE INDEX IF NOT EXISTS idx_account_devices_pk ON account_devices(device_pk);
   `);
   // Миграция существующих БД: колонка blob (1 = тело лежит файлом в blobDir).
   const hasBlobCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='blob'").get().c;
@@ -62,6 +87,13 @@ function createStore(dbPath, opts = {}) {
   // строки получают bytes=0 и добиваются реальным размером при старте (backfill).
   const hasBytesCol = db.prepare("SELECT count(*) c FROM pragma_table_info('queue') WHERE name='bytes'").get().c;
   if (!hasBytesCol) db.exec('ALTER TABLE queue ADD COLUMN bytes INTEGER DEFAULT 0');
+  // v2: проверяемые метаданные устройства отправителя. Старые строки остаются
+  // валидными (NULL => from_account равен from_pk на стороне relay/client).
+  const queueColumns = new Set(db.prepare("SELECT name FROM pragma_table_info('queue')").all().map((r) => r.name));
+  if (!queueColumns.has('from_account')) db.exec('ALTER TABLE queue ADD COLUMN from_account TEXT');
+  if (!queueColumns.has('from_device')) db.exec('ALTER TABLE queue ADD COLUMN from_device TEXT');
+  if (!queueColumns.has('device_cert')) db.exec('ALTER TABLE queue ADD COLUMN device_cert TEXT');
+  if (!queueColumns.has('device_roster')) db.exec('ALTER TABLE queue ADD COLUMN device_roster TEXT');
   // Миграция (H-6): колонка proven — доказано ли владение box-ключом для этой
   // связки pk→sign_pk (см. relay.js: ECDH-proof). Старые связки остаются
   // proven=0 (легаси-совместимость), новые клиенты помечают их proven=1.
@@ -97,7 +129,7 @@ function createStore(dbPath, opts = {}) {
 
   const q = {
     insert: db.prepare(
-      'INSERT OR REPLACE INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob,bytes) VALUES (?,?,?,?,?,?,?,?,?)'
+      'INSERT OR REPLACE INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob,bytes,from_account,from_device,device_cert,device_roster) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
     ),
     forUser: db.prepare('SELECT * FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     // S1: только id (без тел) — для потокового flush с backpressure, чтобы не
@@ -118,6 +150,7 @@ function createStore(dbPath, opts = {}) {
     needBackfill: db.prepare('SELECT id, blob FROM queue WHERE bytes=0'),
     setBytes: db.prepare('UPDATE queue SET bytes=? WHERE id=?'),
     expire: db.prepare('DELETE FROM queue WHERE ts < ?'),
+    rowsForDrop: db.prepare('SELECT id, blob, bytes FROM queue WHERE to_pk=?'),
   };
   // null — если тело-файл пропал (например, volume почистили руками): такая
   // строка мертва, подчищаем её и пропускаем.
@@ -145,6 +178,24 @@ function createStore(dbPath, opts = {}) {
     return {
       id: r.id,
       from: r.from_pk || undefined,
+      fromAccount: r.from_account || r.from_pk || undefined,
+      fromDeviceId: r.from_device || undefined,
+      deviceCertificate: (() => {
+        if (!r.device_cert) return undefined;
+        try {
+          return JSON.parse(r.device_cert);
+        } catch (e) {
+          return undefined;
+        }
+      })(),
+      deviceRoster: (() => {
+        if (!r.device_roster) return undefined;
+        try {
+          return JSON.parse(r.device_roster);
+        } catch (e) {
+          return undefined;
+        }
+      })(),
       envelope,
       silent: !!r.silent,
       callPush: !!r.call_push,
@@ -217,6 +268,71 @@ function createStore(dbPath, opts = {}) {
     delOne: db.prepare('DELETE FROM prekeys_otp WHERE pk=? AND id=?'),
     count: db.prepare('SELECT count(*) c FROM prekeys_otp WHERE pk=?'),
   };
+  const account = {
+    get: db.prepare('SELECT account_pk, root_sign_pk, roster_version, roster_json, updated_at FROM accounts WHERE account_pk=?'),
+    insert: db.prepare(
+      'INSERT INTO accounts (account_pk,root_sign_pk,roster_version,roster_json,updated_at) VALUES (?,?,?,?,?)'
+    ),
+    updateRoster: db.prepare(
+      'UPDATE accounts SET roster_version=?, roster_json=?, updated_at=? WHERE account_pk=?'
+    ),
+    count: db.prepare('SELECT count(*) c FROM accounts'),
+  };
+  const device = {
+    byPk: db.prepare(
+      'SELECT account_pk,device_id,device_pk,device_sign_pk,certificate,name,platform,issued_at,revoked_at,last_seen FROM account_devices WHERE device_pk=?'
+    ),
+    byId: db.prepare(
+      'SELECT account_pk,device_id,device_pk,device_sign_pk,certificate,name,platform,issued_at,revoked_at,last_seen FROM account_devices WHERE account_pk=? AND device_id=?'
+    ),
+    forAccount: db.prepare(
+      'SELECT account_pk,device_id,device_pk,device_sign_pk,certificate,name,platform,issued_at,revoked_at,last_seen FROM account_devices WHERE account_pk=? ORDER BY issued_at ASC, device_id ASC'
+    ),
+    upsert: db.prepare(`
+      INSERT INTO account_devices
+        (account_pk,device_id,device_pk,device_sign_pk,certificate,name,platform,issued_at,revoked_at,last_seen)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(account_pk,device_id) DO UPDATE SET
+        device_pk=excluded.device_pk,
+        device_sign_pk=excluded.device_sign_pk,
+        certificate=excluded.certificate,
+        name=excluded.name,
+        platform=excluded.platform,
+        issued_at=excluded.issued_at,
+        revoked_at=excluded.revoked_at
+    `),
+    revokeById: db.prepare(
+      'UPDATE account_devices SET revoked_at=? WHERE account_pk=? AND device_id=? AND revoked_at IS NULL'
+    ),
+    touch: db.prepare('UPDATE account_devices SET last_seen=? WHERE device_pk=?'),
+    countActive: db.prepare('SELECT count(*) c FROM account_devices WHERE revoked_at IS NULL'),
+  };
+
+  function deviceRow(r) {
+    if (!r) return null;
+    let certificate = null;
+    try {
+      certificate = JSON.parse(r.certificate);
+    } catch (e) {}
+    return {
+      accountPublicKey: r.account_pk,
+      deviceId: r.device_id,
+      devicePublicKey: r.device_pk,
+      deviceSignPublicKey: r.device_sign_pk,
+      certificate,
+      name: r.name,
+      platform: r.platform,
+      issuedAt: r.issued_at,
+      revokedAt: r.revoked_at == null ? null : r.revoked_at,
+      lastSeen: r.last_seen || 0,
+    };
+  }
+
+  function dropQueueFor(to) {
+    const rows = q.rowsForDrop.all(to);
+    for (const row of rows) dropRow(row);
+    return rows.length;
+  }
 
   return {
     // --- queue --------------------------------------------------------------
@@ -224,7 +340,23 @@ function createStore(dbPath, opts = {}) {
      * Положить конверт в очередь получателя; при переполнении вытеснить старейший.
      * Тело крупнее blobThreshold уходит файлом в blobDir — в БД только ссылка.
      */
-    enqueue({ id: mid, to, from, envelope, silent, callPush, ts, maxPerUser, maxPerSender, maxTotal, maxTotalBytes }) {
+    enqueue({
+      id: mid,
+      to,
+      from,
+      fromAccount,
+      fromDeviceId,
+      deviceCertificate,
+      deviceRoster,
+      envelope,
+      silent,
+      callPush,
+      ts,
+      maxPerUser,
+      maxPerSender,
+      maxTotal,
+      maxTotalBytes,
+    }) {
       const envJson = JSON.stringify(envelope);
       const bytes = Buffer.byteLength(envJson);
 
@@ -278,7 +410,21 @@ function createStore(dbPath, opts = {}) {
       }
       const asBlob = blobDir && bytes > blobThreshold;
       if (asBlob) writeBlob(mid, envJson);
-      q.insert.run(mid, to, from || null, asBlob ? '' : envJson, silent ? 1 : 0, callPush ? 1 : 0, ts, asBlob ? 1 : 0, bytes);
+      q.insert.run(
+        mid,
+        to,
+        from || null,
+        asBlob ? '' : envJson,
+        silent ? 1 : 0,
+        callPush ? 1 : 0,
+        ts,
+        asBlob ? 1 : 0,
+        bytes,
+        fromAccount || from || null,
+        fromDeviceId || null,
+        deviceCertificate ? JSON.stringify(deviceCertificate) : null,
+        deviceRoster ? JSON.stringify(deviceRoster) : null
+      );
       liveCount += 1;
       liveBytes += bytes;
       return true; // СРВ-2: конверт сохранён (false выше — отклонён из-за полной очереди получателя)
@@ -303,6 +449,8 @@ function createStore(dbPath, opts = {}) {
       dropRow(r);
       return r.from_pk || null;
     },
+    /** Удалить очередь конкретного адреса устройства (после подписанного отзыва). */
+    dropQueueFor,
     /** Удалить всё старше `cutoffTs` (TTL). Вернуть число удалённых. */
     expireOlderThan(cutoffTs) {
       for (const r of q.blobsOlder.all(cutoffTs)) unlinkBlob(r.id);
@@ -431,6 +579,116 @@ function createStore(dbPath, opts = {}) {
       return otp.count.get(pk).c;
     },
 
+    // --- связанные устройства v2 -------------------------------------------
+    getAccount(accountPk) {
+      const r = account.get.get(accountPk);
+      if (!r) return null;
+      return {
+        accountPublicKey: r.account_pk,
+        accountSignPublicKey: r.root_sign_pk,
+        rosterVersion: r.roster_version || 0,
+        updatedAt: r.updated_at || 0,
+      };
+    },
+    getAccountRoster(accountPk) {
+      const r = account.get.get(accountPk);
+      if (!r || !r.roster_json) return null;
+      try {
+        return JSON.parse(r.roster_json);
+      } catch (e) {
+        return null;
+      }
+    },
+    getDevice(devicePk) {
+      return deviceRow(device.byPk.get(devicePk));
+    },
+    getAccountDevice(accountPk, deviceId) {
+      return deviceRow(device.byId.get(accountPk, deviceId));
+    },
+    devicesForAccount(accountPk) {
+      return device.forAccount.all(accountPk).map(deviceRow);
+    },
+    touchDevice(devicePk, now) {
+      device.touch.run(now, devicePk);
+    },
+    /**
+     * Сохранить уже криптографически проверенный полный roster.
+     * Версия строго монотонна; повтор того же roster идемпотентен. Отозванный
+     * deviceId нельзя оживить тем же сертификатом — повторная привязка требует
+     * нового ключа, а значит нового deviceId.
+     */
+    putAccountRoster(roster) {
+      const accountPk = roster.accountPublicKey;
+      const rootSignPk = roster.accountSignPublicKey;
+      const raw = JSON.stringify(roster);
+      const current = account.get.get(accountPk);
+      if (current && current.root_sign_pk !== rootSignPk) return { ok: false, reason: 'root-key-conflict' };
+      if (current && roster.version < current.roster_version) return { ok: false, reason: 'stale-roster' };
+      if (current && roster.version === current.roster_version) {
+        return current.roster_json === raw
+          ? { ok: true, unchanged: true, revokedDeviceKeys: [] }
+          : { ok: false, reason: 'roster-version-conflict' };
+      }
+
+      const entries = roster.devices || [];
+      const incomingIds = new Set(entries.map((entry) => entry.certificate.deviceId));
+      const existing = device.forAccount.all(accountPk);
+      const existingById = new Map(existing.map((row) => [row.device_id, row]));
+      for (const entry of entries) {
+        const cert = entry.certificate;
+        const byPk = device.byPk.get(cert.devicePublicKey);
+        if (byPk && (byPk.account_pk !== accountPk || byPk.device_id !== cert.deviceId)) {
+          return { ok: false, reason: 'device-key-conflict' };
+        }
+        const old = existingById.get(cert.deviceId);
+        if (old && old.device_pk !== cert.devicePublicKey) return { ok: false, reason: 'device-id-conflict' };
+        if (old && old.revoked_at != null && entry.revokedAt == null) return { ok: false, reason: 'device-revoked' };
+      }
+
+      const revokedDeviceKeys = [];
+      const tx = db.transaction(() => {
+        if (!current) account.insert.run(accountPk, rootSignPk, 0, null, 0);
+        for (const entry of entries) {
+          const cert = entry.certificate;
+          const old = existingById.get(cert.deviceId);
+          const revokedAt = entry.revokedAt == null ? null : entry.revokedAt;
+          if (revokedAt != null && (!old || old.revoked_at == null)) revokedDeviceKeys.push(cert.devicePublicKey);
+          device.upsert.run(
+            accountPk,
+            cert.deviceId,
+            cert.devicePublicKey,
+            cert.deviceSignPublicKey,
+            JSON.stringify(cert),
+            cert.name,
+            cert.platform,
+            cert.issuedAt,
+            revokedAt,
+            old ? old.last_seen || 0 : 0
+          );
+        }
+        // Roster полный: отсутствующий ранее активный сертификат считается
+        // отозванным подписанной новой версией, а не удаляется из аудита.
+        const missing = existing.filter((row) => row.revoked_at == null && !incomingIds.has(row.device_id));
+        if (missing.length) {
+          for (const row of missing) {
+            device.revokeById.run(roster.updatedAt, accountPk, row.device_id);
+            revokedDeviceKeys.push(row.device_pk);
+          }
+        }
+        account.updateRoster.run(roster.version, raw, roster.updatedAt, accountPk);
+      });
+      tx();
+      return { ok: true, unchanged: false, revokedDeviceKeys: [...new Set(revokedDeviceKeys)] };
+    },
+    /** Транспортные данные отозванного устройства больше не нужны и не доставляются. */
+    purgeDeviceTransport(devicePk) {
+      const queued = dropQueueFor(devicePk);
+      tok.del.run(devicePk);
+      otp.delAll.run(devicePk);
+      spk.delFor.run(devicePk);
+      return queued;
+    },
+
     // --- relay directory ----------------------------------------------------
     // S9: каталог отдаём уже усечённым до потолка (самые свежие вперёд), чтобы
     // мусор из gossip не раздувал ответы даже если чистка ещё не отработала.
@@ -457,6 +715,8 @@ function createStore(dbPath, opts = {}) {
         usersQueued: q.usersQueued.get().c,
         totalQueued: q.totalQueued.get().c,
         relays: dir.count.get().c,
+        accounts: account.count.get().c,
+        activeDevices: device.countActive.get().c,
       };
     },
     /**

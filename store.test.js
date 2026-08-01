@@ -340,4 +340,97 @@ test('blob: без blobDir всё в БД (обратная совместимо
   s.close();
 });
 
+function deviceCertificate(accountPk, rootSignPk, id, pk, signPk, issuedAt = 1000) {
+  return {
+    v: 2,
+    type: 'licno-device-certificate',
+    accountPublicKey: accountPk,
+    accountSignPublicKey: rootSignPk,
+    deviceId: id,
+    devicePublicKey: pk,
+    deviceSignPublicKey: signPk,
+    name: id === 'phone' ? 'Телефон Android' : 'Домашний компьютер',
+    platform: id === 'phone' ? 'android' : 'windows',
+    issuedAt,
+    capabilities: ['files', 'history-sync', 'messages', 'notifications', 'voice'],
+    rootSignature: 'signed-' + id,
+  };
+}
+
+function roster(version, devices, updatedAt = version * 1000) {
+  return {
+    v: 2,
+    type: 'licno-device-roster',
+    accountPublicKey: 'account-pk',
+    accountSignPublicKey: 'root-sign-pk',
+    version,
+    updatedAt,
+    devices,
+    rootSignature: 'roster-signature-' + version,
+  };
+}
+
+test('linked devices: roster монотонен, читается по account и device key', () => {
+  const s = fresh();
+  const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
+  const desktop = deviceCertificate('account-pk', 'root-sign-pk', 'desktop', 'desktop-pk', 'desktop-sign-pk', 2000);
+  const v1 = roster(1, [{ certificate: phone, revokedAt: null }]);
+  const first = s.putAccountRoster(v1);
+  assert.strictEqual(first.ok, true);
+  assert.strictEqual(s.getAccount('account-pk').rosterVersion, 1);
+  assert.deepStrictEqual(s.getAccountRoster('account-pk'), v1);
+  assert.strictEqual(s.getDevice('account-pk').deviceId, 'phone');
+
+  const v2 = roster(2, [
+    { certificate: phone, revokedAt: null },
+    { certificate: desktop, revokedAt: null },
+  ]);
+  assert.strictEqual(s.putAccountRoster(v2).ok, true);
+  assert.strictEqual(s.devicesForAccount('account-pk').length, 2);
+  assert.strictEqual(s.getDevice('desktop-pk').revokedAt, null);
+  assert.strictEqual(s.putAccountRoster(v2).unchanged, true, 'повтор идемпотентен');
+  assert.strictEqual(s.putAccountRoster(v1).reason, 'stale-roster');
+  assert.strictEqual(s.putAccountRoster({ ...v2, rootSignature: 'other' }).reason, 'roster-version-conflict');
+  s.close();
+});
+
+test('linked devices: отзыв необратим тем же сертификатом и чистит транспорт', () => {
+  const s = fresh();
+  const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
+  const desktop = deviceCertificate('account-pk', 'root-sign-pk', 'desktop', 'desktop-pk', 'desktop-sign-pk', 2000);
+  s.putAccountRoster(
+    roster(1, [
+      { certificate: phone, revokedAt: null },
+      { certificate: desktop, revokedAt: null },
+    ])
+  );
+  s.enqueue({ id: 'for-desktop', to: 'desktop-pk', from: 'sender', envelope: { cipher: 'x' }, ts: 1 });
+  s.setToken('desktop-pk', 'push-token');
+  s.setSpk('desktop-pk', { id: 'spk', pub: 'pub', sig: 'sig' });
+  s.replaceOtps('desktop-pk', [{ id: 'otp', pub: 'pub' }]);
+
+  const revoked = s.putAccountRoster(
+    roster(2, [
+      { certificate: phone, revokedAt: null },
+      { certificate: desktop, revokedAt: 2500 },
+    ], 2500)
+  );
+  assert.deepStrictEqual(revoked.revokedDeviceKeys, ['desktop-pk']);
+  assert.strictEqual(s.getDevice('desktop-pk').revokedAt, 2500);
+  assert.strictEqual(s.purgeDeviceTransport('desktop-pk'), 1);
+  assert.strictEqual(s.queueFor('desktop-pk').length, 0);
+  assert.strictEqual(s.getToken('desktop-pk'), null);
+  assert.strictEqual(s.getSpk('desktop-pk'), null);
+  assert.strictEqual(s.countOtps('desktop-pk'), 0);
+
+  const replay = s.putAccountRoster(
+    roster(3, [
+      { certificate: phone, revokedAt: null },
+      { certificate: desktop, revokedAt: null },
+    ], 3000)
+  );
+  assert.strictEqual(replay.reason, 'device-revoked');
+  s.close();
+});
+
 console.log('\n' + passed + ' passed');

@@ -27,6 +27,13 @@
  *       получатель подтвердил приём
  *   ping/pong          — проверка живости соединения
  *
+ * Связанные устройства v2 (полностью совместимо со старыми кадрами выше):
+ *   client -> server  {"type":"device-roster-put","roster":{...rootSignature}}
+ *   client -> server  {"type":"device-bind","certificate":{...rootSignature}}
+ *   server -> client  {"type":"device-bound","roster":{...}}
+ * После bind обычный `send` получает внешние поля fromAccount/fromDeviceId и
+ * сертификат устройства; сам E2E-конверт релей по-прежнему не расшифровывает.
+ *
  * НАДЁЖНОСТЬ: конверт лежит в очереди, пока получатель не пришлёт `received`.
  * Онлайн-доставка тоже держит копию в очереди до квитанции, поэтому обрыв связи
  * в момент доставки не теряет сообщение — при переподключении оно шлётся снова.
@@ -49,6 +56,12 @@ const { WebSocketServer } = require('ws');
 const { sendPush, sendCallPush, pushReady, setVapidKeys, vapidPublicKey, generateVapidKeys } = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
+const {
+  assertDeviceCertificate,
+  assertSignedRoster,
+  stableStringify,
+  MAX_ACTIVE_DEVICES,
+} = require('./linked-devices');
 const {
   loadFleetConfig,
   memberFor,
@@ -92,6 +105,8 @@ function turnIceServers() {
 }
 
 const PORT = process.env.PORT || 8787;
+const RELAY_PROTOCOL = 2;
+const RELAY_CAPABILITIES = Object.freeze(['linked-devices-v2', 'device-queues', 'signed-rosters']);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
 const DB_FILE = process.env.RELAY_DB || path.join(__dirname, 'relay.db');
@@ -355,6 +370,48 @@ async function handleVapidFleetHttp(req, res) {
 
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
 const online = new Map();
+// account public key -> deviceId -> live WebSocket. Это дополнительный индекс:
+// legacy online(pubkey) остаётся неизменным, поэтому старые APK не замечают v2.
+const accountOnline = new Map();
+
+function unindexAccountSocket(ws) {
+  if (!ws || !ws.accountPubkey || !ws.deviceId) return;
+  const devices = accountOnline.get(ws.accountPubkey);
+  if (!devices) return;
+  if (devices.get(ws.deviceId) === ws) devices.delete(ws.deviceId);
+  if (!devices.size) accountOnline.delete(ws.accountPubkey);
+  ws.accountPubkey = null;
+  ws.deviceId = null;
+  ws.deviceCertificate = null;
+}
+
+function indexAccountSocket(ws, record) {
+  unindexAccountSocket(ws);
+  let devices = accountOnline.get(record.accountPublicKey);
+  if (!devices) {
+    devices = new Map();
+    accountOnline.set(record.accountPublicKey, devices);
+  }
+  const previous = devices.get(record.deviceId);
+  if (previous && previous !== ws) {
+    try {
+      previous.terminate();
+    } catch (e) {}
+  }
+  ws.accountPubkey = record.accountPublicKey;
+  ws.deviceId = record.deviceId;
+  ws.deviceCertificate = record.certificate;
+  devices.set(record.deviceId, ws);
+  store.touchDevice(record.devicePublicKey, Date.now());
+}
+
+function broadcastAccount(accountPk, frame) {
+  const devices = accountOnline.get(accountPk);
+  if (!devices) return 0;
+  let sent = 0;
+  for (const ws of devices.values()) if (send(ws, frame)) sent += 1;
+  return sent;
+}
 // ip -> число активных соединений (за Caddy берём X-Forwarded-For)
 const ipConns = new Map();
 // pubkey -> время последнего message-пуша (троттлинг уведомлений)
@@ -740,6 +797,9 @@ const server = http.createServer((req, res) => {
     res.end(
       JSON.stringify({
         ok: true,
+        protocol: RELAY_PROTOCOL,
+        capabilities: RELAY_CAPABILITIES,
+        maxLinkedDevices: MAX_ACTIVE_DEVICES,
         online: online.size,
         queued: st.usersQueued,
         messages: st.totalQueued,
@@ -828,6 +888,26 @@ function send(ws, obj) {
   return false;
 }
 
+function queuedMessageFrame(item) {
+  const frame = { type: 'message', id: item.id, envelope: item.envelope };
+  if (item.from) frame.from = item.from;
+  if (item.fromAccount) frame.fromAccount = item.fromAccount;
+  if (item.fromDeviceId) frame.fromDeviceId = item.fromDeviceId;
+  if (item.deviceCertificate) frame.deviceCertificate = item.deviceCertificate;
+  if (item.deviceRoster) frame.deviceRoster = item.deviceRoster;
+  return frame;
+}
+
+function senderMetadata(ws) {
+  if (!ws || !ws.pubkey) return {};
+  return {
+    fromAccount: ws.accountPubkey || ws.pubkey,
+    fromDeviceId: ws.deviceId || undefined,
+    deviceCertificate: ws.deviceCertificate || undefined,
+    deviceRoster: ws.accountPubkey ? store.getAccountRoster(ws.accountPubkey) || undefined : undefined,
+  };
+}
+
 // Follower может получить общий VAPID уже после того, как PWA аутентифицировалась.
 // Не заставляем пользователя ждать следующего реконнекта: сообщаем новый публичный
 // ключ всем уже готовым клиентам отдельным совместимым кадром.
@@ -859,14 +939,14 @@ function flushQueue(pubkey, ws) {
       }
       const item = store.getItem(ids[i]);
       i += 1;
-      if (item) send(ws, { type: 'message', id: item.id, envelope: item.envelope });
+      if (item) send(ws, queuedMessageFrame(item));
     }
   }
   pump();
   return ids.length;
 }
 
-function deliver(from, to, envelope, silent, callPush) {
+function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   const id = nextId();
   // Enqueue; the copy is removed only when the recipient acks (received).
   // СРВ-2: enqueue возвращает false, если очередь получателя полна и у отправителя
@@ -875,6 +955,10 @@ function deliver(from, to, envelope, silent, callPush) {
     id,
     to,
     from,
+    fromAccount: metadata.fromAccount,
+    fromDeviceId: metadata.fromDeviceId,
+    deviceCertificate: metadata.deviceCertificate,
+    deviceRoster: metadata.deviceRoster,
     envelope,
     silent,
     callPush,
@@ -891,7 +975,8 @@ function deliver(from, to, envelope, silent, callPush) {
   // (=доставлено), даже когда сокет уже CLOSING и send молча ничего не отправил, —
   // отправитель видел ложный ✓, а конверт при полной очереди (stored=false) нигде
   // не оставался. Теперь при закрытом сокете проваливаемся ниже (в push/queue/drop).
-  if (ws && send(ws, { type: 'message', id, envelope })) {
+  const liveFrame = queuedMessageFrame({ id, from, envelope, ...metadata });
+  if (ws && send(ws, liveFrame)) {
     counters.deliveredOnline += 1;
     return { queued: false, id };
   }
@@ -955,6 +1040,84 @@ function rateLimited(ws) {
   return ws.rateCount > RATE_MAX_FRAMES;
 }
 
+function closeRevokedDevice(devicePk, accountPk) {
+  store.purgeDeviceTransport(devicePk);
+  const target = online.get(devicePk);
+  if (!target) return;
+  if (target.accountPubkey === accountPk) {
+    send(target, { type: 'device-revoked', accountPublicKey: accountPk });
+    try {
+      target.close(4003, 'device revoked');
+    } catch (e) {
+      try {
+        target.terminate();
+      } catch (e2) {}
+    }
+  }
+}
+
+function acceptSignedRoster(ws, candidate) {
+  let roster;
+  try {
+    roster = assertSignedRoster(candidate);
+  } catch (error) {
+    return { ok: false, reason: 'invalid-roster' };
+  }
+  const known = store.getAccount(roster.accountPublicKey);
+  if (known) {
+    if (known.accountSignPublicKey !== roster.accountSignPublicKey) {
+      return { ok: false, reason: 'root-key-conflict' };
+    }
+  } else {
+    // Первичное создание аккаунта возможно только из доказанного сеанса прежнего
+    // root-адреса. Поэтому чужой подписанный объект не может занять account_pk до
+    // первого выхода владельца телефона на этот relay.
+    const boundRootSign = store.getSignKey(roster.accountPublicKey);
+    if (
+      !ws.proven ||
+      ws.pubkey !== roster.accountPublicKey ||
+      boundRootSign !== roster.accountSignPublicKey
+    ) {
+      return { ok: false, reason: 'account-bootstrap-requires-root' };
+    }
+  }
+  const result = store.putAccountRoster(roster);
+  if (!result.ok) return result;
+  for (const devicePk of result.revokedDeviceKeys || []) closeRevokedDevice(devicePk, roster.accountPublicKey);
+  return { ...result, roster };
+}
+
+function bindSocketToCertifiedDevice(ws, candidate) {
+  if (!ws.proven) return { ok: false, reason: 'box-ownership-proof-required' };
+  let certificate;
+  try {
+    certificate = assertDeviceCertificate(candidate);
+  } catch (error) {
+    return { ok: false, reason: 'invalid-device-certificate' };
+  }
+  if (
+    certificate.devicePublicKey !== ws.pubkey ||
+    certificate.deviceSignPublicKey !== store.getSignKey(ws.pubkey)
+  ) {
+    return { ok: false, reason: 'certificate-does-not-match-session' };
+  }
+  const account = store.getAccount(certificate.accountPublicKey);
+  if (!account || account.accountSignPublicKey !== certificate.accountSignPublicKey) {
+    return { ok: false, reason: 'unknown-account' };
+  }
+  const record = store.getAccountDevice(certificate.accountPublicKey, certificate.deviceId);
+  if (!record || record.revokedAt != null) return { ok: false, reason: 'device-revoked-or-unknown' };
+  if (
+    record.devicePublicKey !== certificate.devicePublicKey ||
+    record.deviceSignPublicKey !== certificate.deviceSignPublicKey ||
+    stableStringify(record.certificate) !== stableStringify(certificate)
+  ) {
+    return { ok: false, reason: 'certificate-not-in-roster' };
+  }
+  indexAccountSocket(ws, record);
+  return { ok: true, record, roster: store.getAccountRoster(certificate.accountPublicKey) };
+}
+
 wss.on('connection', (ws, req) => {
   // H4: per-IP лимит одновременных соединений (защита от коннект-флуда).
   const ip = clientIp(req);
@@ -975,6 +1138,9 @@ wss.on('connection', (ws, req) => {
   ws.pendingSpk = null;
   ws.nonce = null;
   ws.ephSec = null;
+  ws.accountPubkey = null;
+  ws.deviceId = null;
+  ws.deviceCertificate = null;
   ws.rateStart = Date.now();
   ws.rateCount = 0;
   ws.on('pong', () => (ws.isAlive = true));
@@ -1033,6 +1199,7 @@ wss.on('connection', (ws, req) => {
       if (c <= 0) ipConns.delete(ws.ip);
       else ipConns.set(ws.ip, c);
     }
+    unindexAccountSocket(ws);
     if (ws.pubkey && online.get(ws.pubkey) === ws) online.delete(ws.pubkey);
   });
 });
@@ -1169,7 +1336,15 @@ function handleFrameSafely(ws, msg) {
       // клиент по этому числу решает, пора ли выгрузить свежую пачку.
       // vapidPublicKey: web-push (UnifiedPush) публичный ключ релея — клиент передаёт
       // его в expo-unified-push registerDevice(). null, если web-push не настроен.
-      return send(ws, { type: 'ready', queued: flushed, prekeys: store.countOtps(ws.pubkey), vapidPublicKey: vapidPublicKey() });
+      return send(ws, {
+        type: 'ready',
+        queued: flushed,
+        prekeys: store.countOtps(ws.pubkey),
+        vapidPublicKey: vapidPublicKey(),
+        protocol: RELAY_PROTOCOL,
+        capabilities: RELAY_CAPABILITIES,
+        maxLinkedDevices: MAX_ACTIVE_DEVICES,
+      });
     }
 
     // --- relay directory (public READ allowed before auth for bootstrap) ---
@@ -1180,11 +1355,55 @@ function handleFrameSafely(ws, msg) {
     // App-level liveness: клиент шлёт ping, чтобы отличить живое соединение от
     // «тихо зависшего» при смене сети (WS-фреймы ping ему не видны из JS).
     if (msg.type === 'ping') {
+      if (ws.deviceId) store.touchDevice(ws.pubkey, Date.now());
       return send(ws, { type: 'pong' });
     }
 
     // --- everything past here requires authentication ---
     if (!ws.authed) return send(ws, { type: 'error', error: 'not authenticated' });
+
+    if (msg.type === 'device-roster-put') {
+      const accepted = acceptSignedRoster(ws, msg.roster);
+      if (!accepted.ok) {
+        return send(ws, { type: 'device-roster-error', error: accepted.reason || 'invalid-roster' });
+      }
+      send(ws, {
+        type: 'device-roster-ok',
+        accountPublicKey: accepted.roster.accountPublicKey,
+        version: accepted.roster.version,
+        unchanged: !!accepted.unchanged,
+      });
+      broadcastAccount(accepted.roster.accountPublicKey, {
+        type: 'device-roster',
+        roster: accepted.roster,
+      });
+      return;
+    }
+
+    if (msg.type === 'device-bind') {
+      const bound = bindSocketToCertifiedDevice(ws, msg.certificate);
+      if (!bound.ok) {
+        return send(ws, { type: 'device-bind-error', error: bound.reason || 'device-bind-failed' });
+      }
+      return send(ws, {
+        type: 'device-bound',
+        accountPublicKey: bound.record.accountPublicKey,
+        deviceId: bound.record.deviceId,
+        roster: bound.roster,
+      });
+    }
+
+    if (msg.type === 'device-roster-get') {
+      const requested =
+        typeof msg.accountPublicKey === 'string' && msg.accountPublicKey
+          ? msg.accountPublicKey
+          : ws.accountPubkey || ws.pubkey;
+      const ownsRequested =
+        requested === ws.accountPubkey ||
+        (requested === ws.pubkey && !!store.getAccount(requested));
+      if (!ownsRequested) return send(ws, { type: 'device-roster-error', error: 'forbidden' });
+      return send(ws, { type: 'device-roster', roster: store.getAccountRoster(requested) });
+    }
 
     if (msg.type === 'relay-advertise') {
       // M-1: учить каталог может ТОЛЬКО аутентифицированный клиент/релей — иначе
@@ -1295,7 +1514,14 @@ function handleFrameSafely(ws, msg) {
         return send(ws, { type: 'error', error: 'envelope too large' });
       }
       counters.msgsIn += 1;
-      const r = deliver(ws.pubkey, msg.to, msg.envelope, !!msg.silent, !!msg.callPush);
+      const r = deliver(
+        ws.pubkey,
+        msg.to,
+        msg.envelope,
+        !!msg.silent,
+        !!msg.callPush,
+        senderMetadata(ws)
+      );
       // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
       // доставлено» вместо ложного «отправлено». Старый клиент поле игнорирует.
       return send(ws, { type: 'ack', ref: msg.ref, id: r.id, queued: r.queued, dropped: !!r.dropped });
