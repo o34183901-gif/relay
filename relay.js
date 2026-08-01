@@ -1106,7 +1106,8 @@ function bindSocketToCertifiedDevice(ws, candidate) {
     return { ok: false, reason: 'unknown-account' };
   }
   const record = store.getAccountDevice(certificate.accountPublicKey, certificate.deviceId);
-  if (!record || record.revokedAt != null) return { ok: false, reason: 'device-revoked-or-unknown' };
+  if (!record) return { ok: false, reason: 'device-unknown' };
+  if (record.revokedAt != null) return { ok: false, reason: 'device-revoked' };
   if (
     record.devicePublicKey !== certificate.devicePublicKey ||
     record.deviceSignPublicKey !== certificate.deviceSignPublicKey ||

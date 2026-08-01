@@ -15,6 +15,7 @@ const DEVICE_CERT_TYPE = 'licno-device-certificate';
 const DEVICE_ROSTER_TYPE = 'licno-device-roster';
 const PAIRING_REQUEST_TYPE = 'licno-device-link-request';
 const PAIRING_QR_PREFIX = 'licno://link-device/v2#';
+const PAIRING_QR_COMPACT_PREFIX = 'licno://ld/3#';
 const PAIRING_TTL_MS = 2 * 60 * 1000;
 const PAIRING_CLOCK_SKEW_MS = 30 * 1000;
 const MAX_ACTIVE_DEVICES = 10;
@@ -27,8 +28,11 @@ const DEVICE_ID_DOMAIN = 'licno-device-id-v2|';
 const VERIFY_CODE_DOMAIN = 'licno-device-verify-code-v2|';
 
 const CAPABILITIES = new Set(['messages', 'files', 'voice', 'history-sync', 'notifications']);
+const CAPABILITY_BITS = Object.freeze({ files: 1, 'history-sync': 2, messages: 4, notifications: 8, voice: 16 });
 const PLATFORMS = new Set(['android', 'web', 'windows', 'macos', 'linux']);
 const DESKTOP_PLATFORMS = new Set(['windows', 'macos', 'linux']);
+const PLATFORM_CODES = Object.freeze({ windows: 'w', macos: 'm', linux: 'l' });
+const CODE_PLATFORMS = Object.freeze({ w: 'windows', m: 'macos', l: 'linux' });
 
 function fail(message) {
   const error = new Error(message);
@@ -107,6 +111,47 @@ function fromBase64Url(value) {
   } catch (error) {
     fail('invalid base64url');
   }
+}
+
+function compactBase64(value, bytes, label) {
+  return toBase64Url(decodeExact(value, bytes, label));
+}
+
+function expandBase64Url(value, bytes, label) {
+  const decoded = fromBase64Url(value);
+  if (decoded.length !== bytes) fail(`${label} has invalid length`);
+  return encodeBase64(decoded);
+}
+
+function compactRelay(value) {
+  if (value.startsWith('wss://')) return value.slice(6);
+  if (value.startsWith('ws://')) return `~${value.slice(5)}`;
+  return value;
+}
+
+function expandRelay(value) {
+  if (typeof value !== 'string' || !value) fail('pairing relay URL is invalid');
+  if (value.startsWith('~')) return `ws://${value.slice(1)}`;
+  if (!value.includes('://')) return `wss://${value}`;
+  return value;
+}
+
+function parseBase36(value, label) {
+  if (typeof value !== 'string' || !/^[0-9a-z]{1,12}$/.test(value)) fail(`${label} is invalid`);
+  const result = Number.parseInt(value, 36);
+  if (!Number.isSafeInteger(result)) fail(`${label} is invalid`);
+  return result;
+}
+
+function capabilityMask(capabilities) {
+  return capabilities.reduce((mask, capability) => mask | CAPABILITY_BITS[capability], 0);
+}
+
+function capabilitiesFromMask(value) {
+  const mask = parseBase36(value, 'capabilities');
+  const knownMask = Object.values(CAPABILITY_BITS).reduce((result, bit) => result | bit, 0);
+  if (!mask || (mask & ~knownMask)) fail('unsupported capability');
+  return Object.keys(CAPABILITY_BITS).filter((capability) => (mask & CAPABILITY_BITS[capability]) !== 0);
 }
 
 function signPayload(domain, payload, secretKey) {
@@ -347,12 +392,29 @@ function verifyPairingRequest(request, options = {}) {
 
 function encodePairingQr(request) {
   const valid = assertPairingRequest(request, { now: request.createdAt });
-  return PAIRING_QR_PREFIX + toBase64Url(decodeUTF8(stableStringify(valid)));
+  const compact = {
+    i: compactBase64(valid.pairingId, 18, 'pairing id'),
+    b: compactBase64(valid.devicePublicKey, nacl.box.publicKeyLength, 'device public key'),
+    s: compactBase64(valid.deviceSignPublicKey, nacl.sign.publicKeyLength, 'device sign public key'),
+    n: valid.name,
+    p: PLATFORM_CODES[valid.platform],
+    t: valid.createdAt.toString(36),
+    e: (valid.expiresAt - valid.createdAt).toString(36),
+    x: compactBase64(valid.nonce, 32, 'pairing nonce'),
+    r: valid.relays.map(compactRelay),
+    c: capabilityMask(valid.capabilities).toString(36),
+    g: compactBase64(valid.requestSignature, nacl.sign.signatureLength, 'signature'),
+  };
+  return PAIRING_QR_COMPACT_PREFIX + toBase64Url(decodeUTF8(stableStringify(compact)));
 }
 
 function decodePairingQr(value, options = {}) {
-  if (typeof value !== 'string' || !value.startsWith(PAIRING_QR_PREFIX)) fail('not a linked-device QR');
-  const bytes = fromBase64Url(value.slice(PAIRING_QR_PREFIX.length));
+  if (typeof value !== 'string') fail('not a linked-device QR');
+  const compact = value.startsWith(PAIRING_QR_COMPACT_PREFIX);
+  const legacy = value.startsWith(PAIRING_QR_PREFIX);
+  if (!compact && !legacy) fail('not a linked-device QR');
+  const prefix = compact ? PAIRING_QR_COMPACT_PREFIX : PAIRING_QR_PREFIX;
+  const bytes = fromBase64Url(value.slice(prefix.length));
   if (bytes.length > 8192) fail('pairing QR is too large');
   let parsed;
   try {
@@ -360,7 +422,27 @@ function decodePairingQr(value, options = {}) {
   } catch (error) {
     fail('pairing QR is invalid');
   }
-  return assertPairingRequest(parsed, options);
+  if (!compact) return assertPairingRequest(parsed, options);
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.r)) fail('pairing QR is invalid');
+  const createdAt = parseBase36(parsed.t, 'createdAt');
+  const devicePublicKey = expandBase64Url(parsed.b, nacl.box.publicKeyLength, 'device public key');
+  return assertPairingRequest(
+    {
+      pairingId: expandBase64Url(parsed.i, 18, 'pairing id'),
+      deviceId: deriveDeviceId(devicePublicKey),
+      devicePublicKey,
+      deviceSignPublicKey: expandBase64Url(parsed.s, nacl.sign.publicKeyLength, 'device sign public key'),
+      name: parsed.n,
+      platform: CODE_PLATFORMS[parsed.p],
+      createdAt,
+      expiresAt: createdAt + parseBase36(parsed.e, 'expiresAt'),
+      nonce: expandBase64Url(parsed.x, 32, 'pairing nonce'),
+      relays: parsed.r.map(expandRelay),
+      capabilities: capabilitiesFromMask(parsed.c),
+      requestSignature: expandBase64Url(parsed.g, nacl.sign.signatureLength, 'signature'),
+    },
+    options
+  );
 }
 
 function verificationCode(request) {
@@ -377,6 +459,7 @@ module.exports = {
   DEVICE_ROSTER_TYPE,
   PAIRING_REQUEST_TYPE,
   PAIRING_QR_PREFIX,
+  PAIRING_QR_COMPACT_PREFIX,
   PAIRING_TTL_MS,
   PAIRING_CLOCK_SKEW_MS,
   MAX_ACTIVE_DEVICES,

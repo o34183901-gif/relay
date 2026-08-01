@@ -140,8 +140,12 @@ test('pairing QR подписан устройством, имеет TTL и од
     (length) => new Uint8Array(length).fill(7)
   );
   const qr = linked.encodePairingQr(request);
+  assert.ok(qr.startsWith(linked.PAIRING_QR_COMPACT_PREFIX));
+  assert.ok(qr.length < 700, `compact pairing QR is unexpectedly dense: ${qr.length}`);
   const decoded = linked.decodePairingQr(qr, { now: now + 1 });
   assert.deepStrictEqual(decoded, request);
+  const legacyQr = linked.PAIRING_QR_PREFIX + Buffer.from(linked.stableStringify(request), 'utf8').toString('base64url');
+  assert.deepStrictEqual(linked.decodePairingQr(legacyQr, { now: now + 1 }), request);
   assert.match(linked.verificationCode(request), /^\d{2} · \d{2} · \d{2}$/);
   assert.strictEqual(linked.verificationCode(decoded), linked.verificationCode(request));
   assert.throws(() => linked.decodePairingQr(qr, { now: request.expiresAt + linked.PAIRING_CLOCK_SKEW_MS + 1 }), /expired/);
