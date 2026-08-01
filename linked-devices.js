@@ -16,6 +16,7 @@ const DEVICE_ROSTER_TYPE = 'licno-device-roster';
 const PAIRING_REQUEST_TYPE = 'licno-device-link-request';
 const PAIRING_QR_PREFIX = 'licno://link-device/v2#';
 const PAIRING_QR_COMPACT_PREFIX = 'licno://ld/3#';
+const PAIRING_QR_BINARY_PREFIX = 'LICNO:LD4:';
 const PAIRING_TTL_MS = 2 * 60 * 1000;
 const PAIRING_CLOCK_SKEW_MS = 30 * 1000;
 const MAX_ACTIVE_DEVICES = 10;
@@ -33,6 +34,24 @@ const PLATFORMS = new Set(['android', 'web', 'windows', 'macos', 'linux']);
 const DESKTOP_PLATFORMS = new Set(['windows', 'macos', 'linux']);
 const PLATFORM_CODES = Object.freeze({ windows: 'w', macos: 'm', linux: 'l' });
 const CODE_PLATFORMS = Object.freeze({ w: 'windows', m: 'macos', l: 'linux' });
+const BINARY_PLATFORM_CODES = Object.freeze({ windows: 0, macos: 1, linux: 2 });
+const BINARY_CODE_PLATFORMS = Object.freeze({ 0: 'windows', 1: 'macos', 2: 'linux' });
+const DEFAULT_DEVICE_NAMES = Object.freeze({
+  windows: 'Компьютер Windows',
+  macos: 'Mac',
+  linux: 'Компьютер Linux',
+});
+const PAIRING_RELAY_PROFILES = Object.freeze([
+  null,
+  Object.freeze([
+    'wss://89.108.83.230.sslip.io',
+    'wss://46.226.162.166.sslip.io',
+    'wss://77.221.137.215.sslip.io',
+  ]),
+]);
+const BASE41_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$%*+-';
+const BINARY_CANONICAL_NAME = 0x80;
+const BINARY_DEFAULT_TTL = 0x80;
 
 function fail(message) {
   const error = new Error(message);
@@ -147,11 +166,88 @@ function capabilityMask(capabilities) {
   return capabilities.reduce((mask, capability) => mask | CAPABILITY_BITS[capability], 0);
 }
 
-function capabilitiesFromMask(value) {
-  const mask = parseBase36(value, 'capabilities');
+function capabilitiesFromMaskNumber(mask) {
   const knownMask = Object.values(CAPABILITY_BITS).reduce((result, bit) => result | bit, 0);
-  if (!mask || (mask & ~knownMask)) fail('unsupported capability');
+  if (!Number.isInteger(mask) || !mask || (mask & ~knownMask)) fail('unsupported capability');
   return Object.keys(CAPABILITY_BITS).filter((capability) => (mask & CAPABILITY_BITS[capability]) !== 0);
+}
+
+function capabilitiesFromMask(value) {
+  return capabilitiesFromMaskNumber(parseBase36(value, 'capabilities'));
+}
+
+function encodeBase41(bytes) {
+  if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > 8192) {
+    fail('pairing QR is invalid');
+  }
+  let output = '';
+  let index = 0;
+  for (; index + 1 < bytes.length; index += 2) {
+    let value = bytes[index] * 256 + bytes[index + 1];
+    output += BASE41_ALPHABET[value % 41];
+    value = Math.floor(value / 41);
+    output += BASE41_ALPHABET[value % 41];
+    output += BASE41_ALPHABET[Math.floor(value / 41)];
+  }
+  if (index < bytes.length) {
+    const value = bytes[index];
+    output += BASE41_ALPHABET[value % 41];
+    output += BASE41_ALPHABET[Math.floor(value / 41)];
+  }
+  return output;
+}
+
+function decodeBase41(value) {
+  if (typeof value !== 'string' || !value || value.length > 12288 || value.length % 3 === 1) {
+    fail('pairing QR is invalid');
+  }
+  const output = [];
+  for (let index = 0; index < value.length; ) {
+    const remaining = value.length - index;
+    const count = remaining === 2 ? 2 : 3;
+    const first = BASE41_ALPHABET.indexOf(value[index]);
+    const second = BASE41_ALPHABET.indexOf(value[index + 1]);
+    const third = count === 3 ? BASE41_ALPHABET.indexOf(value[index + 2]) : 0;
+    if (first < 0 || second < 0 || third < 0) fail('pairing QR is invalid');
+    const decoded = first + second * 41 + third * 41 * 41;
+    if (count === 3) {
+      if (decoded > 0xffff) fail('pairing QR is invalid');
+      output.push(decoded >>> 8, decoded & 0xff);
+    } else {
+      if (decoded > 0xff) fail('pairing QR is invalid');
+      output.push(decoded);
+    }
+    index += count;
+  }
+  return new Uint8Array(output);
+}
+
+function unsignedBytes(value, length, label) {
+  if (!Number.isSafeInteger(value) || value < 0) fail(`${label} is invalid`);
+  const output = new Uint8Array(length);
+  let remaining = value;
+  for (let index = length - 1; index >= 0; index -= 1) {
+    output[index] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  if (remaining) fail(`${label} is invalid`);
+  return output;
+}
+
+function concatBytes(parts) {
+  const length = parts.reduce((total, part) => total + part.length, 0);
+  if (!length || length > 8192) fail('pairing QR is too large');
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function equalList(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function signPayload(domain, payload, secretKey) {
@@ -390,7 +486,8 @@ function verifyPairingRequest(request, options = {}) {
   }
 }
 
-function encodePairingQr(request) {
+/** Совместимый QR v3 для телефонов, которые ещё не получили декодер v4. */
+function encodePairingQrCompat(request) {
   const valid = assertPairingRequest(request, { now: request.createdAt });
   const compact = {
     i: compactBase64(valid.pairingId, 18, 'pairing id'),
@@ -408,8 +505,141 @@ function encodePairingQr(request) {
   return PAIRING_QR_COMPACT_PREFIX + toBase64Url(decodeUTF8(stableStringify(compact)));
 }
 
+/**
+ * QR v4 хранит те же подписанные поля без JSON/base64-обвязки. Ключи, nonce и
+ * Ed25519-подпись остаются полной длины; сокращаются только повторяемые имена
+ * полей, стандартное имя платформы и известный набор relay.
+ */
+function encodePairingQr(request) {
+  const valid = assertPairingRequest(request, { now: request.createdAt });
+  const platformCode = BINARY_PLATFORM_CODES[valid.platform];
+  if (!Number.isInteger(platformCode)) fail('pairing platform is invalid');
+
+  const canonicalName = valid.name === DEFAULT_DEVICE_NAMES[valid.platform];
+  const header =
+    (canonicalName ? BINARY_CANONICAL_NAME : 0) |
+    (capabilityMask(valid.capabilities) << 2) |
+    platformCode;
+  const ttl = valid.expiresAt - valid.createdAt;
+  const defaultTtl = ttl === PAIRING_TTL_MS;
+  let relayProfile = 0;
+  for (let index = 1; index < PAIRING_RELAY_PROFILES.length; index += 1) {
+    if (equalList(valid.relays, PAIRING_RELAY_PROFILES[index])) {
+      relayProfile = index;
+      break;
+    }
+  }
+  const routeFlags = (defaultTtl ? BINARY_DEFAULT_TTL : 0) | relayProfile;
+  const parts = [
+    new Uint8Array([header, routeFlags]),
+    decodeExact(valid.pairingId, 18, 'pairing id'),
+    decodeExact(valid.devicePublicKey, nacl.box.publicKeyLength, 'device public key'),
+    decodeExact(valid.deviceSignPublicKey, nacl.sign.publicKeyLength, 'device sign public key'),
+    unsignedBytes(valid.createdAt, 6, 'createdAt'),
+    decodeExact(valid.nonce, 32, 'pairing nonce'),
+  ];
+
+  if (!defaultTtl) parts.push(unsignedBytes(ttl, 3, 'expiresAt'));
+  if (!relayProfile) {
+    parts.push(new Uint8Array([valid.relays.length]));
+    for (const relay of valid.relays) {
+      const bytes = decodeUTF8(relay);
+      if (!bytes.length || bytes.length > 1024) fail('pairing relay URL is invalid');
+      parts.push(unsignedBytes(bytes.length, 2, 'relay length'), bytes);
+    }
+  }
+  if (!canonicalName) {
+    const bytes = decodeUTF8(valid.name);
+    if (!bytes.length || bytes.length > 1024) fail('device name has invalid length');
+    parts.push(unsignedBytes(bytes.length, 2, 'device name length'), bytes);
+  }
+  parts.push(decodeExact(valid.requestSignature, nacl.sign.signatureLength, 'signature'));
+  return PAIRING_QR_BINARY_PREFIX + encodeBase41(concatBytes(parts));
+}
+
+function decodePairingQrBinary(value, options) {
+  const bytes = decodeBase41(value.slice(PAIRING_QR_BINARY_PREFIX.length));
+  let offset = 0;
+  const read = (length, label) => {
+    if (!Number.isInteger(length) || length < 0 || offset + length > bytes.length) {
+      fail(`${label} is invalid`);
+    }
+    const output = bytes.slice(offset, offset + length);
+    offset += length;
+    return output;
+  };
+  const readNumber = (length, label) => {
+    let output = 0;
+    for (const byte of read(length, label)) output = output * 256 + byte;
+    if (!Number.isSafeInteger(output)) fail(`${label} is invalid`);
+    return output;
+  };
+
+  const header = readNumber(1, 'pairing header');
+  const platformCode = header & 0x03;
+  const platform = BINARY_CODE_PLATFORMS[platformCode];
+  if (!platform) fail('pairing platform is invalid');
+  const capabilities = capabilitiesFromMaskNumber((header >>> 2) & 0x1f);
+  const canonicalName = (header & BINARY_CANONICAL_NAME) !== 0;
+
+  const routeFlags = readNumber(1, 'pairing route flags');
+  if (routeFlags & 0x70) fail('pairing route flags are invalid');
+  const relayProfile = routeFlags & 0x0f;
+  if (relayProfile >= PAIRING_RELAY_PROFILES.length) fail('pairing relay profile is invalid');
+  const defaultTtl = (routeFlags & BINARY_DEFAULT_TTL) !== 0;
+
+  const pairingId = encodeBase64(read(18, 'pairing id'));
+  const devicePublicKey = encodeBase64(read(nacl.box.publicKeyLength, 'device public key'));
+  const deviceSignPublicKey = encodeBase64(read(nacl.sign.publicKeyLength, 'device sign public key'));
+  const createdAt = readNumber(6, 'createdAt');
+  const nonce = encodeBase64(read(32, 'pairing nonce'));
+  const ttl = defaultTtl ? PAIRING_TTL_MS : readNumber(3, 'expiresAt');
+
+  let relays;
+  if (relayProfile) {
+    relays = [...PAIRING_RELAY_PROFILES[relayProfile]];
+  } else {
+    const count = readNumber(1, 'relay count');
+    if (!count || count > 8) fail('pairing relays are invalid');
+    relays = [];
+    for (let index = 0; index < count; index += 1) {
+      const length = readNumber(2, 'relay length');
+      if (!length || length > 1024) fail('pairing relay URL is invalid');
+      relays.push(encodeUTF8(read(length, 'relay url')));
+    }
+  }
+
+  let name = DEFAULT_DEVICE_NAMES[platform];
+  if (!canonicalName) {
+    const length = readNumber(2, 'device name length');
+    if (!length || length > 1024) fail('device name has invalid length');
+    name = encodeUTF8(read(length, 'device name'));
+  }
+  const requestSignature = encodeBase64(read(nacl.sign.signatureLength, 'signature'));
+  if (offset !== bytes.length) fail('pairing QR has trailing data');
+
+  return assertPairingRequest(
+    {
+      pairingId,
+      deviceId: deriveDeviceId(devicePublicKey),
+      devicePublicKey,
+      deviceSignPublicKey,
+      name,
+      platform,
+      createdAt,
+      expiresAt: createdAt + ttl,
+      nonce,
+      relays,
+      capabilities,
+      requestSignature,
+    },
+    options
+  );
+}
+
 function decodePairingQr(value, options = {}) {
   if (typeof value !== 'string') fail('not a linked-device QR');
+  if (value.startsWith(PAIRING_QR_BINARY_PREFIX)) return decodePairingQrBinary(value, options);
   const compact = value.startsWith(PAIRING_QR_COMPACT_PREFIX);
   const legacy = value.startsWith(PAIRING_QR_PREFIX);
   if (!compact && !legacy) fail('not a linked-device QR');
@@ -460,6 +690,7 @@ module.exports = {
   PAIRING_REQUEST_TYPE,
   PAIRING_QR_PREFIX,
   PAIRING_QR_COMPACT_PREFIX,
+  PAIRING_QR_BINARY_PREFIX,
   PAIRING_TTL_MS,
   PAIRING_CLOCK_SKEW_MS,
   MAX_ACTIVE_DEVICES,
@@ -476,6 +707,7 @@ module.exports = {
   assertPairingRequest,
   verifyPairingRequest,
   encodePairingQr,
+  encodePairingQrCompat,
   decodePairingQr,
   verificationCode,
 };
