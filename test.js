@@ -169,10 +169,11 @@ async function main() {
   };
 
   try {
-    assert.strictEqual(health.protocol, 3);
+    assert.strictEqual(health.protocol, 4);
     assert.ok(Array.isArray(health.capabilities));
     assert.ok(health.capabilities.includes('linked-devices-v2'));
     assert.ok(health.capabilities.includes('binary-attachments-v1'));
+    assert.ok(health.capabilities.includes('frame-batch-v1'));
     assert.strictEqual(health.maxLinkedDevices, linked.MAX_ACTIVE_DEVICES);
     ok('health reports linked-device protocol capabilities');
 

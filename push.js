@@ -195,6 +195,8 @@ function isUnifiedPushEndpoint(token) {
 }
 
 let notifSeq = 0;
+const MESSAGE_NOTIFICATION_ID = 1279877966; // стабильный id: новые сообщения обновляют одну карточку
+const CALL_NOTIFICATION_ID = 1279877967;
 
 /**
  * Отправить зашифрованный web-push на подписку. notification — форма expo-unified-
@@ -220,7 +222,7 @@ async function unifiedPushSend(sub, notification) {
   }
   try {
     notifSeq = (notifSeq + 1) % 1e9;
-    const body = JSON.stringify({ id: notifSeq, ...notification });
+    const body = JSON.stringify({ id: notification.id || notifSeq, ...notification });
     // S13: коннектимся РОВНО на проверенные IP (пиннинг через agent.lookup). Раньше
     // web-push резолвил хост заново своим стеком — вредоносный DNS мог отдать
     // публичный IP на проверке и приватный на самом запросе (self-SSRF/rebinding).
@@ -236,10 +238,20 @@ async function unifiedPushSend(sub, notification) {
 }
 
 /** Content-free wake-up push for a new message. FCM или web-push (UnifiedPush). */
-async function sendPush(token) {
+async function sendPush(token, messageId) {
   if (!token) return false;
   const sub = parseSubscription(token);
-  if (sub) return unifiedPushSend(sub, { title: 'Лично', body: 'Новое зашифрованное сообщение' });
+  const safeMessageId = typeof messageId === 'string' ? messageId.slice(0, 160) : '';
+  if (sub) {
+    return unifiedPushSend(sub, {
+      id: MESSAGE_NOTIFICATION_ID,
+      title: 'Лично',
+      body: 'Новое зашифрованное сообщение',
+      type: 'message',
+      messageId: safeMessageId,
+      data: { type: 'message', messageId: safeMessageId },
+    });
+  }
   return fcmSend({
     token,
     notification: { title: 'Лично', body: 'Новое зашифрованное сообщение' },
@@ -247,7 +259,7 @@ async function sendPush(token) {
     // предыдущее на устройстве, а не добавляется рядом. Даже если дубли
     // придут с нескольких релеев, пользователь увидит одно уведомление.
     android: { priority: 'HIGH', notification: { channel_id: 'messages', tag: 'new-message' } },
-    data: { type: 'message' },
+    data: { type: 'message', messageId: safeMessageId },
   });
 }
 
@@ -255,7 +267,15 @@ async function sendPush(token) {
 async function sendCallPush(token) {
   if (!token) return false;
   const sub = parseSubscription(token);
-  if (sub) return unifiedPushSend(sub, { title: 'Входящий звонок', body: 'Нажмите, чтобы ответить' });
+  if (sub) {
+    return unifiedPushSend(sub, {
+      id: CALL_NOTIFICATION_ID,
+      title: 'Входящий звонок',
+      body: 'Нажмите, чтобы ответить',
+      type: 'call',
+      data: { type: 'call' },
+    });
+  }
   return fcmSend({
     token,
     notification: { title: 'Входящий звонок', body: 'Нажмите, чтобы ответить' },

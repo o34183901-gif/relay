@@ -65,6 +65,7 @@ const {
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
 const { unpackBinaryFrame, packBinaryFrame } = require('./binary-frame');
+const { encode: encodeMessagePack, decode: decodeMessagePack } = require('@msgpack/msgpack');
 const {
   assertDeviceCertificate,
   assertSignedRoster,
@@ -114,13 +115,14 @@ function turnIceServers() {
 }
 
 const PORT = process.env.PORT || 8787;
-const RELAY_PROTOCOL = 3;
+const RELAY_PROTOCOL = 4;
 const RELAY_CAPABILITIES = Object.freeze([
   'linked-devices-v2',
   'device-queues',
   'signed-rosters',
   'binary-attachments-v1',
   'push-test-v1',
+  'frame-batch-v1',
 ]);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
@@ -897,10 +899,68 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, maxPayload: MAX_ENVELOPE_BYTES + 1024 * 1024 });
 
-function send(ws, obj) {
-  if (ws.readyState === ws.OPEN) {
+const BATCHABLE_SERVER_FRAMES = new Set([
+  'message',
+  'ack',
+  'delivered',
+  'binary-ack',
+  'binary-delivered',
+]);
+
+function flushFrameBatch(ws) {
+  clearTimeout(ws.frameBatchTimer);
+  ws.frameBatchTimer = null;
+  const frames = ws.frameBatchQueue || [];
+  ws.frameBatchQueue = [];
+  ws.frameBatchBytes = 0;
+  if (!frames.length || ws.readyState !== ws.OPEN) return false;
+  try {
+    const payload = encodeMessagePack(frames);
+    ws.send(
+      packBinaryFrame(
+        { type: 'frame-batch-v1', version: 1, count: frames.length },
+        payload
+      ),
+      { binary: true }
+    );
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function sendImmediate(ws, obj) {
+  if (!ws || ws.readyState !== ws.OPEN) return false;
+  try {
     ws.send(JSON.stringify(obj));
     return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function send(ws, obj) {
+  if (ws && ws.readyState === ws.OPEN) {
+    if (
+      ws.frameBatchV1 &&
+      ws.authed &&
+      obj &&
+      typeof obj === 'object' &&
+      BATCHABLE_SERVER_FRAMES.has(obj.type)
+    ) {
+      const encodedLength = JSON.stringify(obj).length;
+      if (encodedLength <= 64 * 1024) {
+        ws.frameBatchQueue.push(obj);
+        ws.frameBatchBytes += encodedLength;
+        if (ws.frameBatchQueue.length >= 24 || ws.frameBatchBytes >= 192 * 1024) {
+          flushFrameBatch(ws);
+        } else if (!ws.frameBatchTimer) {
+          ws.frameBatchTimer = setTimeout(() => flushFrameBatch(ws), 10);
+        }
+        return true;
+      }
+    }
+    return sendImmediate(ws, obj);
   }
   return false;
 }
@@ -1038,7 +1098,11 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   // отправитель видел ложный ✓, а конверт при полной очереди (stored=false) нигде
   // не оставался. Теперь при закрытом сокете проваливаемся ниже (в push/queue/drop).
   const liveFrame = queuedMessageFrame({ id, from, envelope, ...metadata });
-  if (ws && send(ws, liveFrame)) {
+  // Если очередь переполнена, этот кадр не имеет дисковой страховки: отправляем
+  // его сразу, а не откладываем на 10 мс в пакет, чтобы `queued:false` означал
+  // реальную передачу в WebSocket. Для сохранённого кадра пакет безопасен — при
+  // обрыве до flush он останется в очереди и придёт после reconnect.
+  if (ws && (stored ? send(ws, liveFrame) : sendImmediate(ws, liveFrame))) {
     counters.deliveredOnline += 1;
     return { queued: false, id };
   }
@@ -1076,7 +1140,7 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   if (token && Date.now() - (lastPushAt.get(to) || 0) >= PUSH_MIN_INTERVAL_MS) {
     lastPushAt.set(to, Date.now());
     counters.pushes += 1;
-    sendPush(token).then(onInvalid);
+    sendPush(token, metadata.notificationId || id).then(onInvalid);
   }
   return { queued: true, id };
 }
@@ -1258,6 +1322,10 @@ wss.on('connection', (ws, req) => {
   ws.accountPubkey = null;
   ws.deviceId = null;
   ws.deviceCertificate = null;
+  ws.frameBatchV1 = false;
+  ws.frameBatchQueue = [];
+  ws.frameBatchBytes = 0;
+  ws.frameBatchTimer = null;
   ws.rateStart = Date.now();
   ws.rateCount = 0;
   ws.on('pong', () => (ws.isAlive = true));
@@ -1323,6 +1391,8 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    clearTimeout(ws.frameBatchTimer);
+    ws.frameBatchQueue = [];
     clearTimeout(ws.authTimer);
     if (ws.ip) {
       const c = (ipConns.get(ws.ip) || 1) - 1;
@@ -1339,6 +1409,31 @@ wss.on('connection', (ws, req) => {
 function handleBinaryFrameSafely(ws, raw) {
   if (!ws.authed) return send(ws, { type: 'binary-error', error: 'not authenticated' });
   const { header, payload } = unpackBinaryFrame(raw);
+  if (header.type === 'frame-batch-v1' && header.version === 1) {
+    if (!ws.frameBatchV1 || payload.length > 256 * 1024) {
+      return send(ws, { type: 'binary-error', error: 'frame batch not negotiated' });
+    }
+    const frames = decodeMessagePack(payload);
+    if (
+      !Array.isArray(frames) ||
+      frames.length < 1 ||
+      frames.length > 64 ||
+      frames.length !== header.count
+    ) {
+      return send(ws, { type: 'binary-error', error: 'invalid frame batch' });
+    }
+    for (const frame of frames) {
+      if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
+        return send(ws, { type: 'binary-error', error: 'invalid frame in batch' });
+      }
+      if (rateLimited(ws)) {
+        send(ws, { type: 'error', error: 'rate limit' });
+        return ws.terminate();
+      }
+      handleFrameSafely(ws, frame);
+    }
+    return true;
+  }
   if (
     header.type !== 'attachment-chunk' ||
     header.version !== 1 ||
@@ -1412,6 +1507,8 @@ function handleFrameSafely(ws, msg) {
       if (msg.pubkey.length > MAX_ADDR_LEN || msg.signPublicKey.length > MAX_ADDR_LEN) {
         return send(ws, { type: 'error', error: 'invalid key' });
       }
+      ws.frameBatchV1 =
+        Array.isArray(msg.capabilities) && msg.capabilities.includes('frame-batch-v1');
       ws.pendingPubkey = msg.pubkey;
       ws.pendingSpk = msg.signPublicKey;
       ws.nonce = naclUtil.encodeBase64(crypto.randomBytes(32));
@@ -1724,7 +1821,10 @@ function handleFrameSafely(ws, msg) {
         msg.envelope,
         !!msg.silent,
         !!msg.callPush,
-        senderMetadata(ws)
+        {
+          ...senderMetadata(ws),
+          notificationId: typeof msg.ref === 'string' ? msg.ref.slice(0, 160) : undefined,
+        }
       );
       // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
       // доставлено» вместо ложного «отправлено». Старый клиент поле игнорирует.
