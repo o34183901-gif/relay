@@ -46,6 +46,21 @@ function createStore(dbPath, opts = {}) {
     );
     CREATE INDEX IF NOT EXISTS idx_queue_to ON queue(to_pk, ts);
     CREATE INDEX IF NOT EXISTS idx_queue_from_to ON queue(from_pk, to_pk, ts);
+    -- Бинарные чанки вложений хранятся raw-файлами, без base64/JSON тела.
+    CREATE TABLE IF NOT EXISTS binary_queue (
+      id           TEXT PRIMARY KEY,
+      to_pk        TEXT NOT NULL,
+      from_pk      TEXT NOT NULL,
+      ref          TEXT,
+      transfer_id  TEXT NOT NULL,
+      chunk_index  INTEGER NOT NULL,
+      total_chunks INTEGER NOT NULL,
+      meta_json    TEXT,
+      bytes        INTEGER NOT NULL,
+      ts           INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_binary_queue_to ON binary_queue(to_pk, ts);
+    CREATE INDEX IF NOT EXISTS idx_binary_queue_from_to ON binary_queue(from_pk, to_pk, ts);
     CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL, proven INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS push_tokens (pk TEXT PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS directory   (url TEXT PRIMARY KEY, last_seen INTEGER);
@@ -106,6 +121,7 @@ function createStore(dbPath, opts = {}) {
   if (!hasLastSeenCol) db.exec('ALTER TABLE identities ADD COLUMN last_seen INTEGER DEFAULT 0');
 
   const blobPath = (mid) => path.join(blobDir, mid + '.json');
+  const binaryPath = (mid) => path.join(blobDir, mid + '.bin');
   function writeBlob(mid, envJson) {
     // tmp + rename: файл появляется атомарно, недописанных блобов не бывает
     const tmp = blobPath(mid) + '.tmp';
@@ -152,6 +168,60 @@ function createStore(dbPath, opts = {}) {
     expire: db.prepare('DELETE FROM queue WHERE ts < ?'),
     rowsForDrop: db.prepare('SELECT id, blob, bytes FROM queue WHERE to_pk=?'),
   };
+  const binary = {
+    insert: db.prepare(
+      `INSERT INTO binary_queue
+       (id,to_pk,from_pk,ref,transfer_id,chunk_index,total_chunks,meta_json,bytes,ts)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    ),
+    idsForUser: db.prepare('SELECT id FROM binary_queue WHERE to_pk=? ORDER BY ts ASC,chunk_index ASC'),
+    byId: db.prepare('SELECT * FROM binary_queue WHERE id=?'),
+    delId: db.prepare('DELETE FROM binary_queue WHERE id=?'),
+    countFor: db.prepare('SELECT count(*) c FROM binary_queue WHERE to_pk=?'),
+    countFromTo: db.prepare('SELECT count(*) c FROM binary_queue WHERE from_pk=? AND to_pk=?'),
+    rowsForDrop: db.prepare('SELECT id,bytes FROM binary_queue WHERE to_pk=?'),
+    older: db.prepare('SELECT id,bytes FROM binary_queue WHERE ts < ?'),
+    expire: db.prepare('DELETE FROM binary_queue WHERE ts < ?'),
+    allIds: db.prepare('SELECT id FROM binary_queue'),
+    usersQueued: db.prepare('SELECT count(DISTINCT to_pk) c FROM binary_queue'),
+    totalQueued: db.prepare('SELECT count(*) c FROM binary_queue'),
+    sumBytes: db.prepare('SELECT coalesce(sum(bytes),0) c FROM binary_queue'),
+  };
+
+  function dropBinaryRow(row) {
+    binary.delId.run(row.id);
+    unlinkBinary(row.id);
+    liveCount = Math.max(0, liveCount - 1);
+    liveBytes = Math.max(0, liveBytes - (row.bytes || 0));
+  }
+
+  function binaryRowToItem(row) {
+    if (!row) return null;
+    let payload;
+    try {
+      payload = fs.readFileSync(binaryPath(row.id));
+    } catch (error) {
+      dropBinaryRow(row);
+      return null;
+    }
+    let metadata = {};
+    try {
+      metadata = row.meta_json ? JSON.parse(row.meta_json) : {};
+    } catch (error) {}
+    return {
+      id: row.id,
+      to: row.to_pk,
+      from: row.from_pk,
+      ref: row.ref || undefined,
+      transferId: row.transfer_id,
+      index: row.chunk_index,
+      total: row.total_chunks,
+      metadata,
+      payload,
+      bytes: row.bytes,
+      ts: row.ts,
+    };
+  }
   // null — если тело-файл пропал (например, volume почистили руками): такая
   // строка мертва, подчищаем её и пропускаем.
   const rowToItem = (r) => {
@@ -224,8 +294,8 @@ function createStore(dbPath, opts = {}) {
   // H-3/S4: глобальные счётчики очереди — по числу строк И по байтам (тела в БД +
   // файлы-blob). Держим в памяти и синхронно обновляем при вставке/удалении, чтобы
   // enqueue и /metrics работали за O(1), не сканируя таблицу/каталог на каждый кадр.
-  let liveCount = q.totalQueued.get().c;
-  let liveBytes = q.sumBytes.get().c;
+  let liveCount = q.totalQueued.get().c + binary.totalQueued.get().c;
+  let liveBytes = q.sumBytes.get().c + binary.sumBytes.get().c;
 
   const id = {
     get: db.prepare('SELECT sign_pk, proven FROM identities WHERE pk=?'),
@@ -236,7 +306,10 @@ function createStore(dbPath, opts = {}) {
     // M-02: холодные identity без ожидающих конвертов — кандидаты на вытеснение
     // (identity с непрочитанной очередью НЕ трогаем, чтобы не потерять сообщения).
     coldNoQueue: db.prepare(
-      'SELECT i.pk FROM identities i WHERE NOT EXISTS (SELECT 1 FROM queue q WHERE q.to_pk = i.pk) ORDER BY i.last_seen ASC LIMIT ?'
+      `SELECT i.pk FROM identities i
+       WHERE NOT EXISTS (SELECT 1 FROM queue q WHERE q.to_pk = i.pk)
+         AND NOT EXISTS (SELECT 1 FROM binary_queue b WHERE b.to_pk = i.pk)
+       ORDER BY i.last_seen ASC LIMIT ?`
     ),
     del: db.prepare('DELETE FROM identities WHERE pk=?'),
   };
@@ -327,11 +400,24 @@ function createStore(dbPath, opts = {}) {
       lastSeen: r.last_seen || 0,
     };
   }
+  function writeBinary(mid, bytes) {
+    if (!blobDir) throw new Error('binary blob directory is not configured');
+    const tmp = binaryPath(mid) + '.tmp';
+    fs.writeFileSync(tmp, bytes);
+    fs.renameSync(tmp, binaryPath(mid));
+  }
+  function unlinkBinary(mid) {
+    try {
+      fs.unlinkSync(binaryPath(mid));
+    } catch (e) {}
+  }
 
   function dropQueueFor(to) {
     const rows = q.rowsForDrop.all(to);
     for (const row of rows) dropRow(row);
-    return rows.length;
+    const binaryRows = binary.rowsForDrop.all(to);
+    for (const row of binaryRows) dropBinaryRow(row);
+    return rows.length + binaryRows.length;
   }
 
   return {
@@ -365,9 +451,14 @@ function createStore(dbPath, opts = {}) {
       // переполнении вытесняется ЕГО ЖЕ старейший (self-eviction). Это закрывает
       // таргетированную цензуру: флудер, зная адрес жертвы, больше не выдавит её
       // реальные сообщения (от других отправителей) — ротирует только свой спам.
-      if (maxPerSender && from && q.countFromTo.get(from, to).c >= maxPerSender) {
+      if (
+        maxPerSender &&
+        from &&
+        q.countFromTo.get(from, to).c + binary.countFromTo.get(from, to).c >= maxPerSender
+      ) {
         const o = q.oldestFromTo.get(from, to);
         if (o) dropRow(o);
+        else return false;
       }
       // СРВ-2: потолок на получателя. При переполнении вытесняем ТОЛЬКО СВОЙ
       // старейший конверт этого отправителя. Раньше при отсутствии своего
@@ -377,7 +468,7 @@ function createStore(dbPath, opts = {}) {
       // очередь жертвы. Теперь чужие конверты не жертвуются: если у нового
       // отправителя своих слотов нет, отклоняем НОВЫЙ конверт (не сохраняем),
       // защищая уже накопленные сообщения жертвы.
-      if (maxPerUser && q.countFor.get(to).c >= maxPerUser) {
+      if (maxPerUser && q.countFor.get(to).c + binary.countFor.get(to).c >= maxPerUser) {
         if (from) {
           const own = q.oldestFromTo.get(from, to);
           if (own) dropRow(own);
@@ -429,6 +520,74 @@ function createStore(dbPath, opts = {}) {
       liveBytes += bytes;
       return true; // СРВ-2: конверт сохранён (false выше — отклонён из-за полной очереди получателя)
     },
+    /** Сохранить зашифрованный raw-чанк без перекодирования в JSON/base64. */
+    enqueueBinary({
+      id: binaryId,
+      to,
+      from,
+      ref,
+      transferId,
+      index,
+      total,
+      metadata,
+      payload,
+      ts,
+      maxPerUser,
+      maxPerSender,
+      maxTotal,
+      maxTotalBytes,
+    }) {
+      const bytes = payload.length;
+      const recipientCount = q.countFor.get(to).c + binary.countFor.get(to).c;
+      const pairCount = q.countFromTo.get(from, to).c + binary.countFromTo.get(from, to).c;
+      if (maxPerUser && recipientCount >= maxPerUser) return false;
+      if (maxPerSender && pairCount >= maxPerSender) return false;
+      if (
+        (maxTotal && liveCount >= maxTotal) ||
+        (maxTotalBytes && liveBytes + bytes > maxTotalBytes)
+      ) {
+        return false;
+      }
+      writeBinary(binaryId, payload);
+      try {
+        binary.insert.run(
+          binaryId,
+          to,
+          from,
+          ref || null,
+          transferId,
+          index,
+          total,
+          metadata ? JSON.stringify(metadata) : null,
+          bytes,
+          ts
+        );
+      } catch (error) {
+        unlinkBinary(binaryId);
+        throw error;
+      }
+      liveCount += 1;
+      liveBytes += bytes;
+      return true;
+    },
+    binaryQueueIdsFor(to) {
+      return binary.idsForUser.all(to).map((row) => row.id);
+    },
+    getBinaryItem(binaryId) {
+      return binaryRowToItem(binary.byId.get(binaryId));
+    },
+    ackBinary(to, binaryId) {
+      const row = binary.byId.get(binaryId);
+      if (!row || row.to_pk !== to) return null;
+      const result = {
+        from: row.from_pk,
+        ref: row.ref || undefined,
+        transferId: row.transfer_id,
+        index: row.chunk_index,
+      };
+      dropBinaryRow(row);
+      return result;
+    },
     /** Все конверты, ждущие получателя (в порядке поступления). */
     queueFor(to) {
       return q.forUser.all(to).map(rowToItem).filter(Boolean);
@@ -454,10 +613,12 @@ function createStore(dbPath, opts = {}) {
     /** Удалить всё старше `cutoffTs` (TTL). Вернуть число удалённых. */
     expireOlderThan(cutoffTs) {
       for (const r of q.blobsOlder.all(cutoffTs)) unlinkBlob(r.id);
-      const removed = q.expire.run(cutoffTs).changes;
+      const binaryRows = binary.older.all(cutoffTs);
+      for (const row of binaryRows) unlinkBinary(row.id);
+      const removed = q.expire.run(cutoffTs).changes + binary.expire.run(cutoffTs).changes;
       // массовое удаление — пересчитываем глобальные счётчики из БД (раз в час, дёшево).
-      liveCount = q.totalQueued.get().c;
-      liveBytes = q.sumBytes.get().c;
+      liveCount = q.totalQueued.get().c + binary.totalQueued.get().c;
+      liveBytes = q.sumBytes.get().c + binary.sumBytes.get().c;
       return removed;
     },
     /**
@@ -468,13 +629,16 @@ function createStore(dbPath, opts = {}) {
     cleanupOrphanBlobs() {
       if (!blobDir) return 0;
       const referenced = new Set(q.blobIds.all().map((r) => r.id));
+      const referencedBinary = new Set(binary.allIds.all().map((row) => row.id));
       let removed = 0;
       for (const f of fs.readdirSync(blobDir)) {
-        const isTmp = f.endsWith('.json.tmp');
+        const isTmp = f.endsWith('.json.tmp') || f.endsWith('.bin.tmp');
         const isBlob = f.endsWith('.json');
-        if (!isTmp && !isBlob) continue; // чужие файлы не трогаем
-        const mid = f.replace(/\.json(\.tmp)?$/, '');
+        const isBinary = f.endsWith('.bin');
+        if (!isTmp && !isBlob && !isBinary) continue; // чужие файлы не трогаем
+        const mid = f.replace(/\.(json|bin)(\.tmp)?$/, '');
         if (isBlob && referenced.has(mid)) continue; // живой блоб
+        if (isBinary && referencedBinary.has(mid)) continue;
         try {
           fs.unlinkSync(path.join(blobDir, f)); // сирота или недописанный tmp
           removed += 1;
@@ -712,8 +876,8 @@ function createStore(dbPath, opts = {}) {
     // --- stats / lifecycle --------------------------------------------------
     stats() {
       return {
-        usersQueued: q.usersQueued.get().c,
-        totalQueued: q.totalQueued.get().c,
+        usersQueued: q.usersQueued.get().c + binary.usersQueued.get().c,
+        totalQueued: q.totalQueued.get().c + binary.totalQueued.get().c,
         relays: dir.count.get().c,
         accounts: account.count.get().c,
         activeDevices: device.countActive.get().c,

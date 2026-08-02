@@ -53,9 +53,18 @@ const dns = require('dns').promises;
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const { WebSocketServer } = require('ws');
-const { sendPush, sendCallPush, pushReady, setVapidKeys, vapidPublicKey, generateVapidKeys } = require('./push');
+const {
+  sendPush,
+  sendCallPush,
+  sendTestPush,
+  pushReady,
+  setVapidKeys,
+  vapidPublicKey,
+  generateVapidKeys,
+} = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
 const { createStore } = require('./store');
+const { unpackBinaryFrame, packBinaryFrame } = require('./binary-frame');
 const {
   assertDeviceCertificate,
   assertSignedRoster,
@@ -105,8 +114,14 @@ function turnIceServers() {
 }
 
 const PORT = process.env.PORT || 8787;
-const RELAY_PROTOCOL = 2;
-const RELAY_CAPABILITIES = Object.freeze(['linked-devices-v2', 'device-queues', 'signed-rosters']);
+const RELAY_PROTOCOL = 3;
+const RELAY_CAPABILITIES = Object.freeze([
+  'linked-devices-v2',
+  'device-queues',
+  'signed-rosters',
+  'binary-attachments-v1',
+  'push-test-v1',
+]);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
 const DB_FILE = process.env.RELAY_DB || path.join(__dirname, 'relay.db');
@@ -175,6 +190,8 @@ function learnRelays(urls) {
   return false;
 }
 const MAX_ENVELOPE_BYTES = 32 * 1024 * 1024; // 32 MB envelope (~24 MB video/file)
+const MAX_BINARY_CHUNK_BYTES = 300 * 1024;
+const MAX_BINARY_CHUNKS = 4096;
 
 // Rate limiting (per connection).
 const AUTH_TIMEOUT_MS = 10000; // must authenticate within this window
@@ -888,6 +905,16 @@ function send(ws, obj) {
   return false;
 }
 
+function sendBinary(ws, header, payload) {
+  if (ws.readyState !== ws.OPEN) return false;
+  try {
+    ws.send(packBinaryFrame(header, payload), { binary: true });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 function queuedMessageFrame(item) {
   const frame = { type: 'message', id: item.id, envelope: item.envelope };
   if (item.from) frame.from = item.from;
@@ -896,6 +923,21 @@ function queuedMessageFrame(item) {
   if (item.deviceCertificate) frame.deviceCertificate = item.deviceCertificate;
   if (item.deviceRoster) frame.deviceRoster = item.deviceRoster;
   return frame;
+}
+
+function queuedBinaryHeader(item) {
+  const header = {
+    type: 'attachment-chunk',
+    version: 1,
+    id: item.id,
+    from: item.from,
+    transferId: item.transferId,
+    index: item.index,
+    total: item.total,
+  };
+  if (item.metadata && item.metadata.fromAccount) header.fromAccount = item.metadata.fromAccount;
+  if (item.metadata && item.metadata.fromDeviceId) header.fromDeviceId = item.metadata.fromDeviceId;
+  return header;
 }
 
 function senderMetadata(ws) {
@@ -926,7 +968,7 @@ onVapidActivated = (publicKey) => {
 const FLUSH_HIGH_WATER = 4 * 1024 * 1024; // порог bufferedAmount, при котором ждём
 const FLUSH_RESUME_MS = 25; // пауза перед проверкой backpressure
 
-function flushQueue(pubkey, ws) {
+function flushQueue(pubkey, ws, onComplete) {
   const ids = store.queueIdsFor(pubkey);
   let i = 0;
   function pump() {
@@ -940,6 +982,26 @@ function flushQueue(pubkey, ws) {
       const item = store.getItem(ids[i]);
       i += 1;
       if (item) send(ws, queuedMessageFrame(item));
+    }
+    if (onComplete) onComplete();
+  }
+  pump();
+  return ids.length;
+}
+
+function flushBinaryQueue(pubkey, ws) {
+  const ids = store.binaryQueueIdsFor(pubkey);
+  let index = 0;
+  function pump() {
+    if (ws.readyState !== ws.OPEN) return;
+    while (index < ids.length) {
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > FLUSH_HIGH_WATER) {
+        setTimeout(pump, FLUSH_RESUME_MS);
+        return;
+      }
+      const item = store.getBinaryItem(ids[index]);
+      index += 1;
+      if (item) sendBinary(ws, queuedBinaryHeader(item), item.payload);
     }
   }
   pump();
@@ -1019,6 +1081,44 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   return { queued: true, id };
 }
 
+function deliverBinary(from, header, payload, metadata = {}) {
+  const id = nextId();
+  const stored = store.enqueueBinary({
+    id,
+    to: header.to,
+    from,
+    ref: header.ref,
+    transferId: header.transferId,
+    index: header.index,
+    total: header.total,
+    metadata,
+    payload,
+    ts: Date.now(),
+    maxPerUser: MAX_QUEUE_PER_USER,
+    maxPerSender: MAX_QUEUE_PER_SENDER,
+    maxTotal: MAX_TOTAL_MESSAGES,
+    maxTotalBytes: MAX_QUEUE_BYTES,
+  });
+  const recipient = online.get(header.to);
+  if (recipient && sendBinary(recipient, queuedBinaryHeader({
+    id,
+    from,
+    transferId: header.transferId,
+    index: header.index,
+    total: header.total,
+    metadata,
+  }), payload)) {
+    counters.deliveredOnline += 1;
+    return { id, queued: false, dropped: false };
+  }
+  if (!stored) {
+    counters.dropped += 1;
+    return { id, queued: false, dropped: true };
+  }
+  counters.queuedOffline += 1;
+  return { id, queued: true, dropped: false };
+}
+
 // Recipient confirmed receipt of `id`: drop it from their queue and tell the
 // original sender (if online) that it was delivered.
 function ackReceived(recipientPubkey, id) {
@@ -1027,6 +1127,22 @@ function ackReceived(recipientPubkey, id) {
     counters.acked += 1;
     const senderWs = online.get(from);
     if (senderWs) send(senderWs, { type: 'delivered', id });
+  }
+}
+
+function ackBinaryReceived(recipientPubkey, id) {
+  const accepted = store.ackBinary(recipientPubkey, id);
+  if (!accepted) return;
+  counters.acked += 1;
+  const sender = online.get(accepted.from);
+  if (sender) {
+    send(sender, {
+      type: 'binary-delivered',
+      id,
+      ref: accepted.ref,
+      transferId: accepted.transferId,
+      index: accepted.index,
+    });
   }
 }
 
@@ -1163,10 +1279,23 @@ wss.on('connection', (ws, req) => {
     }
   }, AUTH_TIMEOUT_MS);
 
-  ws.on('message', (raw) => {
+  ws.on('message', (raw, isBinary) => {
     if (rateLimited(ws)) {
       send(ws, { type: 'error', error: 'rate limit' });
       ws.terminate();
+      return;
+    }
+
+    if (isBinary) {
+      try {
+        handleBinaryFrameSafely(ws, raw);
+      } catch (error) {
+        if (isFatalDbError(error)) {
+          handleTopLevelError('binary-frame-fatal-db', error);
+          return;
+        }
+        send(ws, { type: 'binary-error', error: 'invalid binary frame' });
+      }
       return;
     }
 
@@ -1207,6 +1336,42 @@ wss.on('connection', (ws, req) => {
 
 // Обработка одного разобранного кадра. Вынесено в отдельную функцию, чтобы
 // вызывающий мог обернуть её в try/catch (C-1: одна ошибка не роняет процесс).
+function handleBinaryFrameSafely(ws, raw) {
+  if (!ws.authed) return send(ws, { type: 'binary-error', error: 'not authenticated' });
+  const { header, payload } = unpackBinaryFrame(raw);
+  if (
+    header.type !== 'attachment-chunk' ||
+    header.version !== 1 ||
+    typeof header.to !== 'string' ||
+    !header.to ||
+    header.to.length > MAX_ADDR_LEN ||
+    typeof header.transferId !== 'string' ||
+    !/^[A-Za-z0-9_-]{12,64}$/.test(header.transferId) ||
+    !Number.isInteger(header.index) ||
+    !Number.isInteger(header.total) ||
+    header.total < 1 ||
+    header.total > MAX_BINARY_CHUNKS ||
+    header.index < 0 ||
+    header.index >= header.total ||
+    payload.length < 40 ||
+    payload.length > MAX_BINARY_CHUNK_BYTES ||
+    (header.ref != null && (typeof header.ref !== 'string' || header.ref.length > 160))
+  ) {
+    return send(ws, { type: 'binary-error', ref: header.ref, error: 'invalid attachment chunk' });
+  }
+  counters.msgsIn += 1;
+  const result = deliverBinary(ws.pubkey, header, payload, senderMetadata(ws));
+  return send(ws, {
+    type: 'binary-ack',
+    ref: header.ref,
+    id: result.id,
+    transferId: header.transferId,
+    index: header.index,
+    queued: result.queued,
+    dropped: result.dropped,
+  });
+}
+
 function handleFrameSafely(ws, msg) {
     // C-1: JSON.parse принимает не только объекты — "null", "true", "1", "[...]"
     // это валидный JSON. Обращение msg.type к такому значению роняло обработчик
@@ -1332,14 +1497,15 @@ function handleFrameSafely(ws, msg) {
       store.touchIdentity(ws.pubkey, Date.now());
       const evicted = store.evictColdIdentities(MAX_IDENTITIES);
       if (evicted) console.log(`[identities] evicted ${evicted} cold identity(ies) over cap`);
-      const flushed = flushQueue(ws.pubkey, ws);
+      const flushedBinary = store.binaryQueueIdsFor(ws.pubkey).length;
+      const flushed = flushQueue(ws.pubkey, ws, () => flushBinaryQueue(ws.pubkey, ws));
       // prekeys: сколько одноразовых prekey клиента осталось у этого релея —
       // клиент по этому числу решает, пора ли выгрузить свежую пачку.
       // vapidPublicKey: web-push (UnifiedPush) публичный ключ релея — клиент передаёт
       // его в expo-unified-push registerDevice(). null, если web-push не настроен.
       return send(ws, {
         type: 'ready',
-        queued: flushed,
+        queued: flushed + flushedBinary,
         prekeys: store.countOtps(ws.pubkey),
         vapidPublicKey: vapidPublicKey(),
         protocol: RELAY_PROTOCOL,
@@ -1493,11 +1659,48 @@ function handleFrameSafely(ws, msg) {
       return send(ws, { type: 'registered' });
     }
 
+    if (msg.type === 'push-test') {
+      const testId = typeof msg.testId === 'string' ? msg.testId : '';
+      const channel = msg.channel === 'call' ? 'call' : 'message';
+      if (!/^[A-Za-z0-9_-]{8,96}$/.test(testId)) {
+        return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'invalid-test-id' });
+      }
+      const now = Date.now();
+      if (now - (ws.lastPushTestAt || 0) < 5000) {
+        return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'rate-limited' });
+      }
+      ws.lastPushTestAt = now;
+      const token = store.getToken(ws.pubkey);
+      if (!token) {
+        return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'not-registered' });
+      }
+      sendTestPush(token, testId, channel)
+        .then((result) => {
+          if (result === 'invalid') store.delToken(ws.pubkey);
+          send(ws, {
+            type: 'push-test-result',
+            testId,
+            channel,
+            accepted: result === true,
+            error: result === 'invalid' ? 'invalid-subscription' : result === true ? undefined : 'provider-unavailable',
+          });
+        })
+        .catch(() => {
+          send(ws, { type: 'push-test-result', testId, channel, accepted: false, error: 'provider-error' });
+        });
+      return;
+    }
+
     if (msg.type === 'received') {
       // H-2: квитанцию принимаем только от доказанного владельца адреса. Недоказанный
       // держатель (сквоттер незанятого адреса) не может удалить конверт из очереди
       // и не спровоцирует ложный `delivered` — реальный владелец потом заберёт своё.
       if (typeof msg.id === 'string' && ws.proven) ackReceived(ws.pubkey, msg.id);
+      return;
+    }
+
+    if (msg.type === 'binary-received') {
+      if (typeof msg.id === 'string' && ws.proven) ackBinaryReceived(ws.pubkey, msg.id);
       return;
     }
 

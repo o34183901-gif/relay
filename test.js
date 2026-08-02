@@ -10,6 +10,7 @@ const fs = require('fs');
 const WebSocket = require('ws');
 const crypto = require('./test-crypto');
 const linked = require('./linked-devices');
+const { packBinaryFrame, unpackBinaryFrame } = require('./binary-frame');
 
 const PORT = 8799;
 const URL = `ws://127.0.0.1:${PORT}`;
@@ -84,6 +85,19 @@ function waitForAfter(inbox, type, startIndex, timeout = 2000) {
   });
 }
 
+function waitForBinaryAfter(inbox, startIndex, timeout = 2000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      const item = inbox.slice(startIndex)[0];
+      if (item) return resolve(item);
+      if (Date.now() - started > timeout) return reject(new Error('timeout waiting for binary frame'));
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
 /**
  * Connect and complete the ownership handshake. `autoAck` acks each incoming
  * message (needed for delivery); omit to test queue retention.
@@ -96,12 +110,21 @@ function waitForAfter(inbox, type, startIndex, timeout = 2000) {
 function client(id, { autoAck = true, signId, boxProof = true } = {}) {
   const ws = new WebSocket(URL);
   const inbox = [];
+  const binaryInbox = [];
   const signer = signId || id;
   // СРВ-14: без слушателя 'error' сбой соединения роняет тест необработанным
   // событием; здесь он превращается в reject открывающего промиса (уходит в
   // main try/catch → finally срубает сервер).
   ws.on('error', () => {});
-  ws.on('message', (d) => {
+  ws.on('message', (d, isBinary) => {
+    if (isBinary) {
+      const frame = unpackBinaryFrame(d);
+      binaryInbox.push(frame);
+      if (autoAck && frame.header.id) {
+        ws.send(JSON.stringify({ type: 'binary-received', id: frame.header.id }));
+      }
+      return;
+    }
     const m = JSON.parse(d.toString());
     inbox.push(m);
     if (m.type === 'challenge') {
@@ -120,7 +143,7 @@ function client(id, { autoAck = true, signId, boxProof = true } = {}) {
   return new Promise((resolve, reject) => {
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'hello', pubkey: id.publicKey, signPublicKey: id.signPublicKey }));
-      resolve({ ws, inbox, id });
+      resolve({ ws, inbox, binaryInbox, id });
     });
     ws.on('error', (e) => reject(e)); // соединение не открылось — не виснем
   });
@@ -146,9 +169,10 @@ async function main() {
   };
 
   try {
-    assert.strictEqual(health.protocol, 2);
+    assert.strictEqual(health.protocol, 3);
     assert.ok(Array.isArray(health.capabilities));
     assert.ok(health.capabilities.includes('linked-devices-v2'));
+    assert.ok(health.capabilities.includes('binary-attachments-v1'));
     assert.strictEqual(health.maxLinkedDevices, linked.MAX_ACTIVE_DEVICES);
     ok('health reports linked-device protocol capabilities');
 
@@ -178,6 +202,32 @@ async function main() {
     });
     assert.strictEqual(text1, 'привет через сервер 👋');
     ok('online delivery works and decrypts');
+
+    // --- raw binary attachment chunks (v3) ---
+    const binaryStart = b.binaryInbox.length;
+    const ackStart = a.inbox.length;
+    const rawChunk = crypto.randomBytes ? crypto.randomBytes(96) : require('crypto').randomBytes(96);
+    a.ws.send(
+      packBinaryFrame(
+        {
+          type: 'attachment-chunk',
+          version: 1,
+          to: bob.publicKey,
+          transferId: 'binary-online-1',
+          index: 0,
+          total: 1,
+          ref: 'binary-ref-online',
+        },
+        rawChunk
+      )
+    );
+    const binaryAck = await waitForAfter(a.inbox, 'binary-ack', ackStart);
+    const deliveredBinary = await waitForBinaryAfter(b.binaryInbox, binaryStart);
+    assert.strictEqual(binaryAck.dropped, false);
+    assert.strictEqual(deliveredBinary.header.transferId, 'binary-online-1');
+    assert.deepStrictEqual(deliveredBinary.payload, rawChunk);
+    await waitForAfter(a.inbox, 'binary-delivered', ackStart);
+    ok('v3 raw binary attachment chunk is delivered and acknowledged without base64');
 
     // sender gets an ack (ref echoed) and a delivered receipt after bob acks
     const ack = await waitFor(a.inbox, 'ack');

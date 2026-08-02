@@ -267,6 +267,37 @@ async function sendCallPush(token) {
   });
 }
 
+/**
+ * Контрольный push для диагностики в Профиле. testId не содержит пользовательских
+ * данных и позволяет отличить принятие запроса провайдером от получения телефоном.
+ */
+async function sendTestPush(token, testId, channel = 'message') {
+  if (!token || typeof testId !== 'string' || !testId) return false;
+  const isCall = channel === 'call';
+  const notification = {
+    title: 'Лично · проверка уведомлений',
+    body: isCall ? 'Проверка канала аудио- и видеозвонков' : 'Проверка канала сообщений',
+    type: 'push-test',
+    testId,
+    channel: isCall ? 'call' : 'message',
+  };
+  const sub = parseSubscription(token);
+  if (sub) return unifiedPushSend(sub, notification);
+  return fcmSend({
+    token,
+    notification: { title: notification.title, body: notification.body },
+    android: {
+      priority: 'HIGH',
+      notification: {
+        channel_id: isCall ? 'calls' : 'messages',
+        tag: `push-test-${isCall ? 'call' : 'message'}`,
+        sound: isCall ? 'default' : undefined,
+      },
+    },
+    data: { type: 'push-test', testId, channel: notification.channel },
+  });
+}
+
 /** Сгенерировать новую VAPID-пару (для персиста в relay.js). */
 function generateVapidKeys() {
   return webpush.generateVAPIDKeys();
@@ -275,6 +306,7 @@ function generateVapidKeys() {
 module.exports = {
   sendPush,
   sendCallPush,
+  sendTestPush,
   pushReady: ready,
   setVapidKeys,
   vapidPublicKey,
