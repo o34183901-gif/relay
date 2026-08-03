@@ -237,11 +237,29 @@ async function unifiedPushSend(sub, notification) {
   }
 }
 
-/** Content-free wake-up push for a new message. FCM или web-push (UnifiedPush). */
-async function sendPush(token, messageId) {
+/**
+ * Content-free wake-up push for a new message. FCM или web-push (UnifiedPush).
+ *
+ * ПРФ-4: `chatTag` — НЕПРОЗРАЧНЫЙ признак чата (хэш адреса отправителя, см.
+ * relay.chatNotificationTag). Он едет ТОЛЬКО в web-push, тело которого
+ * зашифровано ключами подписки: провайдер пуша его не читает, а устройство
+ * получает возможность не схлопывать уведомления разных чатов в одно.
+ *
+ * В FCM тег НЕ передаётся сознательно: тело FCM-сообщения уходит Google
+ * открытым текстом, и стабильный признак отправителя дал бы ему псевдоним для
+ * подсчёта «сколько разных людей пишет этому устройству и когда» — это
+ * метаданные социального графа, ровно то, что мессенджер обязан скрывать.
+ * Поэтому на FCM-пути остаётся прежний общий тег: там уведомления по-прежнему
+ * схлопываются, зато Google не узнаёт ничего нового.
+ */
+async function sendPush(token, messageId, chatTag) {
   if (!token) return false;
   const sub = parseSubscription(token);
   const safeMessageId = typeof messageId === 'string' ? messageId.slice(0, 160) : '';
+  // Тег недоверенной длины/формы в теле уведомления не нужен: берём только
+  // безопасный алфавит base64url и ограничиваем длину.
+  const safeChatTag =
+    typeof chatTag === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(chatTag) ? chatTag : '';
   if (sub) {
     return unifiedPushSend(sub, {
       id: MESSAGE_NOTIFICATION_ID,
@@ -249,7 +267,8 @@ async function sendPush(token, messageId) {
       body: 'Новое зашифрованное сообщение',
       type: 'message',
       messageId: safeMessageId,
-      data: { type: 'message', messageId: safeMessageId },
+      chatTag: safeChatTag,
+      data: { type: 'message', messageId: safeMessageId, chatTag: safeChatTag },
     });
   }
   return fcmSend({

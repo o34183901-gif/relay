@@ -8,10 +8,16 @@ const path = require('path');
 const { createStore } = require('./store');
 
 let passed = 0;
+// АУД-06: запись тел крупных конвертов ушла из event-loop, поэтому часть
+// проверок обязана дождаться её завершения. Прогон стал последовательной
+// цепочкой: синхронные тесты работают как раньше, асинхронные — ждутся.
+let chain = Promise.resolve();
 function test(name, fn) {
-  fn();
-  passed++;
-  console.log('  ✓ ' + name);
+  chain = chain.then(async () => {
+    await fn();
+    passed++;
+    console.log('  ✓ ' + name);
+  });
 }
 console.log('relay store (sqlite)');
 
@@ -262,10 +268,29 @@ function freshBlobs(threshold = 100) {
 const bigEnvelope = () => ({ cipher: 'x'.repeat(500) });
 const blobFiles = (dir) => fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
 
-test('blob: крупный конверт уходит файлом, мелкий остаётся в БД', () => {
+// АУД-06: тело крупного конверта пишется вне event-loop — иначе fs.writeFileSync
+// на тридцать мегабайт останавливает обслуживание ВСЕХ пользователей узла.
+// Ключевая гарантия: пока запись идёт, тело доступно из памяти, поэтому читатель
+// (flushQueue) не видит разницы. Проверки, смотрящие на файловую систему, ждут
+// завершения записи явно.
+
+test('АУД-06: тело читается ДО того, как доехало до диска', async () => {
+  const { s, dir } = freshBlobs();
+  s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
+  // Файла на диске может ещё не быть — и это нормально...
+  const item = s.getItem('big');
+  assert.deepStrictEqual(item.envelope, bigEnvelope(), '...но конверт уже отдаётся');
+  await s.flushPendingBlobs();
+  assert.deepStrictEqual(blobFiles(dir), ['big.json'], 'а затем тело оказывается на диске');
+  assert.deepStrictEqual(s.getItem('big').envelope, bigEnvelope(), 'и читается уже оттуда');
+  s.close();
+});
+
+test('blob: крупный конверт уходит файлом, мелкий остаётся в БД', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
   s.enqueue({ id: 'small', to: 'bob', from: 'alice', envelope: { cipher: 'hi' }, ts: 2 });
+  await s.flushPendingBlobs();
   assert.deepStrictEqual(blobFiles(dir), ['big.json']);
   const q = s.queueFor('bob');
   assert.deepStrictEqual(q.map((x) => x.id), ['big', 'small']);
@@ -274,44 +299,58 @@ test('blob: крупный конверт уходит файлом, мелки�
   s.close();
 });
 
-test('blob: ack удаляет и строку, и файл', () => {
+test('blob: ack удаляет и строку, и файл', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
+  await s.flushPendingBlobs();
   assert.strictEqual(s.ack('bob', 'big'), 'alice');
   assert.strictEqual(blobFiles(dir).length, 0);
   s.close();
 });
 
-test('blob: вытеснение по maxPerUser удаляет файл старейшего', () => {
+test('АУД-06: удаление до окончания записи не оставляет файл-сироту', async () => {
+  const { s, dir } = freshBlobs();
+  s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
+  assert.strictEqual(s.ack('bob', 'big'), 'alice'); // ack пришёл раньше, чем запись закончилась
+  await s.flushPendingBlobs();
+  assert.strictEqual(blobFiles(dir).length, 0, 'отменённая запись не должна дописаться на диск');
+  s.close();
+});
+
+test('blob: вытеснение по maxPerUser удаляет файл старейшего', async () => {
   const { s, dir } = freshBlobs();
   for (let i = 0; i < 3; i++) s.enqueue({ id: 'm' + i, to: 'bob', envelope: bigEnvelope(), ts: i, maxPerUser: 2 });
+  await s.flushPendingBlobs();
   assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['m1', 'm2']);
   assert.deepStrictEqual(blobFiles(dir).sort(), ['m1.json', 'm2.json']);
   s.close();
 });
 
-test('blob: TTL удаляет протухшие файлы', () => {
+test('blob: TTL удаляет протухшие файлы', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'old', to: 'bob', envelope: bigEnvelope(), ts: 100 });
   s.enqueue({ id: 'new', to: 'bob', envelope: bigEnvelope(), ts: 1000 });
+  await s.flushPendingBlobs();
   assert.strictEqual(s.expireOlderThan(500), 1);
   assert.deepStrictEqual(blobFiles(dir), ['new.json']);
   s.close();
 });
 
-test('blob: пропавший файл — строка подчищается, очередь не ломается', () => {
+test('blob: пропавший файл — строка подчищается, очередь не ломается', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'big', to: 'bob', envelope: bigEnvelope(), ts: 1 });
   s.enqueue({ id: 'small', to: 'bob', envelope: { cipher: 'hi' }, ts: 2 });
+  await s.flushPendingBlobs();
   fs.unlinkSync(path.join(dir, 'big.json')); // volume почистили руками
   assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['small']);
   assert.strictEqual(s.getItem('big'), null); // мёртвая строка удалена
   s.close();
 });
 
-test('blob: cleanupOrphanBlobs убирает сирот и tmp, живые не трогает', () => {
+test('blob: cleanupOrphanBlobs убирает сирот и tmp, живые не трогает', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'live', to: 'bob', envelope: bigEnvelope(), ts: 1 });
+  await s.flushPendingBlobs();
   fs.writeFileSync(path.join(dir, 'orphan.json'), '{}');
   fs.writeFileSync(path.join(dir, 'half.json.tmp'), '{');
   fs.writeFileSync(path.join(dir, 'unrelated.txt'), 'keep');
@@ -433,4 +472,11 @@ test('linked devices: отзыв необратим тем же сертифик
   s.close();
 });
 
-console.log('\n' + passed + ' passed');
+chain
+  .then(() => {
+    console.log('\n' + passed + ' passed');
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

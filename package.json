@@ -5,10 +5,11 @@
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js",
-    "test": "node linked-devices.test.js && node store.test.js && node push.test.js && node vapid-fleet.test.js && node vapid-fleet.integration.test.js && node test.js"
+    "test": "node linked-devices.test.js && node store.test.js && node push.test.js && node notifications.test.js && node vapid-fleet.test.js && node vapid-fleet.integration.test.js && node test.js && node throttle.test.js"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
+    "@noble/curves": "^2.2.0",
     "better-sqlite3": "^12.11.1",
     "google-auth-library": "^9.15.1",
     "tweetnacl": "^1.0.3",

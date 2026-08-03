@@ -119,19 +119,95 @@ function createStore(dbPath, opts = {}) {
   // диска от неограниченного роста каталога identity/prekey под Sybil-регистрацией).
   const hasLastSeenCol = db.prepare("SELECT count(*) c FROM pragma_table_info('identities') WHERE name='last_seen'").get().c;
   if (!hasLastSeenCol) db.exec('ALTER TABLE identities ADD COLUMN last_seen INTEGER DEFAULT 0');
+  // БЕЗ-3: pq — публичная половина постквантового ключа ML-KEM-768. Хранится
+  // рядом с классической и покрыта той же подписью владельца (релей её не
+  // проверяет на подлинность содержимого, но и подменить не может: клиент
+  // сверяет подпись сам). NULL у пользователей на прежней версии — тогда обмен
+  // идёт по классической схеме.
+  const hasSpkPqCol = db.prepare("SELECT count(*) c FROM pragma_table_info('prekeys_spk') WHERE name='pq'").get().c;
+  if (!hasSpkPqCol) db.exec('ALTER TABLE prekeys_spk ADD COLUMN pq TEXT');
 
   const blobPath = (mid) => path.join(blobDir, mid + '.json');
   const binaryPath = (mid) => path.join(blobDir, mid + '.bin');
+
+  // ---------------------------------------------------------------------------
+  // АУД-06: тело крупного конверта пишется на диск ВНЕ event-loop
+  // ---------------------------------------------------------------------------
+  //
+  // Релей однопоточный. Пока идёт fs.writeFileSync на тридцать мегабайт, узел не
+  // обслуживает НИКОГО: ни доставку, ни квитанции, ни heartbeat. Снаружи это
+  // выглядит как «мессенджер подтормаживает» ровно тогда, когда кто-то отправил
+  // видео, — и тем заметнее, чем больше людей на узле.
+  //
+  // Просто заменить запись на асинхронную нельзя: строка очереди появляется
+  // сразу, и читатель (flushQueue) может прийти за телом раньше, чем оно легло
+  // на диск. Поэтому тело до окончания записи живёт в памяти: читатель берёт его
+  // оттуда, а на диск оно доезжает своим ходом.
+  //
+  // Что с надёжностью. Окно между «строка есть» и «файл есть» существует и при
+  // синхронной записи (fsync никто не звал), но здесь оно шире. Закрываем его
+  // так: pendingBlobs дожидаются завершения при штатной остановке (close), а
+  // строка, чьё тело всё же не доехало, при чтении опознаётся и сносится — этот
+  // путь был и раньше (rowToItem → dropRow). Потерять сообщение молча по-прежнему
+  // невозможно: клиент держит его в своей очереди до квитанции.
+  const pendingBlobs = new Map(); // mid -> { json, cancelled }
+  const blobWrites = new Set(); // все незавершённые записи, включая отменённые
+
   function writeBlob(mid, envJson) {
-    // tmp + rename: файл появляется атомарно, недописанных блобов не бывает
+    const entry = { json: envJson, cancelled: false };
+    pendingBlobs.set(mid, entry);
     const tmp = blobPath(mid) + '.tmp';
-    fs.writeFileSync(tmp, envJson);
-    fs.renameSync(tmp, blobPath(mid));
+    // tmp + rename: файл появляется атомарно, недописанных блобов не бывает.
+    const promise = fs.promises
+      .writeFile(tmp, envJson)
+      .then(async () => {
+        // Строку могли удалить (ack, вытеснение, TTL), пока шла запись. Тогда
+        // файл не нужен — иначе он остался бы сиротой, которую подберёт только
+        // периодическая уборка.
+        if (entry.cancelled) return fs.promises.unlink(tmp).catch(() => {});
+        await fs.promises.rename(tmp, blobPath(mid));
+        // Отмена могла случиться и МЕЖДУ записью и переименованием.
+        if (entry.cancelled) await fs.promises.unlink(blobPath(mid)).catch(() => {});
+      })
+      .catch((error) => {
+        console.warn('[store] не удалось записать тело конверта', mid, error && error.message);
+        return fs.promises.unlink(tmp).catch(() => {});
+      })
+      .finally(() => {
+        blobWrites.delete(promise);
+        if (pendingBlobs.get(mid) === entry) pendingBlobs.delete(mid);
+      });
+    blobWrites.add(promise);
   }
+
+  /** Тело, ещё не доехавшее до диска. null — искать на диске как обычно. */
+  function pendingBlob(mid) {
+    const entry = pendingBlobs.get(mid);
+    return entry && !entry.cancelled ? entry.json : null;
+  }
+
   function unlinkBlob(mid) {
+    const entry = pendingBlobs.get(mid);
+    if (entry) {
+      entry.cancelled = true; // запись доработает и уберёт за собой
+      pendingBlobs.delete(mid);
+    }
     try {
       fs.unlinkSync(blobPath(mid));
     } catch (e) {}
+  }
+
+  /**
+   * Дождаться, пока все начатые записи завершатся. Нужно при штатной остановке
+   * (иначе конверт, чья запись шла в момент SIGTERM, потерял бы тело) и в
+   * тестах, которые смотрят на файловую систему.
+   *
+   * Цикл, а не одно ожидание: пока ждём, могли начаться новые записи.
+   */
+  async function flushPendingBlobs() {
+    while (blobWrites.size) {
+      await Promise.allSettled([...blobWrites]);
+    }
   }
   // Удалить строку очереди и синхронно поправить счётчики веса/количества.
   // r ДОЛЖЕН содержать поле bytes (все запросы, чьи строки сюда попадают,
@@ -227,11 +303,16 @@ function createStore(dbPath, opts = {}) {
   const rowToItem = (r) => {
     let envJson = r.envelope;
     if (r.blob) {
-      try {
-        envJson = fs.readFileSync(blobPath(r.id), 'utf8');
-      } catch (e) {
-        dropRow(r);
-        return null;
+      // АУД-06: тело могло ещё не доехать до диска — запись идёт вне event-loop.
+      // Пока она идёт, тело лежит в памяти, и читатель берёт его оттуда.
+      envJson = pendingBlob(r.id);
+      if (envJson == null) {
+        try {
+          envJson = fs.readFileSync(blobPath(r.id), 'utf8');
+        } catch (e) {
+          dropRow(r);
+          return null;
+        }
       }
     }
     // S6: тело могло испортиться (сбой питания между записью blob-файла и fsync;
@@ -270,6 +351,10 @@ function createStore(dbPath, opts = {}) {
       silent: !!r.silent,
       callPush: !!r.call_push,
       ts: r.ts,
+      // АУД-12: размер конверта уже посчитан при постановке в очередь. Без него
+      // релей сериализовал кадр целиком только ради длины — и тут же выбрасывал
+      // результат, чтобы упаковать тот же кадр в MessagePack заново.
+      bytes: Number(r.bytes) || 0,
     };
   };
 
@@ -330,8 +415,8 @@ function createStore(dbPath, opts = {}) {
     ),
   };
   const spk = {
-    get: db.prepare('SELECT id, pub, sig FROM prekeys_spk WHERE pk=?'),
-    set: db.prepare('INSERT OR REPLACE INTO prekeys_spk (pk,id,pub,sig) VALUES (?,?,?,?)'),
+    get: db.prepare('SELECT id, pub, sig, pq FROM prekeys_spk WHERE pk=?'),
+    set: db.prepare('INSERT OR REPLACE INTO prekeys_spk (pk,id,pub,sig,pq) VALUES (?,?,?,?,?)'),
     delFor: db.prepare('DELETE FROM prekeys_spk WHERE pk=?'),
   };
   const otp = {
@@ -435,6 +520,13 @@ function createStore(dbPath, opts = {}) {
       deviceCertificate,
       deviceRoster,
       envelope,
+      // АУД-06: сериализованный конверт, если вызывающий его уже построил.
+      // Релей всё равно сериализует конверт для проверки размера, а здесь делал
+      // это ВТОРОЙ раз: на конверте в семь мегабайт (вложение в группу по
+      // легаси-пути) это лишний полный проход по памяти в однопоточном процессе,
+      // то есть пауза для ВСЕХ пользователей узла. Строку принимаем, но не
+      // доверяем ей вслепую: если её нет, считаем как раньше.
+      envelopeJson,
       silent,
       callPush,
       ts,
@@ -443,7 +535,7 @@ function createStore(dbPath, opts = {}) {
       maxTotal,
       maxTotalBytes,
     }) {
-      const envJson = JSON.stringify(envelope);
+      const envJson = typeof envelopeJson === 'string' ? envelopeJson : JSON.stringify(envelope);
       const bytes = Buffer.byteLength(envJson);
 
       // S5: квота на пару (отправитель→получатель). Один отправитель не может
@@ -718,11 +810,14 @@ function createStore(dbPath, opts = {}) {
     // --- X3DH prekeys (только публичные половинки) ---------------------------
     /** Сохранить/заменить подписанный prekey пользователя. */
     setSpk(pk, s) {
-      spk.set.run(pk, s.id, s.pub, s.sig);
+      spk.set.run(pk, s.id, s.pub, s.sig, s.pq || null);
     },
     getSpk(pk) {
       const r = spk.get.get(pk);
-      return r ? { id: r.id, pub: r.pub, sig: r.sig } : null;
+      if (!r) return null;
+      // БЕЗ-3: pq отдаём только если он есть — иначе поле не появляется вовсе,
+      // и старый клиент видит ровно прежний бандл.
+      return r.pq ? { id: r.id, pub: r.pub, sig: r.sig, pq: r.pq } : { id: r.id, pub: r.pub, sig: r.sig };
     },
     /** Заменить набор одноразовых prekey пользователя свежей пачкой. */
     replaceOtps(pk, list) {
@@ -892,6 +987,11 @@ function createStore(dbPath, opts = {}) {
     queueBytes() {
       return liveBytes;
     },
+    /**
+     * АУД-06: дождаться записи начатых тел. Вызывается при штатной остановке —
+     * иначе конверт, чья запись шла в момент SIGTERM, потерял бы тело.
+     */
+    flushPendingBlobs,
     close() {
       db.close();
     },

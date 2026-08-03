@@ -9,6 +9,14 @@
  */
 const nacl = require('tweetnacl');
 const { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } = require('tweetnacl-util');
+// АУД-КР2: правило вывода кода подтверждения живёт отдельным чистым модулем —
+// от него зависит, можно ли подменить компьютер при привязке, и проверяться оно
+// должно целиком, а не заодно с остальным протоколом.
+const verifyCode = require('./verification-code');
+const ed25519 = require('./ed25519');
+// Пробрасываем как есть: правило сверки и цена вывода — часть контракта привязки,
+// и вызывающим не должно быть дела до того, в каком файле они живут.
+const { verificationCodesMatch, STRONG_CODE_ROUNDS } = verifyCode;
 
 const LINKED_DEVICE_VERSION = 2;
 const DEVICE_CERT_TYPE = 'licno-device-certificate';
@@ -26,7 +34,6 @@ const CERT_DOMAIN = 'licno-device-certificate-v2|';
 const ROSTER_DOMAIN = 'licno-device-roster-v2|';
 const PAIRING_DOMAIN = 'licno-device-link-request-v2|';
 const DEVICE_ID_DOMAIN = 'licno-device-id-v2|';
-const VERIFY_CODE_DOMAIN = 'licno-device-verify-code-v2|';
 
 const CAPABILITIES = new Set(['messages', 'files', 'voice', 'history-sync', 'notifications']);
 const CAPABILITY_BITS = Object.freeze({ files: 1, 'history-sync': 2, messages: 4, notifications: 8, voice: 16 });
@@ -253,14 +260,26 @@ function equalList(left, right) {
 function signPayload(domain, payload, secretKey) {
   const sk = decodeExact(secretKey, nacl.sign.secretKeyLength, 'sign secret key');
   const bytes = decodeUTF8(domain + stableStringify(payload));
-  return encodeBase64(nacl.sign.detached(bytes, sk));
+  return encodeBase64(ed25519.sign(bytes, sk));
 }
 
+// В-2: САМОЕ ГОРЯЧЕЕ МЕСТО ПРОВЕРКИ ПОДПИСИ ВО ВСЁМ ПРОЕКТЕ.
+//
+// Через verifyPayload проходят сертификат каждого устройства собеседника и
+// подпись самого списка устройств, а список едет с КАЖДЫМ входящим конвертом.
+// Замер боевого пути (см. комментарий в src/relay.js о кэше проверенных
+// отправителей): 42 мс при одном устройстве и 200 мс при десяти, на телефоне
+// вчетверо больше. Проверка подписи здесь — не деталь, а то, сколько человек
+// ждёт свои сообщения после возвращения в сеть.
+//
+// Формат подписи не изменился: обёртка отдаёт те же байты, а подписи двух
+// реализаций взаимно проверяемы (test/ed25519.test.js). Поэтому клиент и релей
+// разных версий совместимы в обе стороны и обновляться могут порознь.
 function verifyPayload(domain, payload, signature, publicKey) {
   try {
     const sig = decodeExact(signature, nacl.sign.signatureLength, 'signature');
     const pk = decodeExact(publicKey, nacl.sign.publicKeyLength, 'sign public key');
-    return nacl.sign.detached.verify(decodeUTF8(domain + stableStringify(payload)), sig, pk);
+    return ed25519.verify(decodeUTF8(domain + stableStringify(payload)), sig, pk);
   } catch (error) {
     return false;
   }
@@ -675,12 +694,23 @@ function decodePairingQr(value, options = {}) {
   );
 }
 
+/** Канонизированные подписываемые поля запроса — вход для вывода кода. */
+function pairingCanonical(request) {
+  return stableStringify(pairingPayload(request));
+}
+
 function verificationCode(request) {
-  const payload = pairingPayload(request);
-  const hash = nacl.hash(decodeUTF8(VERIFY_CODE_DOMAIN + stableStringify(payload)));
-  const number = (((hash[0] << 16) | (hash[1] << 8) | hash[2]) >>> 0) % 1000000;
-  const text = String(number).padStart(6, '0');
-  return `${text.slice(0, 2)} · ${text.slice(2, 4)} · ${text.slice(4, 6)}`;
+  return verifyCode.shortCode(pairingCanonical(request));
+}
+
+/** Десятизначный код: первые шесть цифр совпадают с verificationCode. */
+function strongVerificationCode(request) {
+  return verifyCode.strongCode(pairingCanonical(request));
+}
+
+/** То же, но без заморозки интерфейса на время вывода. */
+function strongVerificationCodeAsync(request) {
+  return verifyCode.strongCodeAsync(pairingCanonical(request));
 }
 
 module.exports = {
@@ -710,4 +740,8 @@ module.exports = {
   encodePairingQrCompat,
   decodePairingQr,
   verificationCode,
+  strongVerificationCode,
+  strongVerificationCodeAsync,
+  verificationCodesMatch,
+  STRONG_CODE_ROUNDS,
 };

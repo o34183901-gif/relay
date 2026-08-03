@@ -62,8 +62,14 @@ const {
   vapidPublicKey,
   generateVapidKeys,
 } = require('./push');
-const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate } = require('./relays');
+const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate, byteGate, buildIceServers, parsePublicStun } = require('./relays');
+const { chatNotificationTag, createPushGate } = require('./notifications');
 const { createStore } = require('./store');
+// В-2: подпись и её проверка — через единую обёртку (внутри @noble/curves,
+// формат прежний побайтно). На релее это путь аутентификации КАЖДОГО
+// подключения: challenge подписывает клиент, свою подпись ставит релей, и
+// подпись подписанного prekey сверяется при каждой выгрузке бандла.
+const ed25519 = require('./ed25519');
 const { unpackBinaryFrame, packBinaryFrame } = require('./binary-frame');
 const { encode: encodeMessagePack, decode: decodeMessagePack } = require('@msgpack/msgpack');
 const {
@@ -97,21 +103,30 @@ const TURN_HOST = process.env.TURN_HOST;
 // автономен: серверы подхватывают его сами.
 let turnSecret = null;
 
-// Ephemeral coturn REST credentials (valid ~1h), so no long-lived TURN
-// password ships in the app.
+// БЕЗ-1: публичный STUN — ТОЛЬКО по явному решению оператора.
+//
+// Раньше при ненастроенном TURN сюда подставлялся stun.l.google.com. Для
+// мессенджера, чей заявленный тезис — «без слежки», это означало, что при каждом
+// звонке обе стороны сообщают Google свой реальный IP и точное время. Содержимое
+// звонка при этом защищено, но сам факт разговора, его время и география обеих
+// сторон утекают третьей стороне мимо всей остальной защиты.
+//
+// Теперь по умолчанию публичного STUN нет вовсе: свой coturn на релее (он же
+// отдаёт STUN на том же порту 3478) закрывает задачу без посредников. Оператор,
+// который сознательно готов на внешний STUN, задаёт его сам:
+//   RELAY_PUBLIC_STUN=stun:stun.example.org:3478,stun:stun2.example.org:3478
+const PUBLIC_STUN = parsePublicStun(process.env.RELAY_PUBLIC_STUN);
+
+// Эфемерные REST-учётки coturn (живут ~1 ч), чтобы долгоживущий пароль TURN
+// не уезжал в приложение. Сама сборка списка — чистая, в relays.js.
 function turnIceServers() {
-  const base = [{ urls: 'stun:stun.l.google.com:19302' }];
-  if (!turnSecret || !TURN_HOST) return base;
-  const username = `${Math.floor(Date.now() / 1000) + 3600}:licno`;
-  const credential = crypto.createHmac('sha1', turnSecret).update(username).digest('base64');
-  return [
-    { urls: `stun:${TURN_HOST}:3478` },
-    {
-      urls: [`turn:${TURN_HOST}:3478?transport=udp`, `turn:${TURN_HOST}:3478?transport=tcp`],
-      username,
-      credential,
-    },
-  ];
+  return buildIceServers({
+    turnSecret,
+    turnHost: TURN_HOST,
+    publicStun: PUBLIC_STUN,
+    now: Date.now(),
+    hmac: (username) => crypto.createHmac('sha1', turnSecret).update(username).digest('base64'),
+  });
 }
 
 const PORT = process.env.PORT || 8787;
@@ -123,6 +138,9 @@ const RELAY_CAPABILITIES = Object.freeze([
   'binary-attachments-v1',
   'push-test-v1',
   'frame-batch-v1',
+  // АУД-13: клиент может спросить остаток своих одноразовых prekey, не
+  // переподключаясь. Без этого долгоживущее соединение не пополняло пул никогда.
+  'prekeys-count-v1',
 ]);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
@@ -195,10 +213,39 @@ const MAX_ENVELOPE_BYTES = 32 * 1024 * 1024; // 32 MB envelope (~24 MB video/fil
 const MAX_BINARY_CHUNK_BYTES = 300 * 1024;
 const MAX_BINARY_CHUNKS = 4096;
 
+// АУД-06: потолок JSON-кадра, проверяемый ДО разбора.
+//
+// Раньше кадр в 33 МБ (maxPayload) сначала превращался в строку (raw.toString()),
+// затем полностью разбирался (JSON.parse) — и только потом отвергался проверкой
+// размера конверта. Релей однопоточный: пока идут эти два прохода, НИ ОДИН
+// пользователь узла не получает и не отправляет сообщений. То есть отправить
+// мусор и заставить узел его разобрать стоило ровно столько же, сколько
+// отправить настоящее сообщение, и никакой аутентификации для этого не
+// требовалось.
+//
+// Длина кадра известна из самого буфера, до единой операции над содержимым.
+// Конверт не может быть больше кадра, в котором приехал, поэтому кадр крупнее
+// потолка конверта плюс служебные поля — заведомо негодный.
+const JSON_FRAME_OVERHEAD_BYTES = 128 * 1024; // to/ref/метаданные устройства с запасом
+const MAX_JSON_FRAME_BYTES = MAX_ENVELOPE_BYTES + JSON_FRAME_OVERHEAD_BYTES;
+// До аутентификации валидны только hello и auth — это пара ключей и подпись,
+// то есть сотни байт. Держать здесь 32 МБ значит разрешать неизвестно кому
+// занимать процессор узла разбором мусора. Порог щедрый на два порядка.
+const MAX_PREAUTH_FRAME_BYTES = 64 * 1024;
+
 // Rate limiting (per connection).
 const AUTH_TIMEOUT_MS = 10000; // must authenticate within this window
 const RATE_WINDOW_MS = 1000;
 const RATE_MAX_FRAMES = 80; // frames per RATE_WINDOW_MS before we drop the socket
+// БЕЗ-5: потолок ПОТОКА с одного соединения. Кадровый лимит выше пропускал
+// 80 × 300 КБ = 24 МБ/с, а при онлайн-получателе конверты минуют очередь, то
+// есть и квоты хранения. Потолок щедрый: отправка вложения 24 МБ укладывается
+// примерно в две секунды, легитимный быстрый клиент его почти не замечает —
+// при превышении релей лишь притормаживает чтение, ничего не теряя.
+const RATE_MAX_BYTES = Number(process.env.RELAY_MAX_BYTES_PER_SEC) || 12 * 1024 * 1024;
+// Сколько окон подряд можно держать превышение, прежде чем это перестанет быть
+// «быстрый канал» и станет абузом. 15 с непрерывного упора в потолок.
+const RATE_ABUSE_WINDOWS = Number(process.env.RELAY_ABUSE_WINDOWS) || 15;
 
 // Resource limits (H4): защита узла от исчерпания ресурсов при абузе/DoS.
 // ВАЖНО: мобильные операторы прячут тысячи абонентов за одним IP (CGNAT),
@@ -223,7 +270,83 @@ const counters = {
   pushes: 0, // отправлено wake-up пушей
   authOk: 0, // успешных аутентификаций
   dropped: 0, // СРВ-2: конверт отброшен (очередь получателя полна, нет своих слотов)
+  throttled: 0, // БЕЗ-5: сколько раз чтение сокета придерживали из-за потолка байт
+  abusive: 0, // БЕЗ-5: сколько соединений разорвано за длительное превышение
+  oversized: 0, // АУД-06: кадров отвергнуто по размеру ДО разбора
+  overloaded: 0, // АУД-06: сколько раз узел сообщил клиенту о перегрузке
 };
+
+// ПРФ-3: задержка event-loop. Релей однопоточный, а хранилище (better-sqlite3) и
+// запись тел вложений на диск синхронны — то есть пока идёт одна тяжёлая
+// операция, НИ ОДИН другой пользователь не получает и не отправляет сообщений:
+// ни heartbeat, ни квитанции, ни доставку. Снаружи это выглядит как «мессенджер
+// подтормаживает» ровно тогда, когда кто-то отправил видео.
+//
+// Померить это иначе нечем: счётчики сообщений при такой блокировке выглядят
+// нормально. Ставим таймер на фиксированный интервал и смотрим, насколько он
+// опоздал, — опоздание и есть время, которое цикл провёл занятым.
+const EVENT_LOOP_PROBE_MS = 500;
+// АУД-06: одной метрики мало. Число, на которое никто не смотрит, ничем не
+// отличается от отсутствия числа: узел может неделями отвечать с секундными
+// паузами, и снаружи это будет выглядеть просто как «мессенджер иногда
+// подтормаживает». Поэтому держим ОКНО последних замеров (чтобы считать p99, а
+// не только максимум с момента старта), пишем в лог при устойчивом превышении и
+// отдаём наружу признак перегрузки, по которому клиент может уйти на соседний
+// релей.
+const LAG_WINDOW = 120; // минута наблюдений при пробе раз в 500 мс
+// Порог взят от обещания продукта, а не от возможностей железа: задержка выше
+// четверти секунды уже заметна человеку как «сообщение думает».
+const LAG_ALERT_MS = Number(process.env.RELAY_LAG_ALERT_MS) || 250;
+// Сколько подряд проб должно превысить порог, прежде чем считать это перегрузкой,
+// а не одним тяжёлым кадром. Три пробы — полторы секунды.
+const LAG_ALERT_STREAK = Number(process.env.RELAY_LAG_ALERT_STREAK) || 3;
+const LAG_LOG_INTERVAL_MS = 60000; // не чаще раза в минуту, иначе лог сам станет нагрузкой
+
+const eventLoopLag = { last: 0, max: 0, samples: [], streak: 0, overloaded: false, loggedAt: 0 };
+let eventLoopProbeAt = Date.now();
+
+/** p99 задержки по окну наблюдений. Ноль, если замеров ещё нет. */
+function eventLoopLagP99() {
+  const list = eventLoopLag.samples;
+  if (!list.length) return 0;
+  const sorted = [...list].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * 0.99) - 1))];
+}
+
+/** Считает ли узел себя перегруженным прямо сейчас. */
+function relayOverloaded() {
+  return eventLoopLag.overloaded;
+}
+
+const eventLoopTimer = setInterval(() => {
+  const now = Date.now();
+  const lag = Math.max(0, now - eventLoopProbeAt - EVENT_LOOP_PROBE_MS);
+  eventLoopProbeAt = now;
+  eventLoopLag.last = lag;
+  if (lag > eventLoopLag.max) eventLoopLag.max = lag;
+  eventLoopLag.samples.push(lag);
+  if (eventLoopLag.samples.length > LAG_WINDOW) eventLoopLag.samples.shift();
+
+  // Одна тяжёлая операция — это норма (кто-то отправил видео). Перегрузка — это
+  // когда цикл не успевает разгрестись НЕСКОЛЬКО проб подряд.
+  eventLoopLag.streak = lag >= LAG_ALERT_MS ? eventLoopLag.streak + 1 : 0;
+  const overloaded = eventLoopLag.streak >= LAG_ALERT_STREAK;
+  if (overloaded && !eventLoopLag.overloaded) {
+    console.warn(
+      `[lag] узел перегружен: задержка цикла ${lag} мс ${eventLoopLag.streak} проб подряд ` +
+        `(порог ${LAG_ALERT_MS} мс, p99 ${eventLoopLagP99()} мс). Клиентам сообщено.`
+    );
+    eventLoopLag.loggedAt = now;
+  } else if (overloaded && now - eventLoopLag.loggedAt >= LAG_LOG_INTERVAL_MS) {
+    console.warn(`[lag] перегрузка продолжается: p99 ${eventLoopLagP99()} мс`);
+    eventLoopLag.loggedAt = now;
+  } else if (!overloaded && eventLoopLag.overloaded) {
+    console.warn(`[lag] перегрузка снята: p99 ${eventLoopLagP99()} мс`);
+  }
+  eventLoopLag.overloaded = overloaded;
+}, EVENT_LOOP_PROBE_MS);
+// Метрика не должна удерживать процесс от штатного завершения.
+if (typeof eventLoopTimer.unref === 'function') eventLoopTimer.unref();
 
 function renderMetrics() {
   const st = store.stats();
@@ -248,11 +371,55 @@ function renderMetrics() {
   metric('licno_messages_delivered_online_total', 'counter', 'Envelopes pushed to an online recipient since start.', counters.deliveredOnline);
   metric('licno_messages_queued_offline_total', 'counter', 'Envelopes queued for an offline recipient since start.', counters.queuedOffline);
   metric('licno_messages_dropped_total', 'counter', 'Envelopes dropped (recipient queue full, no own slots) since start.', counters.dropped);
+  metric('licno_throttled_total', 'counter', 'Times a connection was paused for exceeding the byte budget.', counters.throttled);
+  metric('licno_abusive_closed_total', 'counter', 'Connections closed for sustained byte-budget abuse.', counters.abusive);
   metric('licno_messages_acked_total', 'counter', 'Envelopes confirmed received by recipients since start.', counters.acked);
   metric('licno_push_sent_total', 'counter', 'Wake-up pushes sent since start.', counters.pushes);
   metric('licno_auth_success_total', 'counter', 'Successful client authentications since start.', counters.authOk);
   metric('process_resident_memory_bytes', 'gauge', 'Resident set size of the relay process.', mem.rss);
   metric('nodejs_heap_used_bytes', 'gauge', 'V8 heap used by the relay process.', mem.heapUsed);
+  // ПРФ-3: пока цикл занят, узел не обслуживает НИКОГО. Рост max — прямой
+  // признак того, что синхронная работа (крупный конверт на диск, тяжёлый
+  // запрос) выросла до заметной для пользователей паузы.
+  metric(
+    'licno_event_loop_lag_ms',
+    'gauge',
+    'Задержка event-loop за последний интервал: время, которое цикл был занят и никого не обслуживал.',
+    eventLoopLag.last
+  );
+  metric(
+    'licno_event_loop_lag_max_ms',
+    'gauge',
+    'Максимальная задержка event-loop с момента старта процесса.',
+    eventLoopLag.max
+  );
+  // АУД-06: максимум с момента старта не годится для алерта — один тяжёлый кадр
+  // в прошлую пятницу навсегда делает его красным. p99 по скользящему окну
+  // показывает, как узел живёт СЕЙЧАС, и именно на него вешается порог.
+  metric(
+    'licno_event_loop_lag_p99_ms',
+    'gauge',
+    'p99 задержки event-loop по скользящему окну. Порог для алерта: см. licno_overloaded.',
+    eventLoopLagP99()
+  );
+  metric(
+    'licno_overloaded',
+    'gauge',
+    'Узел считает себя перегруженным (задержка цикла держится выше порога). Клиентам сообщается, чтобы они ушли на соседний релей.',
+    relayOverloaded() ? 1 : 0
+  );
+  metric(
+    'licno_overload_notices_total',
+    'counter',
+    'Сколько раз узел сообщил клиенту о перегрузке.',
+    counters.overloaded
+  );
+  metric(
+    'licno_oversized_frames_total',
+    'counter',
+    'Кадров отвергнуто по размеру ДО разбора (АУД-06): их содержимое узел даже не читал.',
+    counters.oversized
+  );
   return lines.join('\n') + '\n';
 }
 
@@ -433,9 +600,17 @@ function broadcastAccount(accountPk, frame) {
 }
 // ip -> число активных соединений (за Caddy берём X-Forwarded-For)
 const ipConns = new Map();
-// pubkey -> время последнего message-пуша (троттлинг уведомлений)
+// Окно троттлинга message-пушей (см. messagePushGate ниже).
 const PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_PUSH_INTERVAL_MS) || 20000;
-const lastPushAt = new Map();
+// ПРФ-4: троттлинг раньше был на ПОЛУЧАТЕЛЯ целиком — пять сообщений из трёх
+// разных чатов за 20 секунд давали ОДИН пуш, и остальные чаты не будили
+// устройство вовсе. Теперь окно считается на пару «получатель + чат», а от
+// усиления флуда (много отправителей → много пушей) защищает потолок на
+// получателя в том же окне. Логика — в чистом server/notifications.js.
+const messagePushGate = createPushGate({
+  windowMs: PUSH_MIN_INTERVAL_MS,
+  maxPerRecipient: Number(process.env.RELAY_PUSH_MAX_PER_WINDOW) || undefined,
+});
 // СРВ-3: троттлинг ЗВОНКОВЫХ пушей. Раньше call-пуш (high-priority «Входящий
 // звонок») не троттлился вообще — зная адрес жертвы, атакующий устраивал шквал
 // звонковых уведомлений (спам/разряд батареи). Интервал мягче обычного (звонить
@@ -443,8 +618,7 @@ const lastPushAt = new Map();
 const CALL_PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_CALL_PUSH_INTERVAL_MS) || 5000;
 const lastCallPushAt = new Map();
 setInterval(() => {
-  const cutoff = Date.now() - 10 * PUSH_MIN_INTERVAL_MS;
-  for (const [pk, t] of lastPushAt) if (t < cutoff) lastPushAt.delete(pk);
+  messagePushGate.sweep(Date.now());
   const ccut = Date.now() - 10 * CALL_PUSH_MIN_INTERVAL_MS;
   for (const [pk, t] of lastCallPushAt) if (t < ccut) lastCallPushAt.delete(pk);
 }, 60000).unref();
@@ -496,10 +670,10 @@ function verifySignature(nonceB64, signatureB64, signPublicKeyB64) {
   try {
     const sig = naclUtil.decodeBase64(signatureB64);
     const pk = naclUtil.decodeBase64(signPublicKeyB64);
-    if (nacl.sign.detached.verify(naclUtil.decodeUTF8(CHALLENGE_SIG_PREFIX + nonceB64), sig, pk)) {
+    if (ed25519.verify(naclUtil.decodeUTF8(CHALLENGE_SIG_PREFIX + nonceB64), sig, pk)) {
       return true;
     }
-    return nacl.sign.detached.verify(naclUtil.decodeBase64(nonceB64), sig, pk);
+    return ed25519.verify(naclUtil.decodeBase64(nonceB64), sig, pk);
   } catch (e) {
     return false;
   }
@@ -578,7 +752,7 @@ function loadOrCreateRelaySignKeys() {
 }
 const RELAY_KEYS = loadOrCreateRelaySignKeys();
 function signRelayAuth(cnonce) {
-  return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
+  return naclUtil.encodeBase64(ed25519.sign(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
 }
 
 // --- VAPID для web-push: одна P2P-синхронизируемая пара на весь флот --------
@@ -766,13 +940,26 @@ if (TURN_HOST) {
   // Встроенный coturn стартуем только по флагу (Docker-образ) — bare-metal нет.
   if (process.env.RELAY_EMBED_COTURN) startEmbeddedCoturn();
 } else {
-  // Без TURN_HOST TURN не анонсируется (только STUN) — поведение как раньше.
   turnSecret = process.env.TURN_SECRET || null;
+  // БЕЗ-1: молчаливого отката на чужой STUN больше нет, поэтому оператор должен
+  // узнать об этом при старте, а не по жалобам на несобирающиеся звонки.
+  if (!PUBLIC_STUN.length) {
+    console.warn(
+      '[turn] TURN_HOST не задан: релей не выдаёт ни STUN, ни TURN. Звонки за NAT не соберутся.\n' +
+        '       Поднимите coturn на этом узле (TURN_HOST=<адрес> + RELAY_EMBED_COTURN=1) —\n' +
+        '       он же раздаёт STUN на порту 3478. Внешний STUN, если он вам осознанно нужен,\n' +
+        '       задаётся явно: RELAY_PUBLIC_STUN=stun:stun.example.org:3478'
+    );
+  }
 }
 
 // --- X3DH prekeys ----------------------------------------------------------
 // Формат подписи SPK должен совпадать с клиентским (src/crypto.js).
 const SPK_SIG_PREFIX = 'licno-spk-v1|';
+const SPK_PQ_SIG_PREFIX = 'licno-spk-v2|'; // БЕЗ-3: подпись покрывает и ML-KEM-ключ
+// Публичный ключ ML-KEM-768 — 1184 байта, то есть ~1580 символов base64.
+// Потолок с запасом: он же отсекает попытку раздуть таблицу prekey мусором.
+const MAX_SPK_PQ_B64 = 2048;
 const MAX_OTPS_PER_USER = 100;
 // M2: троттлинг выдачи prekey на СОЕДИНЕНИЕ. Без него авторизованный клиент за
 // пару секунд (rate-limit 80 кадров/с) высасывал все OTP жертвы по её адресу,
@@ -799,8 +986,15 @@ const isB64Field = (s, max = 128) => typeof s === 'string' && s.length > 0 && s.
 
 function verifySpkSignature(spkObj, signPublicKeyB64) {
   try {
-    return nacl.sign.detached.verify(
-      naclUtil.decodeUTF8(SPK_SIG_PREFIX + spkObj.id + '|' + spkObj.pub),
+    // БЕЗ-3: у бандла с постквантовым ключом подпись покрывает и его, поэтому
+    // формат подписываемой строки другой. Релей проверяет это не ради себя (он
+    // и так не может подделать бандл — клиент сверяет подпись сам), а чтобы не
+    // хранить заведомо негодные бандлы и не отдавать их вместо рабочих.
+    const message = spkObj.pq
+      ? SPK_PQ_SIG_PREFIX + spkObj.id + '|' + spkObj.pub + '|' + spkObj.pq
+      : SPK_SIG_PREFIX + spkObj.id + '|' + spkObj.pub;
+    return ed25519.verify(
+      naclUtil.decodeUTF8(message),
       naclUtil.decodeBase64(spkObj.sig),
       naclUtil.decodeBase64(signPublicKeyB64)
     );
@@ -939,7 +1133,28 @@ function sendImmediate(ws, obj) {
   }
 }
 
-function send(ws, obj) {
+// АУД-12: сколько весит кадр — без повторной сериализации.
+//
+// Раньше здесь стояла полная JSON.stringify(obj) ТОЛЬКО ради длины: результат
+// выбрасывался, а тот же кадр упаковывался в MessagePack заново в
+// flushFrameBatch. То есть каждый батчуемый кадр сериализовался дважды, на
+// самом горячем пути однопоточного процесса.
+//
+// Кадры-квитанции (ack/delivered) состоят из пары коротких идентификаторов и
+// заведомо меньше порога — измерять их нечего. У кадра `message` вес задаёт
+// конверт, и его размер уже посчитан при постановке в очередь (store.bytes),
+// поэтому вызывающий передаёт его подсказкой. Полная сериализация остаётся
+// только для непредвиденного случая — чтобы поведение не менялось молча.
+const RECEIPT_FRAMES = new Set(['ack', 'delivered', 'binary-ack', 'binary-delivered']);
+const RECEIPT_FRAME_BYTES = 512; // с запасом: id + ref + флаги
+
+function frameBatchBytes(obj, sizeHint) {
+  if (Number.isFinite(sizeHint) && sizeHint >= 0) return sizeHint;
+  if (RECEIPT_FRAMES.has(obj.type)) return RECEIPT_FRAME_BYTES;
+  return JSON.stringify(obj).length;
+}
+
+function send(ws, obj, sizeHint) {
   if (ws && ws.readyState === ws.OPEN) {
     if (
       ws.frameBatchV1 &&
@@ -948,7 +1163,7 @@ function send(ws, obj) {
       typeof obj === 'object' &&
       BATCHABLE_SERVER_FRAMES.has(obj.type)
     ) {
-      const encodedLength = JSON.stringify(obj).length;
+      const encodedLength = frameBatchBytes(obj, sizeHint);
       if (encodedLength <= 64 * 1024) {
         ws.frameBatchQueue.push(obj);
         ws.frameBatchBytes += encodedLength;
@@ -1041,7 +1256,9 @@ function flushQueue(pubkey, ws, onComplete) {
       }
       const item = store.getItem(ids[i]);
       i += 1;
-      if (item) send(ws, queuedMessageFrame(item));
+      // АУД-12: размер конверта известен из очереди — сериализовать кадр ради
+      // одной длины больше не нужно.
+      if (item) send(ws, queuedMessageFrame(item), item.bytes);
     }
     if (onComplete) onComplete();
   }
@@ -1082,6 +1299,7 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
     deviceCertificate: metadata.deviceCertificate,
     deviceRoster: metadata.deviceRoster,
     envelope,
+    envelopeJson: metadata.envelopeJson, // АУД-06: уже построен вызывающим
     silent,
     callPush,
     ts: Date.now(),
@@ -1102,7 +1320,7 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   // его сразу, а не откладываем на 10 мс в пакет, чтобы `queued:false` означал
   // реальную передачу в WebSocket. Для сохранённого кадра пакет безопасен — при
   // обрыве до flush он останется в очереди и придёт после reconnect.
-  if (ws && (stored ? send(ws, liveFrame) : sendImmediate(ws, liveFrame))) {
+  if (ws && (stored ? send(ws, liveFrame, metadata.envelopeBytes) : sendImmediate(ws, liveFrame))) {
     counters.deliveredOnline += 1;
     return { queued: false, id };
   }
@@ -1133,14 +1351,15 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
     return { queued: true, id };
   }
   if (silent) return { queued: true, id }; // control message: deliver, no push
-  // Троттлинг: не чаще одного message-пуша получателю за PUSH_MIN_INTERVAL_MS.
-  // Дубли одного сообщения (веер по релеям от старых клиентов) и бурсты
-  // сообщений не превращаются в очередь уведомлений; на устройстве они и так
-  // схлопываются по tag (см. push.js), это экономит и запросы к FCM.
-  if (token && Date.now() - (lastPushAt.get(to) || 0) >= PUSH_MIN_INTERVAL_MS) {
-    lastPushAt.set(to, Date.now());
+  // ПРФ-4: троттлинг считается на пару «получатель + чат», а не на получателя
+  // целиком. Раньше сообщения из РАЗНЫХ чатов в одном 20-секундном окне давали
+  // один пуш — остальные чаты устройство не будили вовсе, и это читалось как
+  // потерянные сообщения. Дубли одного сообщения (веер по релеям) по-прежнему
+  // схлопываются: у них общий и получатель, и чат.
+  const chatTag = chatNotificationTag(metadata.fromAccount || from);
+  if (token && messagePushGate.allow(to, chatTag, Date.now())) {
     counters.pushes += 1;
-    sendPush(token, metadata.notificationId || id).then(onInvalid);
+    sendPush(token, metadata.notificationId || id, chatTag).then(onInvalid);
   }
   return { queued: true, id };
 }
@@ -1218,6 +1437,37 @@ function rateLimited(ws) {
   }
   ws.rateCount += 1;
   return ws.rateCount > RATE_MAX_FRAMES;
+}
+
+/**
+ * БЕЗ-5: учёт входящего потока. Возвращает true, если соединение пора рвать
+ * (длительное превышение = абуз). При обычном превышении не рвёт и не отказывает,
+ * а перестаёт читать сокет до конца окна: TCP-окно закрывается, отправитель
+ * притормаживает сам, уже принятый кадр обрабатывается как обычно.
+ */
+function byteLimited(ws, bytes) {
+  const gate = byteGate(ws.byteState, Date.now(), bytes, RATE_WINDOW_MS, RATE_MAX_BYTES, RATE_ABUSE_WINDOWS);
+  ws.byteState = gate.state;
+  if (gate.abusive) {
+    counters.abusive += 1;
+    return true;
+  }
+  if (gate.pauseMs > 0 && !ws.throttledUntil) {
+    counters.throttled += 1;
+    ws.throttledUntil = Date.now() + gate.pauseMs;
+    try {
+      ws.pause();
+    } catch (e) {}
+    const timer = setTimeout(() => {
+      ws.throttledUntil = 0;
+      try {
+        ws.resume();
+      } catch (e) {}
+    }, gate.pauseMs);
+    // Придержанный сокет не должен удерживать процесс от штатного завершения.
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+  return false;
 }
 
 function closeRevokedDevice(devicePk, accountPk) {
@@ -1328,6 +1578,8 @@ wss.on('connection', (ws, req) => {
   ws.frameBatchTimer = null;
   ws.rateStart = Date.now();
   ws.rateCount = 0;
+  ws.byteState = null; // БЕЗ-5
+  ws.throttledUntil = 0;
   ws.on('pong', () => (ws.isAlive = true));
   // СРВ-4: без слушателя 'error' ошибка сокета (ECONNRESET при обрыве, превышение
   // maxPayload) бросается из EventEmitter → uncaughtException. Глобальный backstop
@@ -1353,6 +1605,13 @@ wss.on('connection', (ws, req) => {
       ws.terminate();
       return;
     }
+    // БЕЗ-5: байтовый потолок. Кадр всё равно обрабатываем (иначе легитимный
+    // отправитель потеряет чанк вложения) — притормаживание делает byteLimited.
+    if (byteLimited(ws, raw.length || 0)) {
+      send(ws, { type: 'error', error: 'byte rate limit' });
+      ws.terminate();
+      return;
+    }
 
     if (isBinary) {
       try {
@@ -1364,6 +1623,18 @@ wss.on('connection', (ws, req) => {
         }
         send(ws, { type: 'binary-error', error: 'invalid binary frame' });
       }
+      return;
+    }
+
+    // АУД-06: отвергаем заведомо негодный кадр ДО toString и JSON.parse. Оба
+    // прохода идут по всему буферу и на 33 мегабайтах занимают однопоточный узел
+    // целиком — при том что кадр такого размера всё равно будет отвергнут ниже.
+    const frameLimit = ws.authed ? MAX_JSON_FRAME_BYTES : MAX_PREAUTH_FRAME_BYTES;
+    if (raw.length > frameLimit) {
+      counters.oversized += 1;
+      send(ws, { type: 'error', error: 'frame too large' });
+      // До аутентификации это заведомо не наш клиент: рвём, а не переписываемся.
+      if (!ws.authed) return ws.terminate();
       return;
     }
 
@@ -1600,6 +1871,12 @@ function handleFrameSafely(ws, msg) {
       // клиент по этому числу решает, пора ли выгрузить свежую пачку.
       // vapidPublicKey: web-push (UnifiedPush) публичный ключ релея — клиент передаёт
       // его в expo-unified-push registerDevice(). null, если web-push не настроен.
+      // АУД-06: `overloaded` — честный ответ узла на вопрос «тебе сейчас тяжело?».
+      // Раньше сказать это было нечем: клиент держит пул релеев и умеет
+      // переключаться, но признака, по которому стоит предпочесть соседа, у него
+      // не было — перегруженный узел выглядел точно так же, как свободный, и
+      // получал ровно столько же нагрузки. Старый клиент поле игнорирует.
+      if (relayOverloaded()) counters.overloaded += 1;
       return send(ws, {
         type: 'ready',
         queued: flushed + flushedBinary,
@@ -1608,6 +1885,7 @@ function handleFrameSafely(ws, msg) {
         protocol: RELAY_PROTOCOL,
         capabilities: RELAY_CAPABILITIES,
         maxLinkedDevices: MAX_ACTIVE_DEVICES,
+        overloaded: relayOverloaded(),
       });
     }
 
@@ -1620,7 +1898,12 @@ function handleFrameSafely(ws, msg) {
     // «тихо зависшего» при смене сети (WS-фреймы ping ему не видны из JS).
     if (msg.type === 'ping') {
       if (ws.deviceId) store.touchDevice(ws.pubkey, Date.now());
-      return send(ws, { type: 'pong' });
+      // АУД-06: перегрузка приходит и уходит уже после подключения, поэтому
+      // признак едет и в ответе на heartbeat — иначе клиент узнавал бы о ней
+      // только при следующем реконнекте, то есть почти никогда.
+      const busy = relayOverloaded();
+      if (busy) counters.overloaded += 1;
+      return send(ws, busy ? { type: 'pong', overloaded: true } : { type: 'pong' });
     }
 
     // --- everything past here requires authentication ---
@@ -1700,6 +1983,11 @@ function handleFrameSafely(ws, msg) {
       if (!spkObj || !isB64Field(spkObj.id, 32) || !isB64Field(spkObj.pub) || !isB64Field(spkObj.sig)) {
         return send(ws, { type: 'error', error: 'prekeys-put requires bundle.spk {id,pub,sig}' });
       }
+      // БЕЗ-3: постквантовый ключ необязателен, но если объявлен — обязан быть
+      // корректным base64 разумного размера. Подпись над ним проверяется ниже.
+      if (spkObj.pq !== undefined && !isB64Field(spkObj.pq, MAX_SPK_PQ_B64)) {
+        return send(ws, { type: 'error', error: 'bad bundle.spk.pq' });
+      }
       const boundSpkKey = store.getSignKey(ws.pubkey);
       if (!boundSpkKey || !verifySpkSignature(spkObj, boundSpkKey)) {
         return send(ws, { type: 'error', error: 'bad prekey signature' });
@@ -1708,9 +1996,22 @@ function handleFrameSafely(ws, msg) {
         .filter((k) => k && isB64Field(k.id, 32) && isB64Field(k.pub))
         .slice(0, MAX_OTPS_PER_USER)
         .map((k) => ({ id: k.id, pub: k.pub }));
-      store.setSpk(ws.pubkey, { id: spkObj.id, pub: spkObj.pub, sig: spkObj.sig });
+      store.setSpk(ws.pubkey, { id: spkObj.id, pub: spkObj.pub, sig: spkObj.sig, pq: spkObj.pq });
       store.replaceOtps(ws.pubkey, opks);
       return send(ws, { type: 'prekeys-ok', otps: store.countOtps(ws.pubkey) });
+    }
+
+    // АУД-13: сколько СВОИХ одноразовых prekey у релея осталось.
+    //
+    // Раньше это число сообщалось только в `ready`, то есть узнать его можно было
+    // лишь переподключившись. Телефон, который сутки держит соединение, пул не
+    // пополнял никогда — а вычерпать его можно тридцатью ключами в минуту на
+    // адрес. X3DH при этом продолжает работать через подписанный prekey, forward
+    // secrecy не теряется; теряется дополнительный одноразовый слой для всех, кто
+    // напишет вам первым в это окно. Кадр дешёвый (один индексный COUNT) и не
+    // раскрывает ничего, чего клиент не знает про себя сам.
+    if (msg.type === 'prekeys-count') {
+      return send(ws, { type: 'prekeys-count', otps: store.countOtps(ws.pubkey) });
     }
 
     if (msg.type === 'prekeys-get') {
@@ -1810,7 +2111,18 @@ function handleFrameSafely(ws, msg) {
       if (msg.to.length > MAX_ADDR_LEN) {
         return send(ws, { type: 'error', error: 'invalid recipient' });
       }
-      const size = Buffer.byteLength(JSON.stringify(msg.envelope));
+      // АУД-06: сериализуем конверт ОДИН раз — и для проверки размера, и для
+      // хранения. Раньше он сериализовался здесь ради длины, строка тут же
+      // выбрасывалась, а store.enqueue строил её заново: на конверте в семь
+      // мегабайт это лишний полный проход по памяти в однопоточном процессе, то
+      // есть пауза для всех пользователей узла.
+      let envelopeJson;
+      try {
+        envelopeJson = JSON.stringify(msg.envelope);
+      } catch (e) {
+        return send(ws, { type: 'error', error: 'invalid envelope' });
+      }
+      const size = Buffer.byteLength(envelopeJson);
       if (size > MAX_ENVELOPE_BYTES) {
         return send(ws, { type: 'error', error: 'envelope too large' });
       }
@@ -1824,6 +2136,8 @@ function handleFrameSafely(ws, msg) {
         {
           ...senderMetadata(ws),
           notificationId: typeof msg.ref === 'string' ? msg.ref.slice(0, 160) : undefined,
+          envelopeJson,
+          envelopeBytes: size,
         }
       );
       // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
@@ -2070,12 +2384,36 @@ setInterval(() => {
   } catch (e) {}
 }, 3600 * 1000).unref();
 
+// АУД-06: тела крупных конвертов пишутся вне event-loop, поэтому перед выходом
+// начатые записи надо дождаться — иначе конверт, чья запись шла в момент
+// SIGTERM, потерял бы тело, а строка очереди осталась бы. Ждём ограниченно:
+// зависшая файловая система не должна мешать перезапуску узла.
+const SHUTDOWN_FLUSH_MS = 5000;
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   stopEmbeddedCoturn();
-  try {
-    store.close();
-  } catch (e) {}
-  process.exit(0);
+  const finish = () => {
+    try {
+      store.close();
+    } catch (e) {}
+    process.exit(0);
+  };
+  const flush = typeof store.flushPendingBlobs === 'function' ? store.flushPendingBlobs() : null;
+  if (!flush) return finish();
+  const timer = setTimeout(finish, SHUTDOWN_FLUSH_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  flush.then(
+    () => {
+      clearTimeout(timer);
+      finish();
+    },
+    () => {
+      clearTimeout(timer);
+      finish();
+    }
+  );
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

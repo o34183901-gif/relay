@@ -802,6 +802,91 @@ function unitTests() {
   u('coturn: userdb в writable-путь (не /var/lib/turn)', cfgPid.includes('userdb=/data/turndb'));
   u('coturn: без опций строк pidfile/userdb нет', !cfgNoHost.includes('pidfile=') && !cfgNoHost.includes('userdb='));
 
+  // БЕЗ-5: byteGate — потолок ПОТОКА байт на соединение.
+  const W2 = 1000, MAXB = 1000, STRIKES = 3;
+  const bg = (state, now, bytes) => dir.byteGate(state, now, bytes, W2, MAXB, STRIKES);
+  // В пределах бюджета — ни паузы, ни страйков.
+  let b = bg(null, 0, 400);
+  u('byteGate: в бюджете паузы нет', b.pauseMs === 0 && b.abusive === false);
+  b = bg(b.state, 100, 400);
+  u('byteGate: байты накапливаются в окне', b.state.bytes === 800 && b.pauseMs === 0);
+  // Превышение -> пауза до конца окна, но НЕ разрыв.
+  b = bg(b.state, 200, 400);
+  u('byteGate: превышение даёт паузу', b.pauseMs === 800);
+  u('byteGate: одно превышение — не абуз', b.abusive === false);
+  u('byteGate: страйк начислен', b.state.strikes === 1);
+  // Страйк — РАЗ ЗА ОКНО: пачка кадров сверх лимита не сжигает серию мгновенно.
+  b = bg(b.state, 300, 400);
+  b = bg(b.state, 400, 400);
+  b = bg(b.state, 500, 400);
+  u('byteGate: страйк не растёт внутри одного окна', b.state.strikes === 1);
+  u('byteGate: пачка кадров сверх лимита не рвёт связь', b.abusive === false);
+  // Непрерывное превышение окно за окном -> абуз.
+  b = bg(b.state, 1000, 2000);
+  u('byteGate: второе окно подряд — страйк 2', b.state.strikes === 2 && b.abusive === false);
+  b = bg(b.state, 2000, 2000);
+  u('byteGate: третье окно подряд — абуз', b.state.strikes === 3 && b.abusive === true);
+  // Спокойное окно обнуляет серию: всплеск при отправке файла не копится вечно.
+  let calm = bg(null, 0, 2000); // страйк 1
+  u('byteGate: всплеск даёт страйк', calm.state.strikes === 1);
+  calm = bg(calm.state, 1000, 10); // окно закрылось превышенным -> серия жива
+  u('byteGate: серия переживает закрытие превышенного окна', calm.state.strikes === 1);
+  calm = bg(calm.state, 2000, 10); // а это окно прошло тихо -> серия сброшена
+  u('byteGate: тихое окно обнуляет серию', calm.state.strikes === 0);
+  // Пауза не бывает отрицательной и не превышает окно.
+  const late = bg({ start: 0, bytes: 2000, strikes: 1 }, 999, 1);
+  u('byteGate: пауза в пределах окна', late.pauseMs > 0 && late.pauseMs <= W2);
+  const edge = bg({ start: 0, bytes: 2000, strikes: 1 }, 1000, 1);
+  u('byteGate: на границе окно уже новое', edge.state.bytes === 1 && edge.pauseMs === 0);
+  // Мусорный размер кадра не должен уводить счётчик в минус.
+  const neg = bg({ start: 0, bytes: 100, strikes: 0 }, 10, -5000);
+  u('byteGate: отрицательный размер игнорируется', neg.state.bytes === 100);
+  // Ровно на потолке — ещё не превышение (границу не рубим).
+  const exact = bg(null, 0, MAXB);
+  u('byteGate: ровно потолок — не превышение', exact.pauseMs === 0 && exact.state.strikes === 0);
+  u('byteGate: потолок + 1 байт — превышение', bg(exact.state, 1, 1).pauseMs > 0);
+
+  // БЕЗ-1: релей отдаёт клиенту СВОЙ STUN/TURN — и ничей больше.
+  const hmac = (username) => `sig(${username})`;
+  const ice = dir.buildIceServers({
+    turnSecret: 'SEKRET',
+    turnHost: '203.0.113.7',
+    publicStun: ['stun:stun.example.org:3478'],
+    now: 1_700_000_000_000,
+    hmac,
+  });
+  u('ICE: свой STUN первым', ice[0].urls === 'stun:203.0.113.7:3478');
+  u('ICE: свой TURN по udp и tcp', ice[1].urls.length === 2 && ice[1].urls.every((x) => x.startsWith('turn:203.0.113.7:3478')));
+  u('ICE: учётка эфемерная (срок в username)', /^\d+:licno$/.test(ice[1].username));
+  u('ICE: срок = now + 1ч', ice[1].username === `${1_700_000_000 + 3600}:licno`);
+  u('ICE: credential — HMAC от username', ice[1].credential === `sig(${ice[1].username})`);
+  u('ICE: секрет TURN наружу не уходит', !JSON.stringify(ice).includes('SEKRET'));
+  // Свой coturn настроен -> внешний STUN не подмешивается, даже если задан.
+  u('ICE: при своём TURN чужой STUN не добавляется', !JSON.stringify(ice).includes('stun.example.org'));
+
+  // Своего TURN нет -> только то, что оператор разрешил ЯВНО.
+  const iceNoTurn = dir.buildIceServers({ publicStun: ['stun:stun.example.org:3478'], now: 0, hmac });
+  u('ICE: без TURN отдаётся только явный STUN оператора', iceNoTurn.length === 1 && iceNoTurn[0].urls === 'stun:stun.example.org:3478');
+  // Ключевая регрессия: по умолчанию не отдаётся НИЧЕГО. Раньше здесь был Google.
+  u('ICE: по умолчанию список пуст', dir.buildIceServers({ now: 0, hmac }).length === 0);
+  u('ICE: секрет без хоста не включает TURN', dir.buildIceServers({ turnSecret: 'S', now: 0, hmac }).length === 0);
+  u('ICE: хост без секрета не включает TURN', dir.buildIceServers({ turnHost: 'h', now: 0, hmac }).length === 0);
+  for (const bad of [undefined, null, {}, { publicStun: null }, { publicStun: 'stun:x' }]) {
+    u(`ICE: мусорный ввод ${JSON.stringify(bad)} -> пусто`, dir.buildIceServers(bad ? { ...bad, hmac } : bad).length === 0);
+  }
+  // Ни при какой конфигурации в списке не должно оказаться зашитого чужого STUN.
+  const allIce = JSON.stringify([ice, iceNoTurn, dir.buildIceServers({ now: 0, hmac })]);
+  for (const forbidden of ['google', 'stun.l.', 'twilio', 'cloudflare']) {
+    u(`ICE: нет зашитого ${forbidden}`, !allIce.includes(forbidden));
+  }
+
+  // parsePublicStun: пропускает только stun:/stuns:, мусор отбрасывает молча.
+  u('STUN-парсер: пусто по умолчанию', dir.parsePublicStun('').length === 0);
+  u('STUN-парсер: пусто при undefined', dir.parsePublicStun(undefined).length === 0);
+  u('STUN-парсер: разбирает список через запятую', dir.parsePublicStun('stun:a:3478, stuns:b:5349').length === 2);
+  u('STUN-парсер: обрезает пробелы', dir.parsePublicStun('  stun:a:3478  ')[0] === 'stun:a:3478');
+  u('STUN-парсер: отбрасывает не-STUN схемы', dir.parsePublicStun('turn:a,http://b,wss://c,a.b.c').length === 0);
+
   // H-4: rateGate — скользящее окно для троттлинга выдачи OTP по адресу.
   let st = null;
   const W = 1000, MAX = 3;

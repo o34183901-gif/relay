@@ -207,6 +207,98 @@ function rateGate(state, now, windowMs, max) {
   return { allow: s.count < max, state: s };
 }
 
+/**
+ * БЕЗ-5: скользящее окно по БАЙТАМ (в дополнение к rateGate, считающему кадры).
+ *
+ * Кадровый лимит сам по себе дыряв: 80 кадров в секунду по 300 КБ — это 24 МБ/с
+ * с одного сокета, не превысив ни одного лимита. Хуже того, если получатель
+ * онлайн, конверты не ложатся в очередь и квоты хранения (на пользователя, на
+ * отправителя, на общий объём) вообще не срабатывают. Один клиент насыщал канал
+ * и однопоточный event-loop релея, а страдали все остальные.
+ *
+ * Реакция на превышение здесь — НЕ отказ и НЕ разрыв. Отклонённый кадр означает
+ * потерянный чанк вложения, то есть битый файл у легитимного пользователя,
+ * который просто быстро подключён. Вызывающий вместо этого перестаёт читать
+ * сокет на pauseMs (TCP-окно закрывается, отправитель притормаживает сам), а
+ * уже принятый кадр обрабатывает как обычно — ничего не теряется.
+ *
+ * Разрыв остаётся только для настоящего абуза: `abusive` выставляется, когда
+ * лимит превышен maxStrikes окон подряд. Страйк начисляется РАЗ ЗА ОКНО, а не
+ * за кадр, иначе пачка кадров сожгла бы всю серию мгновенно.
+ *
+ *   state = { start, bytes, strikes } | null
+ *   -> { state, pauseMs, abusive }
+ */
+function byteGate(state, now, bytes, windowMs, maxBytes, maxStrikes) {
+  let s = state;
+  if (!s || now - s.start >= windowMs) {
+    // Окно закрылось. Серию обнуляем, только если оно прошло БЕЗ превышения:
+    // иначе непрерывный флуд сбрасывал бы себе счётчик каждым новым окном.
+    s = { start: now, bytes: 0, strikes: s && s.bytes > maxBytes ? s.strikes : 0 };
+  }
+  const wasOver = s.bytes > maxBytes;
+  const nextBytes = s.bytes + (bytes > 0 ? bytes : 0);
+  const nowOver = nextBytes > maxBytes;
+  const strikes = nowOver && !wasOver ? s.strikes + 1 : s.strikes;
+  return {
+    state: { start: s.start, bytes: nextBytes, strikes },
+    pauseMs: nowOver ? Math.max(0, windowMs - (now - s.start)) : 0,
+    abusive: nowOver && strikes >= maxStrikes,
+  };
+}
+
+// Порт coturn: и STUN, и TURN на одном порту (см. coturnConfigText).
+const TURN_PORT = 3478;
+// Срок жизни эфемерных REST-учёток coturn.
+const TURN_TTL_SEC = 3600;
+
+/**
+ * БЕЗ-1: список ICE, который релей отдаёт клиенту. Чистая функция — без сети,
+ * без process.env, без Date.now(): всё приходит параметрами, чтобы результат
+ * можно было проверить тестом.
+ *
+ *   buildIceServers({ turnSecret, turnHost, publicStun, now, hmac })
+ *
+ * Свой coturn настроен -> отдаём свой STUN и свой TURN с эфемерной учёткой
+ * (долгоживущего пароля в приложении нет). Не настроен -> отдаём РОВНО то, что
+ * оператор разрешил явно через RELAY_PUBLIC_STUN, а по умолчанию — ничего.
+ *
+ * Раньше на месте последней ветки был зашитый stun.l.google.com: при каждом
+ * звонке обе стороны сообщали Google свой реальный IP и точное время. Медиа
+ * шифруется, но факт разговора, его время и география — нет; для продукта,
+ * обещающего отсутствие слежки, это противоречие. Молчаливого отката на чужой
+ * сервер больше не существует ни при какой конфигурации.
+ */
+function buildIceServers(opts) {
+  const o = opts || {};
+  const turnHost = o.turnHost;
+  const turnSecret = o.turnSecret;
+  const port = o.port || TURN_PORT;
+  if (turnSecret && turnHost) {
+    const username = `${Math.floor((o.now || 0) / 1000) + (o.ttlSec || TURN_TTL_SEC)}:licno`;
+    return [
+      { urls: `stun:${turnHost}:${port}` },
+      {
+        urls: [`turn:${turnHost}:${port}?transport=udp`, `turn:${turnHost}:${port}?transport=tcp`],
+        username,
+        credential: o.hmac(username),
+      },
+    ];
+  }
+  // Пустой список означает, что звонок соберётся лишь по прямым кандидатам;
+  // клиент это видит и предупреждает пользователя (ЗВ-1), а не выдаёт
+  // отсутствие ретранслятора за норму.
+  return (Array.isArray(o.publicStun) ? o.publicStun : []).map((urls) => ({ urls }));
+}
+
+/** Разбор RELAY_PUBLIC_STUN: только stun:/stuns:, остальное молча отбрасываем. */
+function parsePublicStun(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => /^stuns?:/i.test(item));
+}
+
 module.exports = {
   MAX_RELAYS,
   normalizeRelayUrl,
@@ -216,4 +308,9 @@ module.exports = {
   coturnConfigText,
   COTURN_DENIED_RANGES,
   rateGate,
+  byteGate,
+  buildIceServers,
+  parsePublicStun,
+  TURN_PORT,
+  TURN_TTL_SEC,
 };
