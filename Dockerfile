@@ -28,8 +28,10 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Затем канонический код релея (без клиентских исходников). vapid-fleet.json
 # содержит только разрешённые URL/ПУБЛИЧНЫЕ relay-sign ключи; приватного VAPID в
 # образе нет — он создаётся genesis и раздаётся разрешённым узлам по NaCl-box.
-COPY relay.js relays.js store.js push.js vapid-fleet.js vapid-fleet.json linked-devices.js binary-frame.js \
-  ed25519.js notifications.js verification-code.js ./
+COPY binary-frame.js ed25519.js envelopeFrame.js httpRateLimit.js linked-devices.js \
+  mailboxEvict.js mailboxGcs.js mbx.js nativeEd25519.js nativeX25519.js notifications.js \
+  push.js queueAdmission.js relay.js relays.js store.js vapid-fleet.js vapid-fleet.json \
+  vapid-identity.js verification-code.js x25519.js ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 

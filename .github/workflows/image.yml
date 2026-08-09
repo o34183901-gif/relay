@@ -75,6 +75,7 @@ jobs:
         run: |
           npm ci
           npm test
+          node dockerfileModules.test.js
 
       # 1) Сборка ЛОКАЛЬНО (load, без публикации) — чтобы прогнать смоук-тест ДО выката.
       - name: Build image locally (for smoke-test)
