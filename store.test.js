@@ -5,6 +5,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const Database = require('better-sqlite3');
 const { createStore } = require('./store');
 
 let passed = 0;
@@ -37,7 +38,7 @@ test('enqueue + queueFor: порядок по времени, распаковк
   s.close();
 });
 
-test('ack: удаляет по id и возвращает from_pk; чужой to игнорируется', () => {
+test('ack: удаляет по id и возвращает адрес отправителя; чужой to игнорируется', () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
   assert.strictEqual(s.ack('carol', 'a'), null, 'нельзя ack чужой очереди');
@@ -109,6 +110,83 @@ test('СРВ-2: Sybil-флудер (свежие identity) не вытесняе
   s.close();
 });
 
+test('ВЫС-15: пять личностей не закрывают ящик — резерв достаётся корреспонденту', () => {
+  const s = fresh();
+  const limits = { maxPerUser: 10, maxPerSender: 4, reserve: 4, reciprocityTtlMs: 1000 };
+  // Жертва bob сама писала честной carol — узел запомнил пару bob→carol.
+  s.enqueue({ id: 'из-дома', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
+  // Флудер выбирает всё, что незнакомцам доступно: 10 - 4 = 6 слотов.
+  let admitted = 0;
+  for (let i = 0; i < 12; i++) {
+    if (s.enqueue({ id: 'спам' + i, to: 'bob', from: 'личность' + (i % 3), envelope: {}, ts: 10 + i, ...limits })) {
+      admitted += 1;
+    }
+  }
+  assert.strictEqual(admitted, 6, 'незнакомцам достаётся очередь без резерва, сколько бы личностей ни было');
+  // Честная carol — корреспондент: bob ей писал. Резерв её.
+  for (let i = 0; i < 4; i++) {
+    assert.strictEqual(
+      s.enqueue({ id: 'письмо' + i, to: 'bob', from: 'carol', envelope: {}, ts: 100 + i, ...limits }),
+      true,
+      'письмо корреспондента проходит в резерв'
+    );
+  }
+  const ids = s.queueFor('bob').map((x) => x.id);
+  assert.strictEqual(ids.filter((x) => x.startsWith('письмо')).length, 4, 'все письма на месте');
+  s.close();
+});
+
+test('ВЫС-15: корреспондент у полной очереди вытесняет спам незнакомца, а не отбрасывается', () => {
+  const s = fresh();
+  const limits = { maxPerUser: 6, maxPerSender: 6, reserve: 2, reciprocityTtlMs: 1000 };
+  s.enqueue({ id: 'из-дома', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
+  // Письма корреспондента СТАРШЕ спама: жертвой вытеснения обязан стать
+  // старейший конверт НЕЗНАКОМЦА, а не старейший вообще — иначе письмо одного
+  // настоящего собеседника платило бы за письмо другого.
+  s.enqueue({ id: 'письмо0', to: 'bob', from: 'carol', envelope: {}, ts: 5, ...limits });
+  s.enqueue({ id: 'письмо1', to: 'bob', from: 'carol', envelope: {}, ts: 6, ...limits });
+  for (let i = 0; i < 4; i++) {
+    s.enqueue({ id: 'спам' + i, to: 'bob', from: 'личность' + i, envelope: {}, ts: 10 + i, ...limits });
+  }
+  assert.strictEqual(s.queueFor('bob').length, 6, 'очередь полна');
+  // Вторая корреспондентка dave… нет: bob писал и dave. Полная очередь — но
+  // письмо настоящего собеседника не отбрасывается: платит спам незнакомца.
+  s.enqueue({ id: 'из-дома-2', to: 'dave', from: 'bob', envelope: {}, ts: 30, ...limits });
+  assert.strictEqual(
+    s.enqueue({ id: 'письмо-дейва', to: 'bob', from: 'dave', envelope: {}, ts: 40, ...limits }),
+    true,
+    'письмо корреспондента у полной очереди принимается'
+  );
+  const ids = s.queueFor('bob').map((x) => x.id);
+  assert.ok(ids.includes('письмо-дейва'), 'письмо в очереди');
+  assert.ok(!ids.includes('спам0'), 'старейший спам незнакомца вытеснен');
+  assert.ok(ids.includes('письмо0') && ids.includes('письмо1'), 'письма других корреспондентов целы');
+  // А незнакомец у полной очереди — по-прежнему drop-new.
+  assert.strictEqual(
+    s.enqueue({ id: 'спам-новый', to: 'bob', from: 'свежая-личность', envelope: {}, ts: 50, ...limits }),
+    false,
+    'незнакомцу чужие конверты не жертвуются'
+  );
+  s.close();
+});
+
+test('ВЫС-15: память о корреспондентах стареет — «писал когда-то» не открывает резерв', () => {
+  const s = fresh();
+  const limits = { maxPerUser: 4, maxPerSender: 4, reserve: 2, reciprocityTtlMs: 100 };
+  s.enqueue({ id: 'давно', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
+  // Незнакомцы заняли свою половину; carol приходит СИЛЬНО позже срока памяти.
+  s.enqueue({ id: 'спам0', to: 'bob', from: 'х0', envelope: {}, ts: 1000, ...limits });
+  s.enqueue({ id: 'спам1', to: 'bob', from: 'х1', envelope: {}, ts: 1001, ...limits });
+  assert.strictEqual(
+    s.enqueue({ id: 'письмо', to: 'bob', from: 'carol', envelope: {}, ts: 5000, ...limits }),
+    false,
+    'память истекла — carol снова незнакомка, и резерв ей не достаётся'
+  );
+  // Уборка по сроку выметает и саму таблицу памяти.
+  s.expireOlderThan(2000);
+  s.close();
+});
+
 test('S4/H-03 maxTotalBytes: байтовый потолок ОТКЛОНЯЕТ новый, чужое не вытесняет', () => {
   const s = fresh();
   const big = { cipher: 'x'.repeat(1000) };
@@ -156,6 +234,7 @@ test('identities TOFU: первый ключ закрепляется, втор�
 test('identities proven (H-6): доказанную связку легаси не перебивает, владелец box-ключа — да', () => {
   const s = fresh();
   s.bindSignKey('bob', 'KEY_A', true); // доказано владение box-ключом -> proven
+  s.touchIdentity('bob', 1234);
   assert.deepStrictEqual(s.getIdentity('bob'), { signPk: 'KEY_A', proven: true });
   s.bindSignKey('bob', 'KEY_EVIL', false); // INSERT OR IGNORE — не трогает
   assert.strictEqual(s.getSignKey('bob'), 'KEY_A');
@@ -379,6 +458,281 @@ test('blob: без blobDir всё в БД (обратная совместимо
   s.close();
 });
 
+test('АУД-06: getItemAsync отдаёт то же тело — и из памяти, и с диска', async () => {
+  const { s } = freshBlobs();
+  s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
+  const fromMemory = await s.getItemAsync('big'); // запись ещё идёт
+  assert.deepStrictEqual(fromMemory.envelope, bigEnvelope());
+  await s.flushPendingBlobs();
+  const fromDisk = await s.getItemAsync('big');
+  assert.deepStrictEqual(fromDisk.envelope, bigEnvelope());
+  assert.strictEqual(fromDisk.from, 'alice');
+  assert.strictEqual(await s.getItemAsync('нет-такого'), null);
+  s.close();
+});
+
+// --- бинарные чанки вложений (АУД-06) ---------------------------------------
+//
+// Путь фото и видео: сырой чанк ложится файлом <id>.bin. Запись такого чанка
+// делалась синхронно — то есть на КАЖДЫЙ чанк передачи (до 4096 штук по 300 КБ)
+// узел переставал обслуживать всех остальных. Проверяем то же, что и у
+// конвертов: пока запись идёт, тело отдаётся из памяти; отменённая запись не
+// оставляет файла; счётчики очереди не «плывут».
+const binFiles = (dir) => fs.readdirSync(dir).filter((f) => f.endsWith('.bin'));
+const chunk = (byte = 1, size = 4096) => Buffer.alloc(size, byte);
+
+function putChunk(s, id, extra = {}) {
+  return s.enqueueBinary({
+    id,
+    to: 'bob',
+    from: 'alice',
+    ref: 'msg-1',
+    transferId: 't1',
+    index: 0,
+    total: 1,
+    metadata: { name: 'видео.mp4' },
+    payload: chunk(),
+    ts: 1,
+    ...extra,
+  });
+}
+
+test('binary: чанк ставится в очередь, читается целиком и снимается ackBinary', async () => {
+  const { s, dir } = freshBlobs();
+  assert.strictEqual(putChunk(s, 'c1'), true);
+  await s.flushPendingBlobs();
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c1']);
+  const item = s.getBinaryItem('c1');
+  assert.strictEqual(item.to, 'bob');
+  assert.strictEqual(item.from, 'alice');
+  assert.strictEqual(item.ref, 'msg-1');
+  assert.strictEqual(item.transferId, 't1');
+  assert.deepStrictEqual(item.metadata, { name: 'видео.mp4' });
+  assert.ok(item.payload.equals(chunk()), 'тело чанка не искажено');
+  const ack = s.ackBinary('bob', 'c1');
+  assert.strictEqual(ack.from, 'alice');
+  assert.strictEqual(ack.transferId, 't1');
+  assert.strictEqual(binFiles(dir).length, 0, 'ack удаляет и строку, и файл');
+  s.close();
+});
+
+test('АУД-06: чанк читается ДО того, как доехал до диска', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'c1');
+  // Файла на диске может ещё не быть — запись идёт вне event-loop...
+  const item = s.getBinaryItem('c1');
+  assert.ok(item && item.payload.equals(chunk()), '...но чанк уже отдаётся');
+  await s.flushPendingBlobs();
+  assert.deepStrictEqual(binFiles(dir), ['c1.bin'], 'а затем тело оказывается на диске');
+  assert.ok(s.getBinaryItem('c1').payload.equals(chunk()), 'и читается уже оттуда');
+  s.close();
+});
+
+test('АУД-06: getBinaryItemAsync отдаёт то же — и из памяти, и с диска', async () => {
+  const { s } = freshBlobs();
+  putChunk(s, 'c1');
+  const fromMemory = await s.getBinaryItemAsync('c1'); // запись ещё идёт
+  assert.ok(fromMemory.payload.equals(chunk()));
+  await s.flushPendingBlobs();
+  const fromDisk = await s.getBinaryItemAsync('c1');
+  assert.ok(fromDisk.payload.equals(chunk()));
+  assert.strictEqual(fromDisk.from, 'alice');
+  assert.strictEqual(await s.getBinaryItemAsync('нет-такого'), null);
+  s.close();
+});
+
+test('АУД-06: ackBinary до окончания записи не оставляет файл-сироту', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'c1');
+  assert.ok(s.ackBinary('bob', 'c1'), 'ack пришёл раньше, чем запись закончилась');
+  await s.flushPendingBlobs();
+  assert.strictEqual(fs.readdirSync(dir).length, 0, 'отменённая запись не должна дописаться на диск');
+  s.close();
+});
+
+test('binary: пропавший файл — строка подчищается, очередь не ломается', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'c1');
+  putChunk(s, 'c2', { ts: 2 });
+  await s.flushPendingBlobs();
+  fs.unlinkSync(path.join(dir, 'c1.bin')); // volume почистили руками
+  assert.strictEqual(s.getBinaryItem('c1'), null, 'мёртвая строка удалена');
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c2'], 'остальная очередь цела');
+  assert.strictEqual(s.queueBytes(), 4096, 'вес очереди пересчитан ровно на один чанк');
+  s.close();
+});
+
+test('АУД-06: строка, снятая во время асинхронного чтения, не вычитается дважды', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'c1');
+  putChunk(s, 'c2', { ts: 2 });
+  await s.flushPendingBlobs();
+  assert.strictEqual(s.queueBytes(), 8192);
+  fs.unlinkSync(path.join(dir, 'c1.bin')); // чтение c1 обязано провалиться и снести строку
+  const reading = s.getBinaryItemAsync('c1');
+  // ...а пока чтение висит, тот же чанк снимает квитанция. Раньше счётчики
+  // уменьшались обоими путями, и liveBytes/liveCount уезжали вниз — на них
+  // держатся потолки очереди, то есть релей начинал принимать больше, чем можно.
+  assert.ok(s.ackBinary('bob', 'c1'));
+  assert.strictEqual(await reading, null);
+  assert.strictEqual(s.queueBytes(), 4096, 'вес уменьшился ровно на один чанк, а не на два');
+  assert.strictEqual(s.stats().totalQueued, 1, 'в очереди действительно осталась одна строка');
+  s.close();
+});
+
+test('binary: TTL удаляет протухшие чанки вместе с файлами', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'old', { ts: 100 });
+  putChunk(s, 'new', { ts: 1000 });
+  await s.flushPendingBlobs();
+  assert.strictEqual(s.expireOlderThan(500), 1);
+  assert.deepStrictEqual(binFiles(dir), ['new.bin']);
+  assert.strictEqual(s.queueBytes(), 4096);
+  s.close();
+});
+
+test('binary: cleanupOrphanBlobs убирает .bin-сирот, но не трогает идущую запись', async () => {
+  const { s, dir } = freshBlobs();
+  putChunk(s, 'live');
+  // Уборка на живом узле: у 'live' запись ещё идёт, её tmp сносить нельзя.
+  assert.strictEqual(s.cleanupOrphanBlobs(), 0);
+  await s.flushPendingBlobs();
+  assert.ok(s.getBinaryItem('live').payload.equals(chunk()), 'чанк уцелел');
+  fs.writeFileSync(path.join(dir, 'orphan.bin'), 'x');
+  fs.writeFileSync(path.join(dir, 'half.bin.tmp'), 'x');
+  assert.strictEqual(s.cleanupOrphanBlobs(), 2);
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(), ['live.bin']);
+  s.close();
+});
+
+test('binary: потолки очереди считают чанки вместе с конвертами', () => {
+  const { s } = freshBlobs();
+  assert.strictEqual(putChunk(s, 'c1', { maxPerUser: 2 }), true);
+  assert.strictEqual(putChunk(s, 'c2', { ts: 2, maxPerUser: 2 }), true);
+  assert.strictEqual(putChunk(s, 'c3', { ts: 3, maxPerUser: 2 }), false, 'потолок получателя');
+  assert.strictEqual(putChunk(s, 'c4', { ts: 4, maxTotalBytes: 100 }), false, 'байтовый потолок');
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c1', 'c2']);
+  s.close();
+});
+
+test('blob: ошибка фоновой записи подчищает недоступное тело', async () => {
+  const { s } = freshBlobs();
+  const originalWriteFile = fs.promises.writeFile;
+  fs.promises.writeFile = async () => { throw new Error('disk unavailable'); };
+  try {
+    s.enqueue({ id: 'write-failed', to: 'bob', envelope: bigEnvelope(), ts: 1 });
+    await s.flushPendingBlobs();
+    assert.strictEqual(s.getItem('write-failed'), null);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    s.close();
+  }
+});
+
+test('binary: raw-чанк читается, учитывается и подтверждается без base64', () => {
+  const { s, dir } = freshBlobs();
+  const payload = Buffer.from([0, 1, 2, 255]);
+  assert.strictEqual(s.enqueueBinary({
+    id: 'binary-1', to: 'bob', from: 'alice', ref: 'message-1', transferId: 'transfer-1',
+    index: 0, total: 1, metadata: { mime: 'image/png' }, payload, ts: 10,
+  }), true);
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['binary-1']);
+  const item = s.getBinaryItem('binary-1');
+  assert.deepStrictEqual(item.payload, payload);
+  assert.deepStrictEqual(item.metadata, { mime: 'image/png' });
+  assert.strictEqual(s.ackBinary('mallory', 'binary-1'), null);
+  assert.deepStrictEqual(s.ackBinary('bob', 'binary-1'), {
+    from: 'alice', ref: 'message-1', transferId: 'transfer-1', index: 0,
+  });
+  assert.strictEqual(s.getBinaryItem('binary-1'), null);
+  assert.strictEqual(fs.existsSync(path.join(dir, 'binary-1.bin')), false);
+  s.close();
+});
+
+test('binary: лимиты учитывают общую и парную очередь', () => {
+  const { s } = freshBlobs();
+  const payload = Buffer.from([1, 2, 3]);
+  assert.strictEqual(s.enqueueBinary({ id: 'b-limit', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload, ts: 1 }), true);
+  assert.strictEqual(s.enqueue({ id: 'json-pair', to: 'bob', from: 'alice', envelope: {}, ts: 2, maxPerSender: 1 }), false);
+  assert.strictEqual(s.enqueueBinary({ id: 'b-count', to: 'carol', from: 'alice', transferId: 't2', index: 0, total: 1, payload, ts: 2, maxTotal: 1 }), false);
+  assert.strictEqual(s.enqueueBinary({ id: 'b-bytes', to: 'carol', from: 'alice', transferId: 't3', index: 0, total: 1, payload, ts: 3, maxTotalBytes: s.queueBytes() }), false);
+  s.close();
+});
+
+test('binary: ошибка метаданных и дубликат не оставляют сирот и не портят принятое тело', () => {
+  const { s, dir } = freshBlobs();
+  const circular = {};
+  circular.self = circular;
+  assert.throws(() => s.enqueueBinary({
+    id: 'bad-meta', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1,
+    metadata: circular, payload: Buffer.from('bad'), ts: 1,
+  }));
+  assert.strictEqual(fs.existsSync(path.join(dir, 'bad-meta.bin')), false);
+
+  const original = Buffer.from('original');
+  s.enqueueBinary({ id: 'duplicate', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: original, ts: 2 });
+  assert.throws(() => s.enqueueBinary({ id: 'duplicate', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: Buffer.from('replacement'), ts: 3 }));
+  assert.deepStrictEqual(s.getBinaryItem('duplicate').payload, original, 'дубликат не уничтожает уже принятое тело');
+  s.close();
+});
+
+test('binary: пропавший raw-файл удаляет мёртвую строку', async () => {
+  const { s, dir } = freshBlobs();
+  s.enqueueBinary({ id: 'missing-bin', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: Buffer.from('x'), ts: 1 });
+  // АУД-06: тело чанка ложится на диск АСИНХРОННО — очередь не ждёт диска,
+  // иначе на каждый чанк вложения релей замирал бы на записи. Поэтому перед
+  // тем, как трогать файл руками, запись надо дождаться: без этого удалялся бы
+  // не существующий ещё файл, а проверка «пропал файл» ничего бы не проверяла.
+  await s.flushPendingBlobs();
+  fs.unlinkSync(path.join(dir, 'missing-bin.bin'));
+  assert.strictEqual(s.getBinaryItem('missing-bin'), null);
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), []);
+  s.close();
+});
+
+test('перезапуск: backfill восстанавливает bytes, повреждённые JSON изолируются', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-store-db-'));
+  const dbPath = path.join(root, 'relay.sqlite');
+  const blobDir = path.join(root, 'blobs');
+  let s = createStore(dbPath, { blobDir, blobThreshold: 100 });
+  s.enqueue({ id: 'legacy-inline', to: 'bob', from: 'alice', envelope: { text: 'inline' }, ts: 1 });
+  s.enqueue({
+    id: 'legacy-blob', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 2,
+    deviceCertificate: { id: 'device' }, deviceRoster: { version: 1 },
+  });
+  s.enqueue({ id: 'legacy-missing', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 3 });
+  return s.flushPendingBlobs().then(() => {
+    s.close();
+    const raw = new Database(dbPath);
+    raw.prepare('UPDATE queue SET bytes=0').run();
+    raw.close();
+    fs.unlinkSync(path.join(blobDir, 'legacy-missing.json'));
+    s = createStore(dbPath, { blobDir, blobThreshold: 100 });
+    assert.ok(s.queueBytes() > 500, 'размеры строк прежней версии восстановлены');
+    assert.deepStrictEqual(s.queueIdsFor('bob'), ['legacy-inline', 'legacy-blob', 'legacy-missing']);
+
+    const mutate = new Database(dbPath);
+    mutate.prepare("UPDATE queue SET envelope='{broken' WHERE id='legacy-inline'").run();
+    // ГРФ-1: отдельных колонок device_cert/device_roster в базе больше НЕТ.
+    //
+    // Открытым текстом рядом с шифртекстом лежали from_pk, from_account,
+    // from_device, device_cert и device_roster, а поверх стоял индекс — то есть
+    // готовая структура «кто кому и когда». Дампа базы хватало, чтобы
+    // восстановить граф общения. Теперь всё это — один блоб sender_meta,
+    // зашифрованный ключом из отдельного файла. Портим именно его: правило
+    // «повреждённые метаданные не выходят наружу» осталось тем же, изменилось
+    // только место, где они лежат.
+    mutate.prepare("UPDATE queue SET sender_meta=x'00' WHERE id='legacy-blob'").run();
+    mutate.close();
+    assert.strictEqual(s.getItem('legacy-inline'), null);
+    const blob = s.getItem('legacy-blob');
+    assert.strictEqual(blob.deviceCertificate, undefined);
+    assert.strictEqual(blob.deviceRoster, undefined);
+    assert.strictEqual(blob.from, undefined, 'из нечитаемого блоба не берётся и отправитель');
+    s.close();
+  });
+});
+
 function deviceCertificate(accountPk, rootSignPk, id, pk, signPk, issuedAt = 1000) {
   return {
     v: 2,
@@ -427,6 +781,8 @@ test('linked devices: roster монотонен, читается по account �
   assert.strictEqual(s.putAccountRoster(v2).ok, true);
   assert.strictEqual(s.devicesForAccount('account-pk').length, 2);
   assert.strictEqual(s.getDevice('desktop-pk').revokedAt, null);
+  assert.strictEqual(s.getAccountDevice('account-pk', 'desktop').devicePublicKey, 'desktop-pk');
+  s.touchDevice('desktop-pk', 3000);
   assert.strictEqual(s.putAccountRoster(v2).unchanged, true, 'повтор идемпотентен');
   assert.strictEqual(s.putAccountRoster(v1).reason, 'stale-roster');
   assert.strictEqual(s.putAccountRoster({ ...v2, rootSignature: 'other' }).reason, 'roster-version-conflict');
@@ -469,6 +825,264 @@ test('linked devices: отзыв необратим тем же сертифик
     ], 3000)
   );
   assert.strictEqual(replay.reason, 'device-revoked');
+  s.close();
+});
+
+// ---------------------------------------------------------------------------
+// ГРФ: граф общения не должен восстанавливаться из файла базы
+// ---------------------------------------------------------------------------
+
+test('ГРФ-1: в базе нет ни колонки, ни индекса «кто кому»', () => {
+  const s = fresh();
+  s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
+  const columns = (table) => s.tableColumnsForTest(table);
+  for (const table of ['queue', 'binary_queue']) {
+    for (const gone of ['from_pk', 'from_account', 'from_device', 'device_cert', 'device_roster', 'meta_json']) {
+      assert.ok(!columns(table).includes(gone), `${table}.${gone} не должен существовать`);
+    }
+    assert.ok(columns(table).includes('sender_meta'), `${table}.sender_meta есть`);
+    assert.ok(columns(table).includes('pair_tag'), `${table}.pair_tag есть`);
+  }
+  const indexes = s.indexNamesForTest();
+  assert.ok(!indexes.includes('idx_queue_from_to'), 'индекс графа снесён');
+  assert.ok(!indexes.includes('idx_binary_queue_from_to'), 'индекс графа снесён (бинарный)');
+  assert.ok(indexes.includes('idx_queue_pair'), 'квота ходит по индексу метки пары');
+  assert.ok(indexes.includes('idx_binary_queue_pair'), 'квота ходит по индексу метки пары (бинарный)');
+  s.close();
+});
+
+test('ГРФ-1: доставка получателю сохраняет ВСЕ метаданные отправителя', () => {
+  const s = fresh();
+  const cert = { deviceId: 'desktop-1', devicePublicKey: 'alice-dev' };
+  const roster = { version: 7, devices: [{ certificate: cert, revokedAt: null }] };
+  s.enqueue({
+    id: 'a',
+    to: 'bob',
+    from: 'alice-dev',
+    fromAccount: 'alice-acc',
+    fromDeviceId: 'desktop-1',
+    deviceCertificate: cert,
+    deviceRoster: roster,
+    envelope: { cipher: 'x' },
+    ts: 1,
+  });
+  const item = s.getItem('a');
+  assert.strictEqual(item.from, 'alice-dev');
+  assert.strictEqual(item.fromAccount, 'alice-acc');
+  assert.strictEqual(item.fromDeviceId, 'desktop-1');
+  assert.deepStrictEqual(item.deviceCertificate, cert);
+  assert.deepStrictEqual(item.deviceRoster, roster);
+  // ack по-прежнему возвращает адрес отправителя — на нём держится квитанция
+  // «доставлено» (relay.js: ackReceived → online.get(from)).
+  assert.strictEqual(s.ack('bob', 'a'), 'alice-dev');
+  s.close();
+});
+
+test('ГРФ-1: без fromAccount он равен from (легаси-путь одноустройственного отправителя)', () => {
+  const s = fresh();
+  s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
+  const item = s.getItem('a');
+  assert.strictEqual(item.from, 'alice');
+  assert.strictEqual(item.fromAccount, 'alice');
+  assert.strictEqual(item.fromDeviceId, undefined);
+  s.close();
+});
+
+test('ГРФ-1: квота на пару считается по метке — разные отправители не мешают друг другу', () => {
+  const s = fresh();
+  s.enqueue({ id: 'real', to: 'bob', from: 'carol', envelope: {}, ts: 1, maxPerUser: 500, maxPerSender: 2 });
+  for (let i = 0; i < 4; i++) {
+    s.enqueue({ id: 's' + i, to: 'bob', from: 'mallory', envelope: {}, ts: 10 + i, maxPerUser: 500, maxPerSender: 2 });
+  }
+  // и вторая жертва того же флудера: метка пары другая, квота считается отдельно
+  for (let i = 0; i < 4; i++) {
+    s.enqueue({ id: 'd' + i, to: 'dave', from: 'mallory', envelope: {}, ts: 20 + i, maxPerUser: 500, maxPerSender: 2 });
+  }
+  assert.ok(s.queueFor('bob').map((x) => x.id).includes('real'), 'чужое не вытеснено');
+  assert.strictEqual(s.queueFor('bob').filter((x) => x.id.startsWith('s')).length, 2);
+  assert.strictEqual(s.queueFor('dave').length, 2, 'квота пары считается на пару, а не на отправителя');
+  s.close();
+});
+
+test('ГРФ-1: файл базы не содержит адресов отправителей, метаданные переживают перезапуск', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grf-'));
+  const dbPath = path.join(dir, 'relay.db');
+  const cert = { deviceId: 'd1', devicePublicKey: 'SENDER-DEVICE-KEY' };
+  const first = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
+  first.enqueue({
+    id: 'a',
+    to: 'RECIPIENT-KEY',
+    from: 'SENDER-DEVICE-KEY',
+    fromAccount: 'SENDER-ACCOUNT-KEY',
+    fromDeviceId: 'd1',
+    deviceCertificate: cert,
+    envelope: { cipher: 'x' },
+    ts: 1,
+  });
+  first.close();
+
+  for (const file of fs.readdirSync(dir).filter((f) => f.startsWith('relay.db'))) {
+    const raw = fs.readFileSync(path.join(dir, file));
+    assert.ok(!raw.includes(Buffer.from('SENDER-DEVICE-KEY')), file + ' не должен содержать адрес отправителя');
+    assert.ok(!raw.includes(Buffer.from('SENDER-ACCOUNT-KEY')), file + ' не должен содержать аккаунт отправителя');
+  }
+  // Получатель в базе остаётся: по нему адресуется очередь, спрятать его нельзя.
+  assert.ok(fs.readFileSync(dbPath).includes(Buffer.from('RECIPIENT-KEY')));
+
+  const again = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
+  const item = again.getItem('a');
+  assert.strictEqual(item.from, 'SENDER-DEVICE-KEY', 'ключ подхватился из файла рядом с базой');
+  assert.strictEqual(item.fromAccount, 'SENDER-ACCOUNT-KEY');
+  assert.deepStrictEqual(item.deviceCertificate, cert);
+  again.close();
+
+  // Потеря файла ключа: конверт всё ещё доставляется, но без атрибуции.
+  fs.unlinkSync(dbPath + '.metakey');
+  const orphaned = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
+  const blind = orphaned.getItem('a');
+  assert.deepStrictEqual(blind.envelope, { cipher: 'x' }, 'конверт не потерян');
+  assert.strictEqual(blind.from, undefined, 'отправитель без ключа не восстанавливается');
+  assert.strictEqual(orphaned.ack('RECIPIENT-KEY', 'a'), null, 'квитанцию слать некому');
+  orphaned.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('ГРФ-1: миграция старой базы переносит метаданные и сносит открытый текст', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grf-mig-'));
+  const dbPath = path.join(dir, 'relay.db');
+  // Схема ровно та, что была у операторов до этой правки.
+  const legacy = new Database(dbPath);
+  legacy.pragma('journal_mode = WAL');
+  legacy.exec(`
+    CREATE TABLE queue (
+      id TEXT PRIMARY KEY, to_pk TEXT NOT NULL, from_pk TEXT, envelope TEXT NOT NULL,
+      silent INTEGER DEFAULT 0, call_push INTEGER DEFAULT 0, ts INTEGER NOT NULL,
+      blob INTEGER DEFAULT 0, bytes INTEGER DEFAULT 0,
+      from_account TEXT, from_device TEXT, device_cert TEXT, device_roster TEXT
+    );
+    CREATE INDEX idx_queue_to ON queue(to_pk, ts);
+    CREATE INDEX idx_queue_from_to ON queue(from_pk, to_pk, ts);
+    CREATE TABLE binary_queue (
+      id TEXT PRIMARY KEY, to_pk TEXT NOT NULL, from_pk TEXT NOT NULL, ref TEXT,
+      transfer_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, total_chunks INTEGER NOT NULL,
+      meta_json TEXT, bytes INTEGER NOT NULL, ts INTEGER NOT NULL
+    );
+    CREATE INDEX idx_binary_queue_from_to ON binary_queue(from_pk, to_pk, ts);
+  `);
+  legacy
+    .prepare(
+      'INSERT INTO queue (id,to_pk,from_pk,envelope,silent,call_push,ts,blob,bytes,from_account,from_device,device_cert,device_roster) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    )
+    .run('m1', 'bob', 'OLD-SENDER', '{"cipher":"x"}', 0, 0, 100, 0, 14, 'OLD-ACCOUNT', 'dev-7', '{"deviceId":"dev-7"}', '{"version":3}');
+  legacy
+    .prepare(
+      'INSERT INTO binary_queue (id,to_pk,from_pk,ref,transfer_id,chunk_index,total_chunks,meta_json,bytes,ts) VALUES (?,?,?,?,?,?,?,?,?,?)'
+    )
+    .run('b1', 'bob', 'OLD-SENDER', 'r1', 't1', 0, 2, '{"fromAccount":"OLD-ACCOUNT"}', 10, 102);
+  legacy.close();
+
+  const s = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
+  const item = s.getItem('m1');
+  assert.strictEqual(item.from, 'OLD-SENDER', 'накопленная очередь не потеряла отправителя');
+  assert.strictEqual(item.fromAccount, 'OLD-ACCOUNT');
+  assert.strictEqual(item.fromDeviceId, 'dev-7');
+  assert.deepStrictEqual(item.deviceRoster, { version: 3 });
+  assert.ok(!s.indexNamesForTest().includes('idx_queue_from_to'), 'индекс графа снесён миграцией');
+  assert.ok(!s.tableColumnsForTest('queue').includes('from_pk'));
+  assert.ok(!s.tableColumnsForTest('binary_queue').includes('meta_json'));
+  // Квота на пару продолжает работать на перенесённых строках.
+  const stored = s.enqueue({ id: 'm2', to: 'bob', from: 'OLD-SENDER', envelope: {}, ts: 200, maxPerUser: 500, maxPerSender: 1 });
+  assert.strictEqual(stored, true);
+  assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['m2'], 'вытеснен свой же старейший');
+  s.close();
+
+  for (const file of fs.readdirSync(dir).filter((f) => f.startsWith('relay.db'))) {
+    const raw = fs.readFileSync(path.join(dir, file));
+    assert.ok(!raw.includes(Buffer.from('OLD-SENDER')), file + ': открытый текст вычищен VACUUM+checkpoint');
+    assert.ok(!raw.includes(Buffer.from('OLD-ACCOUNT')), file + ': открытый текст вычищен VACUUM+checkpoint');
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('ГРФ-3: имя давно отозванного устройства стирается, ключи и запрет оживления остаются', () => {
+  const s = fresh();
+  const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
+  const desktop = deviceCertificate('account-pk', 'root-sign-pk', 'desktop', 'desktop-pk', 'desktop-sign-pk', 2000);
+  desktop.name = 'MacBook Виктора';
+  s.putAccountRoster(roster(1, [{ certificate: phone, revokedAt: null }, { certificate: desktop, revokedAt: null }]));
+  s.putAccountRoster(
+    roster(2, [{ certificate: phone, revokedAt: null }, { certificate: desktop, revokedAt: 2500 }], 2500)
+  );
+  assert.strictEqual(s.getDevice('desktop-pk').name, 'MacBook Виктора');
+
+  // Свежий отзыв не трогаем: чистим только то, что старше срока хранения.
+  assert.strictEqual(s.redactRevokedDevices(2500 + 1000, 30 * 24 * 3600 * 1000), 0);
+  assert.strictEqual(s.getDevice('desktop-pk').name, 'MacBook Виктора');
+
+  const redacted = s.redactRevokedDevices(2500 + 40 * 24 * 3600 * 1000);
+  assert.strictEqual(redacted, 1);
+  const row = s.getDevice('desktop-pk');
+  assert.strictEqual(row.name, '', 'имя стёрто');
+  assert.strictEqual(row.certificate, null, 'сертификат стёрт');
+  assert.strictEqual(row.devicePublicKey, 'desktop-pk', 'ключ остался — на нём держится запрет переприсвоения');
+  assert.strictEqual(row.revokedAt, 2500, 'отметка отзыва осталась');
+  assert.ok(row.redactedAt > 0);
+  assert.strictEqual(s.redactRevokedDevices(2500 + 50 * 24 * 3600 * 1000), 0, 'повтор ничего не меняет');
+
+  // Повторная публикация roster НЕ возвращает имя обратно и не оживляет устройство.
+  const replay = s.putAccountRoster(
+    roster(3, [{ certificate: phone, revokedAt: null }, { certificate: desktop, revokedAt: 2500 }], 3000)
+  );
+  assert.strictEqual(replay.ok, true);
+  assert.strictEqual(s.getDevice('desktop-pk').name, '', 'roster не оживил имя');
+  assert.strictEqual(
+    s.putAccountRoster(
+      roster(4, [{ certificate: phone, revokedAt: null }, { certificate: desktop, revokedAt: null }], 4000)
+    ).reason,
+    'device-revoked',
+    'вычищенная запись по-прежнему запрещает оживление'
+  );
+  s.close();
+});
+
+test('linked devices: ключ устройства не переносится между аккаунтами', () => {
+  const s = fresh();
+  const first = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'shared-device-pk', 'device-sign');
+  assert.strictEqual(s.putAccountRoster(roster(1, [{ certificate: first, revokedAt: null }])).ok, true);
+  const second = deviceCertificate('other-account', 'other-root', 'other-phone', 'shared-device-pk', 'other-sign');
+  const otherRoster = {
+    ...roster(1, [{ certificate: second, revokedAt: null }]),
+    accountPublicKey: 'other-account',
+    accountSignPublicKey: 'other-root',
+  };
+  assert.strictEqual(s.putAccountRoster(otherRoster).reason, 'device-key-conflict');
+  s.close();
+});
+
+test('linked devices: отсутствие устройства в новом полном roster отзывает его', () => {
+  const s = fresh();
+  const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
+  const desktop = deviceCertificate('account-pk', 'root-sign-pk', 'desktop', 'desktop-pk', 'desktop-sign-pk', 2000);
+  s.putAccountRoster(roster(1, [
+    { certificate: phone, revokedAt: null },
+    { certificate: desktop, revokedAt: null },
+  ]));
+  const result = s.putAccountRoster(roster(2, [{ certificate: phone, revokedAt: null }], 3000));
+  assert.deepStrictEqual(result.revokedDeviceKeys, ['desktop-pk']);
+  assert.strictEqual(s.getDevice('desktop-pk').revokedAt, 3000);
+  s.close();
+});
+
+test('linked devices: повреждённый roster в БД не выходит наружу', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-roster-db-'));
+  const dbPath = path.join(root, 'relay.sqlite');
+  const s = createStore(dbPath);
+  const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
+  s.putAccountRoster(roster(1, [{ certificate: phone, revokedAt: null }]));
+  const raw = new Database(dbPath);
+  raw.prepare("UPDATE accounts SET roster_json='{broken'").run();
+  raw.close();
+  assert.strictEqual(s.getAccountRoster('account-pk'), null);
   s.close();
 });
 

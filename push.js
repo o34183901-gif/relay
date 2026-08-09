@@ -19,6 +19,7 @@ const dns = require('dns').promises;
 const https = require('https');
 const webpush = require('web-push');
 const { isPrivateHost } = require('./relays');
+const { deviceVapidKeys, vapidSubject } = require('./vapid-identity');
 
 // S13: кастомный lookup для web-push — отдаёт ТОЛЬКО заранее проверенные адреса
 // (пиннинг), игнорируя повторное разрешение имени. Между проверкой и коннектом имя
@@ -31,12 +32,14 @@ function pinnedLookup(pinned) {
   };
 }
 
-let GoogleAuth;
-try {
-  ({ GoogleAuth } = require('google-auth-library'));
-} catch (e) {
-  GoogleAuth = null;
+function loadGoogleAuth(load = require) {
+  try {
+    return load('google-auth-library').GoogleAuth || null;
+  } catch (e) {
+    return null;
+  }
 }
+const GoogleAuth = loadGoogleAuth();
 
 // Автопоиск service-account.json: env → каталог данных (volume) → рядом с кодом.
 function autoDetectCredentials() {
@@ -48,22 +51,29 @@ function autoDetectCredentials() {
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) return p;
-    } catch (e) {}
+    } catch (e) {
+      // Кандидат может лежать на недоступном пути (нет прав на каталог тома).
+      // Это не повод падать на старте — проверяем следующий, а вернув null,
+      // релей просто работает без FCM.
+    }
   }
   return null;
 }
 
 const CREDENTIALS_FILE = autoDetectCredentials();
-if (CREDENTIALS_FILE && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+function applyCredentialsFile(credentialsFile, env = process.env) {
+  if (credentialsFile && !env.GOOGLE_APPLICATION_CREDENTIALS) {
   // google-auth-library читает путь из этой переменной
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = CREDENTIALS_FILE;
+    env.GOOGLE_APPLICATION_CREDENTIALS = credentialsFile;
+  }
 }
+applyCredentialsFile(CREDENTIALS_FILE);
 
-function detectProjectId() {
-  if (process.env.FCM_PROJECT_ID) return process.env.FCM_PROJECT_ID;
-  if (!CREDENTIALS_FILE) return null;
+function detectProjectId(credentialsFile = CREDENTIALS_FILE, env = process.env, readFile = fs.readFileSync) {
+  if (env.FCM_PROJECT_ID) return env.FCM_PROJECT_ID;
+  if (!credentialsFile) return null;
   try {
-    return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8')).project_id || null;
+    return JSON.parse(readFile(credentialsFile, 'utf8')).project_id || null;
   } catch (e) {
     return null;
   }
@@ -73,10 +83,16 @@ const PROJECT_ID = detectProjectId();
 let auth = null;
 let warned = false;
 
-function ready() {
-  if (PROJECT_ID && process.env.GOOGLE_APPLICATION_CREDENTIALS && GoogleAuth) return true;
+function ready(options = {}) {
+  const {
+    projectId = PROJECT_ID,
+    env = process.env,
+    googleAuth = GoogleAuth,
+    log = console.log,
+  } = options || {};
+  if (projectId && env.GOOGLE_APPLICATION_CREDENTIALS && googleAuth) return true;
   if (!warned) {
-    console.log('[push] FCM not configured — skipping wake-up pushes');
+    log('[push] FCM not configured — skipping wake-up pushes');
     warned = true;
   }
   return false;
@@ -128,20 +144,45 @@ async function fcmSend(message) {
 // (relay.js resolveVapidKeys → setVapidKeys). Клиент забирает публичный ключ из
 // кадра ready и передаёт в registerDevice. Во ФЕДЕРАЦИИ пуш шлёт лишь релей, у
 // которого есть VAPID-приватный ключ подписки — как и с FCM service-account
-// (доверенный релей). Оператор флота ставит ОДНУ VAPID-пару на свои релеи.
+// (доверенный релей).
+//
+// ВЫС-51: БАЗОВАЯ пара — общая у флота, а КЛИЕНТУ она не выдаётся никогда.
+//
+// Раньше выдавалась: одна пара на весь флот плюс постоянный subject означали,
+// что push-провайдер (FCM/Mozilla/Apple) видит все подписки «Лично» одной
+// группой и в любой момент отвечает на вопрос «сколько у этого мессенджера
+// устройств, где они и когда их будят». Теперь из базового секрета выводится
+// ПАРА НА УСТРОЙСТВО (vapid-identity.js): и кадр ready, и подпись пуша берут
+// ключ, выведенный из адреса получателя. Базовый секрет при этом остаётся общим
+// — только благодаря этому любой релей флота, у которого осела очередь, выводит
+// ту же пару и может разбудить устройство.
 
 const UP_MAX_ENDPOINT_LEN = 512;
 const UP_MAX_SUB_LEN = 1024; // подписка (endpoint + ключи) длиннее FCM-токена
 
+// Коды, которыми push-сервис отвечает на «подпись не тем ключом»: Mozilla —
+// 401, FCM/Apple — 403, часть реализаций — 400. Отзыв подписки это НЕ значит
+// (он приходит как 404/410), поэтому здесь уместна вторая попытка, а не
+// удаление токена.
+const VAPID_REJECTED = new Set([400, 401, 403]);
+
 let vapidConfigured = false;
-let vapidPub = null;
-/** Задать VAPID-пару релея (зовётся из relay.js после resolveVapidKeys). */
-function setVapidKeys(publicKey, privateKey, subject) {
+let vapidBase = null; // { publicKey, privateKey } — базовая пара узла
+let vapidContact = null; // subject RFC 8292: контакт этого узла, а не всего флота
+/**
+ * Задать базовую VAPID-пару релея (зовётся из relay.js после resolveVapidKeys).
+ * `selfUrl` — собственный адрес узла: из него делается контакт по умолчанию.
+ */
+function setVapidKeys(publicKey, privateKey, subject, selfUrl) {
   try {
     // RFC 8292 contact URI. Реальный HTTPS-домен лучше .invalid: push-сервис
     // может использовать subject для связи с оператором при злоупотреблениях.
-    webpush.setVapidDetails(subject || 'https://lichno.pro/', publicKey, privateKey);
-    vapidPub = publicKey;
+    // ВЫС-51: по умолчанию это адрес САМОГО УЗЛА, а не общая для флота
+    // константа, — провайдер и так видит IP запроса и нового не узнаёт.
+    const contact = vapidSubject(selfUrl, subject);
+    webpush.setVapidDetails(contact, publicKey, privateKey);
+    vapidBase = { publicKey, privateKey };
+    vapidContact = contact;
     vapidConfigured = true;
     return true;
   } catch (e) {
@@ -150,9 +191,34 @@ function setVapidKeys(publicKey, privateKey, subject) {
     return false;
   }
 }
-/** Публичный VAPID-ключ для кадра ready клиенту (null — web-push не настроен). */
+/**
+ * Базовый публичный ключ узла — для /health и сверки флота между собой.
+ * КЛИЕНТУ он больше не выдаётся: у клиента своя пара (vapidPublicKeyFor).
+ */
 function vapidPublicKey() {
-  return vapidConfigured ? vapidPub : null;
+  return vapidConfigured && vapidBase ? vapidBase.publicKey : null;
+}
+
+/**
+ * Пара, которой подписываются пуши на это устройство.
+ *
+ * Без адреса (старый вызов, диагностика без привязки) остаётся базовая пара:
+ * потерять уведомление хуже, чем отдать провайдеру один общий ключ. Вывод, не
+ * давший пары (базовый секрет неожиданной формы), сюда же и приводит.
+ */
+function vapidKeysFor(address) {
+  if (!vapidConfigured || !vapidBase) return null;
+  return deviceVapidKeys(vapidBase.privateKey, address) || vapidBase;
+}
+
+/**
+ * Публичный VAPID-ключ ЭТОГО устройства для кадра ready (null — web-push не
+ * настроен). Адрес приходит из аутентифицированного соединения, поэтому узнать
+ * чужой ключ таким запросом нельзя — только свой.
+ */
+function vapidPublicKeyFor(address) {
+  const keys = vapidKeysFor(address);
+  return keys ? keys.publicKey : null;
 }
 
 /** Литеральная (без DNS) валидация endpoint: http(s), длина, хост не приватный. */
@@ -204,8 +270,21 @@ const CALL_NOTIFICATION_ID = 1279877967;
  * поэтому резолвим и отвергаем приватные адреса ПЕРЕД отправкой (web-push-
  * библиотека ходит сама, без кастомного lookup; литеральный + резолв-чек закрывают
  * основной вектор). Возвращает true | false | 'invalid' (подписка отозвана).
+ *
+ * ВЫС-51 (переход на пару устройства). Подписка выпускается ПОД КОНКРЕТНЫЙ
+ * ключ: push-сервис сверяет подпись с тем ключом, который клиент указал при
+ * подписке, и чужой отвергает. Значит подписки, выпущенные ДО этой доработки
+ * (под общий ключ флота), новым ключом не подписать — а молча перестать будить
+ * уже установленные приложения нельзя.
+ *
+ * Поэтому переход такой: подписываем парой устройства, а на отказ «не тот
+ * отправитель» повторяем прежней общей парой. Обе живут рядом, пока клиент не
+ * перевыпустит подписку — он это делает сам при следующем запуске, потому что
+ * `ready` уже отдаёт ему новый ключ и registerDevice/subscribe идут с ним.
+ * Разовая лишняя попытка на старую подписку дешевле пропавшего уведомления, а
+ * с новыми подписками её не бывает вовсе.
  */
-async function unifiedPushSend(sub, notification) {
+async function unifiedPushSend(sub, notification, address) {
   if (!vapidConfigured) return false; // VAPID не задан — web-push не шлём
   const parsed = typeof sub === 'string' ? parseSubscription(sub) : sub;
   if (!parsed) return 'invalid';
@@ -227,7 +306,20 @@ async function unifiedPushSend(sub, notification) {
     // web-push резолвил хост заново своим стеком — вредоносный DNS мог отдать
     // публичный IP на проверке и приватный на самом запросе (self-SSRF/rebinding).
     const agent = new https.Agent({ lookup: pinnedLookup(pinned), keepAlive: false });
-    const res = await webpush.sendNotification(parsed, body, { TTL: 3600, agent });
+    const deliver = (keys) =>
+      webpush.sendNotification(parsed, body, {
+        TTL: 3600,
+        agent,
+        vapidDetails: { subject: vapidContact, publicKey: keys.publicKey, privateKey: keys.privateKey },
+      });
+    const keys = vapidKeysFor(address);
+    let res;
+    try {
+      res = await deliver(keys);
+    } catch (e) {
+      if (keys === vapidBase || !VAPID_REJECTED.has(e && e.statusCode)) throw e;
+      res = await deliver(vapidBase); // подписка выпущена ещё под общий ключ флота
+    }
     return !!res && res.statusCode >= 200 && res.statusCode < 300;
   } catch (e) {
     const code = e && e.statusCode;
@@ -251,8 +343,27 @@ async function unifiedPushSend(sub, notification) {
  * метаданные социального графа, ровно то, что мессенджер обязан скрывать.
  * Поэтому на FCM-пути остаётся прежний общий тег: там уведомления по-прежнему
  * схлопываются, зато Google не узнаёт ничего нового.
+ *
+ * АУД-Э1: `messageId` подчиняется ТОМУ ЖЕ правилу и по той же причине.
+ *
+ * Раньше он уходил в FCM, и вся его обработка сводилась к обрезке до 160
+ * символов — а приходит он от клиента. Клиент кладёт туда публичный ключ:
+ * `src/groups.js` формирует метку как «идентификатор сообщения : публичный ключ
+ * участника», и 44 символа base64 помещаются в лимит целиком. То есть рядом с
+ * токеном устройства Google передавался адрес получателя в «Лично», а общий
+ * идентификатор у копий одного группового сообщения позволял ещё и связать
+ * токены между собой — восстановив состав группы и список устройств человека.
+ *
+ * Схлопывание уведомлений на FCM-пути от этого не страдает: за него отвечает
+ * `tag: 'new-message'`, а не идентификатор. Гашение уже показанного уведомления
+ * по приходу сообщения работало и раньше лишь частично — клиент сопоставляет
+ * его со СВОИМ `mid`, который с клиентской меткой веера не совпадает.
+ *
+ * ВЫС-51: `address` — адрес получателя. По нему выводится VAPID-пара устройства
+ * (web-push). Ни в тело уведомления, ни в FCM он не попадает: это ключевой
+ * материал, а не поле сообщения.
  */
-async function sendPush(token, messageId, chatTag) {
+async function sendPush(token, messageId, chatTag, address) {
   if (!token) return false;
   const sub = parseSubscription(token);
   const safeMessageId = typeof messageId === 'string' ? messageId.slice(0, 160) : '';
@@ -261,39 +372,62 @@ async function sendPush(token, messageId, chatTag) {
   const safeChatTag =
     typeof chatTag === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(chatTag) ? chatTag : '';
   if (sub) {
-    return unifiedPushSend(sub, {
-      id: MESSAGE_NOTIFICATION_ID,
-      title: 'Лично',
-      body: 'Новое зашифрованное сообщение',
-      type: 'message',
-      messageId: safeMessageId,
-      chatTag: safeChatTag,
-      data: { type: 'message', messageId: safeMessageId, chatTag: safeChatTag },
-    });
+    return unifiedPushSend(
+      sub,
+      {
+        id: MESSAGE_NOTIFICATION_ID,
+        title: 'Лично',
+        body: 'Новое зашифрованное сообщение',
+        type: 'message',
+        messageId: safeMessageId,
+        chatTag: safeChatTag,
+        data: { type: 'message', messageId: safeMessageId, chatTag: safeChatTag },
+      },
+      address
+    );
   }
-  return fcmSend({
+  return fcmSend(messageFcmPayload(token));
+}
+
+/**
+ * Тело FCM-уведомления о новом сообщении.
+ *
+ * Вынесено отдельной чистой функцией, чтобы состав полей можно было проверить
+ * тестом. Всё, что здесь появится, уходит Google открытым текстом — поэтому
+ * поле, добавленное сюда без разбора, стоит дороже обычной ошибки: увидеть его
+ * в code review трудно, а последствия не откатываются (отправленное уже
+ * отправлено).
+ */
+function messageFcmPayload(token) {
+  return {
     token,
     notification: { title: 'Лично', body: 'Новое зашифрованное сообщение' },
     // tag: одинаковый у всех message-пушей — новое уведомление ЗАМЕНЯЕТ
     // предыдущее на устройстве, а не добавляется рядом. Даже если дубли
     // придут с нескольких релеев, пользователь увидит одно уведомление.
     android: { priority: 'HIGH', notification: { channel_id: 'messages', tag: 'new-message' } },
-    data: { type: 'message', messageId: safeMessageId },
-  });
+    // АУД-Э1: ничего, кроме типа. Идентификатор сообщения отсюда убран — он
+    // приходил от клиента и содержал публичный ключ получателя.
+    data: { type: 'message' },
+  };
 }
 
 /** High-priority ring push for an incoming call. FCM или web-push (UnifiedPush). */
-async function sendCallPush(token) {
+async function sendCallPush(token, address) {
   if (!token) return false;
   const sub = parseSubscription(token);
   if (sub) {
-    return unifiedPushSend(sub, {
-      id: CALL_NOTIFICATION_ID,
-      title: 'Входящий звонок',
-      body: 'Нажмите, чтобы ответить',
-      type: 'call',
-      data: { type: 'call' },
-    });
+    return unifiedPushSend(
+      sub,
+      {
+        id: CALL_NOTIFICATION_ID,
+        title: 'Входящий звонок',
+        body: 'Нажмите, чтобы ответить',
+        type: 'call',
+        data: { type: 'call' },
+      },
+      address
+    );
   }
   return fcmSend({
     token,
@@ -310,7 +444,7 @@ async function sendCallPush(token) {
  * Контрольный push для диагностики в Профиле. testId не содержит пользовательских
  * данных и позволяет отличить принятие запроса провайдером от получения телефоном.
  */
-async function sendTestPush(token, testId, channel = 'message') {
+async function sendTestPush(token, testId, channel = 'message', address) {
   if (!token || typeof testId !== 'string' || !testId) return false;
   const isCall = channel === 'call';
   const notification = {
@@ -321,7 +455,7 @@ async function sendTestPush(token, testId, channel = 'message') {
     channel: isCall ? 'call' : 'message',
   };
   const sub = parseSubscription(token);
-  if (sub) return unifiedPushSend(sub, notification);
+  if (sub) return unifiedPushSend(sub, notification, address);
   return fcmSend({
     token,
     notification: { title: notification.title, body: notification.body },
@@ -344,13 +478,18 @@ function generateVapidKeys() {
 
 module.exports = {
   sendPush,
+  messageFcmPayload,
   sendCallPush,
   sendTestPush,
   pushReady: ready,
   setVapidKeys,
   vapidPublicKey,
+  vapidPublicKeyFor,
   generateVapidKeys,
   isUnifiedPushEndpoint,
   validUnifiedPushEndpoint,
   parseSubscription,
+  loadGoogleAuth,
+  applyCredentialsFile,
+  detectProjectId,
 };

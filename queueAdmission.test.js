@@ -1,0 +1,155 @@
+/**
+ * queueAdmission.test.js — приём в очередь получателя (ВЫС-15).
+ *
+ * Пять бесплатных личностей по сто конвертов выбирали MAX_QUEUE_PER_USER=500
+ * целиком, и честные отправители получали отказ на четырнадцать суток. Здесь
+ * проверяется правило, которое это закрывает: резерв слотов под корреспондентов
+ * и вытеснение чужого спама настоящим письмом.
+ *
+ * Запуск: node server/queueAdmission.test.js
+ */
+
+'use strict';
+
+const assert = require('assert');
+const { QUEUE_RESERVE, admitEnvelope } = require('./queueAdmission');
+
+let passed = 0;
+function test(name, fn) {
+  fn();
+  passed += 1;
+  console.log('  ✓ ' + name);
+}
+console.log('приём в очередь получателя (ВЫС-15)');
+
+const LIMITS = { maxPerUser: 500, maxPerSender: 100, reserve: 100 };
+
+test('первое сообщение незнакомца проходит как раньше', () => {
+  // Резерв не должен мешать знакомству: до него очередь общая.
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 0, strangerCount: 0, senderCount: 0 }),
+    { admit: true, evict: null }
+  );
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 399, strangerCount: 399, senderCount: 99 }),
+    { admit: true, evict: null }
+  );
+});
+
+test('сценарий аудита: пять личностей больше не закрывают ящик', () => {
+  // Пять свежих ключей по сто конвертов. Первые четыреста проходят, дальше
+  // незнакомцам закрыто: резерв им не достаётся ни при каком числе личностей.
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 400, strangerCount: 400, senderCount: 0 }),
+    { admit: false, evict: null },
+    'пятая личность упирается в резерв, а не в потолок очереди'
+  );
+  // А корреспондент — тот, кому жертва сама писала, — проходит в резерв.
+  assert.deepStrictEqual(
+    admitEnvelope({
+      ...LIMITS,
+      recipientCount: 400,
+      strangerCount: 400,
+      senderCount: 0,
+      correspondent: true,
+    }),
+    { admit: true, evict: null },
+    'резерв существует ровно для него'
+  );
+});
+
+test('корреспондент у полной очереди вытесняет чужой спам, а не отбрасывается', () => {
+  // Раньше здесь был drop-new: спам лежал неприкосновенно до TTL, а настоящее
+  // письмо выбрасывалось. Теперь платит незнакомец — старейшим конвертом.
+  assert.deepStrictEqual(
+    admitEnvelope({
+      ...LIMITS,
+      recipientCount: 500,
+      strangerCount: 400,
+      senderCount: 0,
+      correspondent: true,
+    }),
+    { admit: true, evict: 'stranger' }
+  );
+});
+
+test('очередь, полная письмами корреспондентов, — честная загрузка, а не абуз', () => {
+  // Вытеснять некого: незнакомых конвертов нет. Отказ здесь правильный —
+  // уже принятые настоящие письма неприкосновенны.
+  assert.deepStrictEqual(
+    admitEnvelope({
+      ...LIMITS,
+      recipientCount: 500,
+      strangerCount: 0,
+      senderCount: 0,
+      correspondent: true,
+    }),
+    { admit: false, evict: null }
+  );
+});
+
+test('свой потолок пары ротирует свои конверты — и у корреспондента тоже', () => {
+  for (const correspondent of [false, true]) {
+    assert.deepStrictEqual(
+      admitEnvelope({ ...LIMITS, recipientCount: 250, strangerCount: 0, senderCount: 100, correspondent }),
+      { admit: true, evict: 'own' },
+      'квота пары одна на всех: и корреспондент не занимает чужую очередь целиком'
+    );
+  }
+});
+
+test('полная очередь со своими конвертами — ротация своих, чужие неприкосновенны', () => {
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 500, strangerCount: 100, senderCount: 5 }),
+    { admit: true, evict: 'own' }
+  );
+});
+
+test('незнакомец у полной очереди получает drop-new, как раньше', () => {
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 500, strangerCount: 400, senderCount: 0 }),
+    { admit: false, evict: null }
+  );
+});
+
+test('легаси-кадр без отправителя ведёт себя по-старому', () => {
+  // Некому атрибутировать — прежнее вытеснение старейшего. В самом релее from
+  // всегда задан, эта ветка — только для унаследованных вызовов.
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 500, strangerCount: 0, senderKnown: false }),
+    { admit: true, evict: 'oldest' }
+  );
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, recipientCount: 10, strangerCount: 10, senderKnown: false }),
+    { admit: true, evict: null },
+    'и резерв на него не распространяется — незнакомцем он не считается'
+  );
+});
+
+test('резерв можно выключить нулём — остаются прежние правила', () => {
+  assert.deepStrictEqual(
+    admitEnvelope({ ...LIMITS, reserve: 0, recipientCount: 499, strangerCount: 499, senderCount: 0 }),
+    { admit: true, evict: null }
+  );
+});
+
+test('резерв не шире очереди: перекос настроек не запирает её целиком', () => {
+  // reserve больше maxPerUser означал бы «незнакомцам нельзя никогда» — и
+  // первое сообщение нового собеседника не доходило бы вовсе.
+  assert.deepStrictEqual(
+    admitEnvelope({ maxPerUser: 50, maxPerSender: 10, reserve: 500, recipientCount: 0, strangerCount: 0 }),
+    { admit: false, evict: null },
+    'формально это отказ — но только когда оператор сам так настроил'
+  );
+  assert.ok(QUEUE_RESERVE < 500, 'штатный резерв заведомо уже штатной очереди');
+});
+
+test('без потолков всё проходит — потолки задаёт вызывающий', () => {
+  assert.deepStrictEqual(admitEnvelope(), { admit: true, evict: null });
+  assert.deepStrictEqual(
+    admitEnvelope({ recipientCount: 10000, strangerCount: 10000, senderCount: 10000 }),
+    { admit: true, evict: null }
+  );
+});
+
+console.log(`\nприём в очередь получателя: ${passed} проверок пройдено`);

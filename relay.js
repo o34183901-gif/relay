@@ -2,8 +2,8 @@
  * relay.js — store-and-forward ретранслятор для мессенджера «Лично».
  *
  * Задача: доставлять зашифрованные конверты между телефонами. Сервер НЕ знает
- * секретных ключей и НЕ может прочитать сообщения — он видит только шифртекст и
- * адрес получателя (его публичный ключ).
+ * секретных ключей и НЕ может прочитать сообщения. Но не «только шифртекст и
+ * адрес получателя», как тут стояло: см. server/README.md, что он видит и хранит.
  *
  * Протокол (JSON, по одному сообщению на кадр):
  *   client -> server  {"type":"hello","pubkey":"<b64>","signPublicKey":"<b64>"}
@@ -19,7 +19,10 @@
  *   server -> client  {"type":"prekeys","pubkey":"...","bundle":{spk,opk}|null}
  *       одноразовый prekey выдаётся ровно один раз и вычёркивается
  *   client -> server  {"type":"send","to":"<b64>","envelope":{...},"ref":"..."}
- *   server -> client  {"type":"ack","ref":"...","id":"...","queued":bool}
+ *   server -> client  {"type":"ack","ref":"...","id":"...","queued":true,"dropped":bool}
+ *       СРВ-11: `queued` — КОНСТАНТА (всегда true), а не состояние получателя;
+ *       раньше по нему читалось «адрес сейчас в сети» (см. ACK_QUEUED). Отказ
+ *       принять конверт несёт `dropped`. Факт доставки — кадр `delivered` ниже.
  *   server -> client  {"type":"message","id":"...","envelope":{...}}
  *   client -> server  {"type":"received","id":"..."}    — квитанция о приёме
  *       ТОЛЬКО после неё сервер удаляет конверт из очереди (надёжная доставка)
@@ -60,21 +63,57 @@ const {
   pushReady,
   setVapidKeys,
   vapidPublicKey,
+  vapidPublicKeyFor,
   generateVapidKeys,
 } = require('./push');
 const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate, byteGate, buildIceServers, parsePublicStun } = require('./relays');
 const { chatNotificationTag, createPushGate } = require('./notifications');
 const { createStore } = require('./store');
+const mbx = require('./mbx');
+// ВЫС-19: частота обращений к HTTP-репликации ящика на IP. Чистое правило,
+// проверяется отдельно (server/httpRateLimit.test.js).
+const { createHttpRateLimit } = require('./httpRateLimit');
 // В-2: подпись и её проверка — через единую обёртку (внутри @noble/curves,
 // формат прежний побайтно). На релее это путь аутентификации КАЖДОГО
 // подключения: challenge подписывает клиент, свою подпись ставит релей, и
 // подпись подписанного prekey сверяется при каждой выгрузке бандла.
 const ed25519 = require('./ed25519');
+// НАТ-1: третий уровень той же обёртки — подпись через OpenSSL, который у Node
+// уже есть. Замер с честным разбором ключа на каждый вызов: проверка подписи
+// 1,61 мс через @noble/curves против 0,12 мс через OpenSSL — ×13. Для релея это
+// прямой потолок: подпись проверяется на КАЖДОЕ подключение (challenge) и на
+// подписанный список устройств в каждом конверте, а узел однопоточный.
+//
+// Включается только после самопроверки на векторе RFC 8032, и она же обязана
+// ОТКАЗАТЬ на подделке. Не сошлось — работает прежний путь, и причина уходит в
+// лог: молчаливый откат на медленное потом не разобрать.
+const { resolveNativeEd25519 } = require('./nativeEd25519');
+const nativeEd25519 = resolveNativeEd25519(() => crypto);
+if (nativeEd25519.implementation) ed25519.setNative(nativeEd25519.implementation);
+// НАТ-2: общий секрет — то же самое для X25519. Замер: 0,646 мс через tweetnacl
+// против 0,035 мс через OpenSSL, ×18. На релее он считается на КАЖДОЕ
+// подключение — доказательством владения адресом (verifyBoxProof ниже).
+//
+// Самопроверка здесь спрашивает не только «тот ли ответ», но и «отвергает ли
+// точку малого порядка»: такая точка даёт секрет, не зависящий от секретки, и
+// реализация, выдающая на ней рабочий на вид ответ, выглядит совершенно
+// исправной (КЛТ-4).
+const x25519 = require('./x25519');
+const { resolveNativeX25519 } = require('./nativeX25519');
+const nativeX25519 = resolveNativeX25519(() => crypto);
+if (nativeX25519.implementation) x25519.setNative(nativeX25519.implementation);
 const { unpackBinaryFrame, packBinaryFrame } = require('./binary-frame');
+// ПРФ-14: правило двоичного кадра обычного сообщения. Файл ГЕНЕРИРУЕТСЯ из
+// src/envelopeFrame.js (scripts/sync-core.js) — правится только источник,
+// иначе клиент и релей однажды разойдутся в том, какой конверт можно упаковать.
+const envelopeFrame = require('./envelopeFrame');
 const { encode: encodeMessagePack, decode: decodeMessagePack } = require('@msgpack/msgpack');
 const {
   assertDeviceCertificate,
   assertSignedRoster,
+  // КРИТ-04: право переписать список устройств — отдельно от проверки подписей,
+  // чтобы спрашивать его ДО неё.
+  rosterWriteGate,
   stableStringify,
   MAX_ACTIVE_DEVICES,
 } = require('./linked-devices');
@@ -130,7 +169,7 @@ function turnIceServers() {
 }
 
 const PORT = process.env.PORT || 8787;
-const RELAY_PROTOCOL = 4;
+const RELAY_PROTOCOL = 6;
 const RELAY_CAPABILITIES = Object.freeze([
   'linked-devices-v2',
   'device-queues',
@@ -138,9 +177,24 @@ const RELAY_CAPABILITIES = Object.freeze([
   'binary-attachments-v1',
   'push-test-v1',
   'frame-batch-v1',
+  // ПРФ-14: обычное сообщение принимается и отдаётся двоичным кадром, без
+  // base64 вокруг запечатанного конверта. Объявляется отдельно от
+  // binary-attachments-v1: релей может уметь чанки вложений и не уметь этого.
+  envelopeFrame.BINARY_ENVELOPE_CAPABILITY,
   // АУД-13: клиент может спросить остаток своих одноразовых prekey, не
   // переподключаясь. Без этого долгоживущее соединение не пополняло пул никогда.
   'prekeys-count-v1',
+  // ПЯЩ-1: общий ящик записок «ищи меня вот здесь». Объявляется отдельно:
+  // старый узел его не умеет, и клиент обязан это видеть, а не гадать.
+  'mbx-v1',
+  // СРЕД-03: узел принимает кадр-пустышку и молча его выбрасывает.
+  //
+  // Объявление здесь — не формальность, а условие работы меры. Прежний релей на
+  // незнакомый двоичный кадр ОТВЕЧАЕТ (`binary-error`), и такой ответ уходил бы
+  // в канал на каждую пустышку: прикрытие, которое само себя размечает, хуже
+  // отсутствия прикрытия. Поэтому клиент шлёт пустышки только туда, где
+  // возможность объявлена, а узел прежней версии их не видит вовсе.
+  'cover-traffic-v1',
 ]);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
@@ -159,7 +213,22 @@ const MAX_QUEUE_BYTES = Number(process.env.RELAY_MAX_QUEUE_BYTES) || 8 * 1024 * 
 // получателя. При превышении вытесняется его же старейший (self-eviction) —
 // флудер не выдавливает чужие (реальные) сообщения жертвы. < MAX_QUEUE_PER_USER.
 const MAX_QUEUE_PER_SENDER = Number(process.env.RELAY_MAX_QUEUE_PER_SENDER) || 100;
+// ВЫС-15: сколько слотов очереди получателя доступно только корреспондентам —
+// отправителям, которым получатель сам недавно писал. Иначе пять бесплатных
+// личностей по MAX_QUEUE_PER_SENDER конвертов выбирали очередь целиком, и
+// честные отправители получали отказ на весь срок TTL. Память «кто кому писал»
+// стареет вместе с очередью (см. store.expireOlderThan).
+const QUEUE_RESERVE_SLOTS = Number(process.env.RELAY_QUEUE_RESERVE) || 100;
 const QUEUE_TTL_MS = Number(process.env.RELAY_TTL_MS) || 14 * 24 * 3600 * 1000; // 14 дней
+// ПЯЩ-1: потолок общего ящика записок. Записка 224 байта, срок жизни 13 часов;
+// 400 000 штук — это около 90 МБ с индексами. Сверх потолка вытесняется самый
+// старый ОТРЕЗОК целиком: резать по одной записке внутри отрезка нельзя — какая
+// из них кому нужна, узел не знает и знать не может.
+const MBX_MAX_RECORDS = Number(process.env.RELAY_MBX_MAX_RECORDS) || mbx.MAX_RECORDS;
+// Сколько записок один сокет кладёт за окно. Восемь за отрезок — норма клиента;
+// шестьдесят четыре в минуту с запасом покрывают её и отсекают поток.
+const MBX_PUT_MAX = Number(process.env.RELAY_MBX_PUT_MAX) || 64;
+const MBX_PUT_WINDOW_MS = 60 * 1000;
 // M-02: глобальный потолок числа зарегистрированных identity. У таблиц identities/
 // prekeys/push_tokens (в отличие от очереди) не было ни TTL, ни лимита, ни
 // вытеснения — Sybil-регистрация (hello→auth→prekeys-put→register в цикле) могла
@@ -173,6 +242,72 @@ const BLOB_DIR = process.env.RELAY_BLOB_DIR || path.join(path.dirname(DB_FILE), 
 const BLOB_THRESHOLD = Number(process.env.RELAY_BLOB_THRESHOLD) || 64 * 1024;
 
 const store = createStore(DB_FILE, { blobDir: BLOB_DIR, blobThreshold: BLOB_THRESHOLD });
+
+// ПЯЩ-1: как узел отличает повтор записки от подделки под тем же ключом.
+//
+// Хеш берётся от значения И метки вместе. Совпало всё — записка пришла вторым
+// путём, новой строки не нужно. Совпал ключ, но не метка — это ДРУГАЯ запись, и
+// она обязана лечь рядом: иначе подделкой вытесняли бы настоящую записку, а
+// адресат, сверяя метку, молча не находил бы ничего.
+function mbxValueHash(record) {
+  return crypto
+    .createHash('sha256')
+    .update(Buffer.from(record.value))
+    .update(Buffer.from(record.mac))
+    .digest();
+}
+
+// Сводка считается раз на изменение ящика и отдаётся всем одинаковой.
+const mbxDigest = mbx.createDigestCache();
+
+/**
+ * Убрать протухшее и, если ящик всё равно переполнен, лишнее из старейшего
+ * отрезка.
+ *
+ * ВЫС-31: лишнее — это ровно столько записок, сколько нужно, чтобы вернуться
+ * под потолок, а не отрезок целиком. Прежнее вычищало шесть часов записок одним
+ * движением, и залив ящик, этим можно было выбивать чужие записки прицельно:
+ * старейший отрезок — ровно тот, за которым адресат придёт в следующий раз, а
+ * свои заливающий кладёт в текущий.
+ *
+ * Порядок внутри отрезка назначает узел при вставке, поэтому выбор равномерен:
+ * доля выброшенного у каждого равна его доле в ящике.
+ */
+function mbxTrim(now = Date.now()) {
+  const removed = store.mbxExpire(mbx.slotOf(now - mbx.TTL_MS));
+  return removed + store.mbxTrimTo(MBX_MAX_RECORDS);
+}
+
+/**
+ * КРИТ-04: пересчитать сводку ящика — по СОБЫТИЮ изменения, а не по просьбе.
+ *
+ * Просьба обслуживается в обработчике кадра, между приёмами других соединений,
+ * и однопоточному узлу нечем её обогнать. Пока сводка считалась там, стоимость
+ * выборки всех ключей ящика и кодирования GCS платил тот, кто спросил, — а
+ * значит, её мог назначить кто угодно, просто спрашивая почаще.
+ *
+ * Теперь работа делается здесь, сразу после изменения, и к моменту просьбы уже
+ * готова. Сверяемся с ревизией, а не с курсором репликации: курсор растёт только
+ * при добавлении, поэтому чистка ящика для него невидима.
+ */
+/**
+ * ПРФ-21: сколько ждать перед пересчётом сводки ящика.
+ *
+ * Секунда. Записка живёт тринадцать часов, поэтому сводка, отставшая на
+ * секунду, не значит ничего; а тот, кто спросит её раньше, получит посчитанную
+ * по требованию — отставшего ответа не бывает по построению.
+ */
+const MBX_DIGEST_MIN_INTERVAL_MS = Number(process.env.RELAY_MBX_DIGEST_MS) || 1000;
+
+function mbxRefreshDigest(now = Date.now()) {
+  // Пересчёт — полный обход ключей ящика: на двухстах тысячах записок это почти
+  // секунда, и всё это время однопоточный узел не обслуживает никого. Раньше он
+  // шёл на КАЖДУЮ укладку.
+  return mbxDigest.refreshIfDue(store.mbxRevision(), () => store.mbxKeys(), {
+    now,
+    minIntervalMs: MBX_DIGEST_MIN_INTERVAL_MS,
+  });
+}
 {
   const orphans = store.cleanupOrphanBlobs();
   if (orphans) console.log(`[blobs] removed ${orphans} orphan attachment file(s)`);
@@ -210,6 +345,12 @@ function learnRelays(urls) {
   return false;
 }
 const MAX_ENVELOPE_BYTES = 32 * 1024 * 1024; // 32 MB envelope (~24 MB video/file)
+// ПРФ-14: потолок ТЕЛА двоичного кадра `send-v1`, посчитанный так, чтобы конверт
+// после кодирования в base64 уложился в MAX_ENVELOPE_BYTES. Проверяется ДО
+// кодирования: иначе тело в 33 МБ сначала превратилось бы в 44 МБ строки и лишь
+// потом было отвергнуто — то есть отправка мусора стоила бы узлу столько же,
+// сколько настоящая работа (та же беда, что чинил АУД-06).
+const MAX_SEALED_PAYLOAD_BYTES = envelopeFrame.maxSealedBytes(MAX_ENVELOPE_BYTES);
 const MAX_BINARY_CHUNK_BYTES = 300 * 1024;
 const MAX_BINARY_CHUNKS = 4096;
 
@@ -247,6 +388,39 @@ const RATE_MAX_BYTES = Number(process.env.RELAY_MAX_BYTES_PER_SEC) || 12 * 1024 
 // «быстрый канал» и станет абузом. 15 с непрерывного упора в потолок.
 const RATE_ABUSE_WINDOWS = Number(process.env.RELAY_ABUSE_WINDOWS) || 15;
 
+// КРИТ-04: отдельный потолок на ДОРОГИЕ кадры.
+//
+// Общий лимит меряет кадры, а не работу. Восемьдесят кадров в секунду — верная
+// мерка для конвертов, каждый из которых стоит одну вставку в очередь, и
+// негодная для просьб, каждая из которых стоит выборки по всей базе или пачки
+// проверок подписи. Одно соединение, укладываясь в общий лимит с запасом,
+// занимало однопоточный узел целиком, и страдали при этом все остальные.
+//
+// Числа взяты от того, как этими кадрами пользуются на самом деле:
+//   • сводку ящика клиент спрашивает раз в отрезок, то есть раз в шесть часов;
+//     десять в минуту — это триста шестьдесят суточных норм подряд;
+//   • корзин за один поиск набирается единицы (сколько ключей совпало с
+//     фильтром), тридцать в минуту покрывает поиск с большим запасом;
+//   • список устройств переписывается при привязке или отзыве — событие,
+//     которое у человека случается несколько раз в год.
+//
+// Превышение НЕ рвёт соединение: легитимный клиент мог попасть сюда из-за
+// повторов при плохой связи, а разрыв обошёлся бы ему дороже отказа. Ответ —
+// обычная ошибка, по которой клиент отступает.
+const COSTLY_WINDOW_MS = 60 * 1000;
+const MBX_DIGEST_MAX_PER_MIN = Number(process.env.RELAY_MBX_DIGEST_PER_MIN) || 10;
+const MBX_FETCH_MAX_PER_MIN = Number(process.env.RELAY_MBX_FETCH_PER_MIN) || 30;
+// ВЫС-19: HTTP-репликация ящика (GET /mbx) — усилитель ×30000. WS-кадры ящика
+// уже за аутентификацией и под costlyLimited, а у HTTP-пути защиты не было.
+// Частота на IP: репликация соседа — редкий фоновый опрос, десяток в минуту с
+// запасом её покрывает и отсекает поток. Страница — сколько записок отдаём за
+// один ответ: полный перенос всё равно идёт постранично по курсору after,
+// поэтому маленькая страница лишь снижает разовое усиление, ничего не ломая.
+const MBX_HTTP_MAX_PER_MIN = Number(process.env.RELAY_MBX_HTTP_PER_MIN) || 12;
+const MBX_HTTP_PAGE = Math.min(mbx.SYNC_LIMIT, Number(process.env.RELAY_MBX_HTTP_PAGE) || 512);
+const mbxHttpRate = createHttpRateLimit({ max: MBX_HTTP_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+const ROSTER_PUT_MAX_PER_MIN = Number(process.env.RELAY_ROSTER_PUT_PER_MIN) || 10;
+
 // Resource limits (H4): защита узла от исчерпания ресурсов при абузе/DoS.
 // ВАЖНО: мобильные операторы прячут тысячи абонентов за одним IP (CGNAT),
 // поэтому per-IP лимит — грубый предохранитель от одиночного хоста, а не от
@@ -274,6 +448,19 @@ const counters = {
   abusive: 0, // БЕЗ-5: сколько соединений разорвано за длительное превышение
   oversized: 0, // АУД-06: кадров отвергнуто по размеру ДО разбора
   overloaded: 0, // АУД-06: сколько раз узел сообщил клиенту о перегрузке
+  // КРИТ-04: работа, которую пытались назначить узлу и которую он не сделал.
+  // Оператору эти два числа говорят то, чего не скажет ни одно другое: узел
+  // сейчас не «медленный», а обстреливаемый дорогими просьбами. Без них поток
+  // мусорных ростеров и просьб о сводке выглядит просто ростом задержек.
+  costlyRefused: 0, // отказов по отдельному потолку дорогих кадров
+  rosterDeniedEarly: 0, // ростеров отвергнуто ДО проверки подписей
+  // СРЕД-03: принятых и выброшенных пустышек. Оператору это единственный способ
+  // увидеть, сколько полосы уходит на прикрывающий трафик: в счётчики сообщений
+  // такие кадры не попадают намеренно — они не сообщения.
+  cover: 0,
+  // ВЫС-19: отказов HTTP-репликации ящика по частоте. Рост числа — узел дёргают
+  // как усилитель, а не реплицируют.
+  mbxHttpLimited: 0,
 };
 
 // ПРФ-3: задержка event-loop. Релей однопоточный, а хранилище (better-sqlite3) и
@@ -318,8 +505,7 @@ function relayOverloaded() {
   return eventLoopLag.overloaded;
 }
 
-const eventLoopTimer = setInterval(() => {
-  const now = Date.now();
+function sampleEventLoopLag(now = Date.now()) {
   const lag = Math.max(0, now - eventLoopProbeAt - EVENT_LOOP_PROBE_MS);
   eventLoopProbeAt = now;
   eventLoopLag.last = lag;
@@ -344,7 +530,8 @@ const eventLoopTimer = setInterval(() => {
     console.warn(`[lag] перегрузка снята: p99 ${eventLoopLagP99()} мс`);
   }
   eventLoopLag.overloaded = overloaded;
-}, EVENT_LOOP_PROBE_MS);
+}
+const eventLoopTimer = setInterval(sampleEventLoopLag, EVENT_LOOP_PROBE_MS);
 // Метрика не должна удерживать процесс от штатного завершения.
 if (typeof eventLoopTimer.unref === 'function') eventLoopTimer.unref();
 
@@ -373,6 +560,18 @@ function renderMetrics() {
   metric('licno_messages_dropped_total', 'counter', 'Envelopes dropped (recipient queue full, no own slots) since start.', counters.dropped);
   metric('licno_throttled_total', 'counter', 'Times a connection was paused for exceeding the byte budget.', counters.throttled);
   metric('licno_abusive_closed_total', 'counter', 'Connections closed for sustained byte-budget abuse.', counters.abusive);
+  metric(
+    'licno_costly_refused_total',
+    'counter',
+    'Expensive frames refused by the per-minute budget (mailbox digest/fetch, roster writes).',
+    counters.costlyRefused
+  );
+  metric(
+    'licno_roster_denied_early_total',
+    'counter',
+    'Device-roster writes rejected on permissions before any signature was verified.',
+    counters.rosterDeniedEarly
+  );
   metric('licno_messages_acked_total', 'counter', 'Envelopes confirmed received by recipients since start.', counters.acked);
   metric('licno_push_sent_total', 'counter', 'Wake-up pushes sent since start.', counters.pushes);
   metric('licno_auth_success_total', 'counter', 'Successful client authentications since start.', counters.authOk);
@@ -419,6 +618,18 @@ function renderMetrics() {
     'counter',
     'Кадров отвергнуто по размеру ДО разбора (АУД-06): их содержимое узел даже не читал.',
     counters.oversized
+  );
+  metric(
+    'licno_cover_frames_total',
+    'counter',
+    'Кадров-пустышек принято и выброшено (СРЕД-03). Это полоса, но не сообщения: в очередь они не встают и никого не будят.',
+    counters.cover
+  );
+  metric(
+    'licno_mbx_http_limited_total',
+    'counter',
+    'Отказов HTTP-репликации ящика по частоте (ВЫС-19). Рост — узел дёргают как усилитель, а не реплицируют.',
+    counters.mbxHttpLimited
   );
   return lines.join('\n') + '\n';
 }
@@ -508,16 +719,31 @@ function rememberVapidRequest(request) {
   return true;
 }
 
-async function handleVapidFleetHttp(req, res) {
+async function handleVapidFleetHttpWith(req, res, options = {}) {
+  const fleet = options.fleet === undefined ? VAPID_FLEET : options.fleet;
+  const member = options.member === undefined ? VAPID_MEMBER : options.member;
+  const bundle = options.bundle === undefined ? vapidFleetBundle : options.bundle;
+  const allowPrivate = options.allowPrivate === undefined ? VAPID_FLEET_ALLOW_PRIVATE : options.allowPrivate;
+  const selfUrl = options.selfUrl === undefined ? SELF_URL : options.selfUrl;
+  const relayPublicKey = options.relayPublicKey || RELAY_KEYS.pub;
+  const relaySecretKey = options.relaySecretKey || RELAY_KEYS.sec;
+  const rateAllowed = options.rateAllowed || vapidRequestRateAllowed;
+  const readRequest = options.readRequest || readJsonRequest;
+  const verifyRequest = options.verifyRequest || verifyVapidRequest;
+  const rememberRequest = options.rememberRequest || rememberVapidRequest;
+  const resolvePeer = options.resolvePeer || safePeerAddrs;
+  const sourceMatches = options.sourceMatches || sourceMatchesResolved;
+  const makeResponse = options.makeResponse || createVapidResponse;
+  const logger = options.logger || console;
   const ip = clientIp(req);
-  if (!VAPID_FLEET || !VAPID_MEMBER || !vapidFleetBundle || !vapidRequestRateAllowed(ip)) {
-    res.writeHead(vapidFleetBundle ? 429 : 503, { 'content-type': 'application/json' });
+  if (!fleet || !member || !bundle || !rateAllowed(ip)) {
+    res.writeHead(bundle ? 429 : 503, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
     return;
   }
-  const request = await readJsonRequest(req);
-  const requestMember = verifyVapidRequest(request, VAPID_FLEET);
-  if (!requestMember || !rememberVapidRequest(request)) {
+  const request = await readRequest(req);
+  const requestMember = verifyRequest(request, fleet);
+  if (!requestMember || !rememberRequest(request)) {
     res.writeHead(403, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
     return;
@@ -526,21 +752,21 @@ async function handleVapidFleetHttp(req, res) {
   // Подпись доказывает владение relay-sign.key, а совпадение сетевого источника
   // с DNS/IP разрешённого URL не даёт скопировать публичный образ на чужой сервер
   // и запросить приватный VAPID под именем участника флота.
-  const resolved = await safePeerAddrs(requestMember.url, { allowPrivate: VAPID_FLEET_ALLOW_PRIVATE });
-  if (!resolved || !sourceMatchesResolved(ip, resolved)) {
+  const resolved = await resolvePeer(requestMember.url, { allowPrivate });
+  if (!resolved || !sourceMatches(ip, resolved)) {
     res.writeHead(403, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
     return;
   }
 
   try {
-    const response = createVapidResponse({
-      config: VAPID_FLEET,
+    const response = makeResponse({
+      config: fleet,
       request,
-      bundle: vapidFleetBundle,
-      senderUrl: SELF_URL,
-      senderRelayPub: RELAY_KEYS.pub,
-      senderRelaySecret: RELAY_KEYS.sec,
+      bundle,
+      senderUrl: selfUrl,
+      senderRelayPub: relayPublicKey,
+      senderRelaySecret: relaySecretKey,
     });
     res.writeHead(200, {
       'content-type': 'application/json',
@@ -548,10 +774,13 @@ async function handleVapidFleetHttp(req, res) {
     });
     res.end(JSON.stringify(response));
   } catch (e) {
-    console.warn('[vapid-fleet] не удалось сформировать ответ:', e && e.message);
+    logger.warn('[vapid-fleet] не удалось сформировать ответ:', e && e.message);
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
   }
+}
+async function handleVapidFleetHttp(req, res) {
+  return handleVapidFleetHttpWith(req, res);
 }
 
 // pubkey -> live WebSocket (in-memory: живые сокеты место в RAM, не в БД)
@@ -582,7 +811,10 @@ function indexAccountSocket(ws, record) {
   if (previous && previous !== ws) {
     try {
       previous.terminate();
-    } catch (e) {}
+    } catch (e) {
+      // Прежний сокет этого устройства всё равно вычёркивается из каталога.
+      // Он мог оборваться сам — тогда terminate() уже нечего закрывать.
+    }
   }
   ws.accountPubkey = record.accountPublicKey;
   ws.deviceId = record.deviceId;
@@ -617,11 +849,12 @@ const messagePushGate = createPushGate({
 // повторно легитимно быстрее, чем слать сообщения), но флуд отсекает.
 const CALL_PUSH_MIN_INTERVAL_MS = Number(process.env.RELAY_CALL_PUSH_INTERVAL_MS) || 5000;
 const lastCallPushAt = new Map();
-setInterval(() => {
-  messagePushGate.sweep(Date.now());
-  const ccut = Date.now() - 10 * CALL_PUSH_MIN_INTERVAL_MS;
+function sweepPushGates(now = Date.now()) {
+  messagePushGate.sweep(now);
+  const ccut = now - 10 * CALL_PUSH_MIN_INTERVAL_MS;
   for (const [pk, t] of lastCallPushAt) if (t < ccut) lastCallPushAt.delete(pk);
-}, 60000).unref();
+}
+setInterval(sweepPushGates, 60000).unref();
 
 // СРВ-4: потолок длины адреса получателя. box-pubkey в base64 = 44 символа; берём
 // с запасом. Без этого `to` не ограничивался ничем, кроме maxPayload (~33 МБ) и в
@@ -710,7 +943,13 @@ function concatU8(a, b) {
 /** true, если boxProof доказывает владение box-секреткой адреса boxPubB64. */
 function verifyBoxProof(nonceB64, proofB64, boxPubB64, ephSecB64) {
   try {
-    const shared = nacl.scalarMult(naclUtil.decodeBase64(ephSecB64), naclUtil.decodeBase64(boxPubB64));
+    // НАТ-2: через единую точку. Она же отбраковывает точку малого порядка —
+    // раньше здесь этой отбраковки не было вовсе: нулевой общий секрет прошёл
+    // бы дальше и доказательство считалось бы от него.
+    const shared = x25519.sharedSecret(
+      naclUtil.decodeBase64(ephSecB64),
+      naclUtil.decodeBase64(boxPubB64)
+    );
     const data = concatU8(naclUtil.decodeUTF8(BOX_PROOF_PREFIX), naclUtil.decodeBase64(nonceB64));
     const expected = hmacSha512(shared, data).slice(0, 32);
     const got = naclUtil.decodeBase64(proofB64);
@@ -729,12 +968,45 @@ function verifyBoxProof(nonceB64, proofB64, boxPubB64, ephSecB64) {
 // половину в лог, чтобы оператор внёс её клиентам.
 const RELAY_AUTH_PREFIX = 'licno-relay-auth-v1|';
 const RELAY_SIGN_KEY_FILE = process.env.RELAY_SIGN_KEY_FILE || path.join(path.dirname(DB_FILE), 'relay-sign.key');
-function loadOrCreateRelaySignKeys() {
+/**
+ * Т-4: новая личность релея создаётся только тогда, когда прежней ТОЧНО нет.
+ *
+ * ЧТО БЫЛО НЕ ТАК. Чтение файла с ключом не различало два случая: «файла нет»
+ * (первый запуск, нормально) и «файл есть, но не читается» (права, сбой тома,
+ * подмонтированный не туда volume). Оба вели в одну ветку — сгенерировать новую
+ * пару. А публичную половину клиенты ПИНЯТ: смена ключа для них выглядит как
+ * подмена релея, и они отказываются с ним разговаривать. Узел при этом считает,
+ * что всё в порядке, и оператор узнаёт о случившемся по массовому «релей не
+ * отвечает», не имея ни строчки в логе о причине.
+ *
+ * Теперь новая пара создаётся только на ENOENT. Любая другая ошибка чтения —
+ * отказ старта: прежний ключ, скорее всего, цел и лежит рядом, и заменить его
+ * молча значит потерять доверие всех клиентов ради обхода проблемы с правами.
+ * Не стартовать громко лучше, чем стартовать чужим.
+ *
+ * `exit` и `fileSystem` параметризованы ради теста: проверить поведение при
+ * нечитаемом ключе иначе нечем, а именно оно здесь и важно.
+ */
+function loadOrCreateRelaySignKeys({
+  fileSystem = fs,
+  exit = (code) => process.exit(code),
+} = {}) {
   let secB64 = process.env.RELAY_SIGN_SECRET || null;
   if (!secB64) {
     try {
-      secB64 = fs.readFileSync(RELAY_SIGN_KEY_FILE, 'utf8').trim();
-    } catch (e) {}
+      secB64 = fileSystem.readFileSync(RELAY_SIGN_KEY_FILE, 'utf8').trim();
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') {
+        console.error(
+          `[relay-key] ключ ${RELAY_SIGN_KEY_FILE} существует, но не читается (${(e && e.code) || 'ошибка'}). ` +
+            'Новый НЕ генерирую: клиенты пинят публичную половину, и подмена ключа отрезала бы их всех. ' +
+            'Проверьте права и том, затем запустите снова.'
+        );
+        exit(1);
+        return null;
+      }
+      // ENOENT — первый запуск, пару создаём ниже.
+    }
   }
   try {
     if (secB64) {
@@ -746,8 +1018,20 @@ function loadOrCreateRelaySignKeys() {
   }
   const kp = nacl.sign.keyPair();
   try {
-    fs.writeFileSync(RELAY_SIGN_KEY_FILE, naclUtil.encodeBase64(kp.secretKey), { mode: 0o600 });
-  } catch (e) {}
+    fileSystem.writeFileSync(RELAY_SIGN_KEY_FILE, naclUtil.encodeBase64(kp.secretKey), { mode: 0o600 });
+  } catch (e) {
+    // Пара создана, но на диск не легла: следующий запуск возьмёт ДРУГУЮ, и
+    // запинившие клиенты потеряют доверие к релею. Работать в таком состоянии —
+    // значит копить отказы, которые проявятся при ближайшем рестарте и будут
+    // выглядеть беспричинными. Отказываем в старте сразу и называем причину.
+    console.error(
+      `[relay-key] не удалось сохранить ключ в ${RELAY_SIGN_KEY_FILE} (${(e && e.code) || 'ошибка'}). ` +
+        'Без этого следующий запуск сменит личность релея и отрежет запинивших клиентов. ' +
+        'Дайте процессу право записи либо задайте RELAY_SIGN_SECRET.'
+    );
+    exit(1);
+    return null;
+  }
   return { pub: naclUtil.encodeBase64(kp.publicKey), sec: kp.secretKey };
 }
 const RELAY_KEYS = loadOrCreateRelaySignKeys();
@@ -755,12 +1039,20 @@ function signRelayAuth(cnonce) {
   return naclUtil.encodeBase64(ed25519.sign(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
 }
 
-// --- VAPID для web-push: одна P2P-синхронизируемая пара на весь флот --------
+// --- VAPID для web-push: общий БАЗОВЫЙ секрет, пара — на устройство ---------
 // В публичном образе нет приватного VAPID. Genesis-релей из vapid-fleet.json
 // создаёт/подписывает одну пару, остальные разрешённые узлы получают тот же
 // подписанный bundle по NaCl-box через POST /vapid-fleet. Выдача разрешена только
 // URL из списка флота, чей relay-sign.key совпал и чей публичный IP является
 // источником запроса. Поэтому произвольный узел из открытого gossip ключ не получит.
+//
+// ВЫС-51: эта общая пара — БАЗОВЫЙ СЕКРЕТ, а не то, что видит push-провайдер.
+// Клиенту (кадр `ready`, кадр `vapid-key`) и в подпись пуша идёт пара,
+// выведенная из адреса устройства (server/vapid-identity.js). Общей она
+// остаётся ровно затем, чтобы любой релей флота вывел ту же пару и мог
+// разбудить устройство, чья очередь осела именно у него. Наружу (/health) по-
+// прежнему отдаётся базовый публичный ключ — по нему операторы сверяют, что
+// флот синхронен; ключевого материала он не раскрывает.
 const RELAY_VAPID_KEY_FILE = process.env.RELAY_VAPID_KEY_FILE || path.join(path.dirname(DB_FILE), 'vapid.json');
 const RELAY_VAPID_FLEET_FILE =
   process.env.RELAY_VAPID_FLEET_FILE || path.join(__dirname, 'vapid-fleet.json');
@@ -786,79 +1078,102 @@ let onVapidActivated = null;
 function activateVapid(publicKey, privateKey, source, bundle) {
   if (!validVapidPair(publicKey, privateKey)) return false;
   const before = vapidPublicKey();
-  if (!setVapidKeys(publicKey, privateKey, process.env.RELAY_VAPID_SUBJECT)) return false;
+  // SELF_URL идёт в contact URI (RFC 8292): контактом узла становится он сам, а
+  // не общая для всего флота константа, по которой провайдер склеивал подписки.
+  if (!setVapidKeys(publicKey, privateKey, process.env.RELAY_VAPID_SUBJECT, SELF_URL)) return false;
   vapidFleetBundle = bundle || null;
   vapidKeySource = source;
-  if (before !== publicKey && onVapidActivated) onVapidActivated(publicKey);
+  if (before !== publicKey && onVapidActivated) onVapidActivated();
   return true;
 }
 
-function resolveVapidKeys() {
-  const fromEnv = {
+function resolveVapidKeysWith(options = {}) {
+  const fleet = options.fleet === undefined ? VAPID_FLEET : options.fleet;
+  const selfUrl = options.selfUrl === undefined ? SELF_URL : options.selfUrl;
+  const member = options.member === undefined ? VAPID_MEMBER : options.member;
+  const standalone = options.standalone === undefined ? VAPID_STANDALONE : options.standalone;
+  const relayPublicKey = options.relayPublicKey || RELAY_KEYS.pub;
+  const relaySecretKey = options.relaySecretKey || RELAY_KEYS.sec;
+  const keyFile = options.keyFile || RELAY_VAPID_KEY_FILE;
+  const fromEnv = options.fromEnv || {
     publicKey: process.env.RELAY_VAPID_PUBLIC || null,
     privateKey: process.env.RELAY_VAPID_PRIVATE || null,
   };
-  const fromFile = readJsonFile(RELAY_VAPID_KEY_FILE);
+  const fromFile = options.fromFile === undefined ? readJsonFile(keyFile) : options.fromFile;
+  const verifyBundle = options.verifyBundle || verifyVapidBundle;
+  const acceptsKey = options.acceptsKey || memberAcceptsKey;
+  const validPair = options.validPair || validVapidPair;
+  const activate = options.activate || activateVapid;
+  const generate = options.generate || generateVapidKeys;
+  const signBundle = options.signBundle || signVapidBundle;
+  const writeFile = options.writeFile || writeJsonAtomic;
+  const logger = options.logger || console;
 
-  if (VAPID_FLEET && SELF_URL) {
-    if (!VAPID_MEMBER) {
+  if (fleet && selfUrl) {
+    if (!member) {
       // Ошибка/чужой узел не должен тихо создать четвёртую VAPID-пару и отдать её
       // PWA-клиентам. Явный standalone override оставлен для независимых операторов.
-      if (!VAPID_STANDALONE) {
-        console.warn(`[vapid-fleet] ${SELF_URL} не входит в разрешённый флот — web-push выключен`);
-        return;
+      if (!standalone) {
+        logger.warn(`[vapid-fleet] ${selfUrl} не входит в разрешённый флот — web-push выключен`);
+        return null;
       }
-    } else if (!memberAcceptsKey(VAPID_MEMBER, RELAY_KEYS.pub)) {
-      console.error(
-        `[vapid-fleet] relay-sign.key не совпадает с разрешённым ключом для ${SELF_URL} — web-push выключен`
+    } else if (!acceptsKey(member, relayPublicKey)) {
+      logger.error(
+        `[vapid-fleet] relay-sign.key не совпадает с разрешённым ключом для ${selfUrl} — web-push выключен`
       );
-      return;
+      return null;
     } else {
-      if (verifyVapidBundle(fromFile, VAPID_FLEET)) {
-        activateVapid(fromFile.publicKey, fromFile.privateKey, 'fleet-file', fromFile);
-        return;
+      if (verifyBundle(fromFile, fleet)) {
+        activate(fromFile.publicKey, fromFile.privateKey, 'fleet-file', fromFile);
+        return 'fleet-file';
       }
 
-      if (SELF_URL.toLowerCase() !== VAPID_FLEET.genesis.toLowerCase()) {
+      if (selfUrl.toLowerCase() !== fleet.genesis.toLowerCase()) {
         // Не принимаем старый локально сгенерированный vapid.json: follower ждёт
         // подписанный genesis bundle и затем безопасно заменит файл атомарно.
-        console.log('[vapid-fleet] общий VAPID ещё не получен — ожидаю разрешённый peer');
-        return;
+        logger.log('[vapid-fleet] общий VAPID ещё не получен — ожидаю разрешённый peer');
+        return null;
       }
 
       // Genesis может принять уже существующую пару (важно при миграции с живыми
       // подписками) или env override, затем подписывает её своим relay-sign.key.
-      let pair = validVapidPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
-      if (!pair && fromFile && validVapidPair(fromFile.publicKey, fromFile.privateKey)) {
+      let pair = validPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
+      if (!pair && fromFile && validPair(fromFile.publicKey, fromFile.privateKey)) {
         pair = { publicKey: fromFile.publicKey, privateKey: fromFile.privateKey };
       }
-      if (!pair) pair = generateVapidKeys();
+      if (!pair) pair = generate();
       try {
-        const bundle = signVapidBundle(pair, VAPID_FLEET, RELAY_KEYS.sec);
-        writeJsonAtomic(RELAY_VAPID_KEY_FILE, bundle);
-        activateVapid(bundle.publicKey, bundle.privateKey, 'fleet-genesis', bundle);
-        console.log(`[vapid-fleet] genesis создал/подписал общий VAPID epoch=${bundle.epoch}`);
+        const bundle = signBundle(pair, fleet, relaySecretKey);
+        writeFile(keyFile, bundle);
+        activate(bundle.publicKey, bundle.privateKey, 'fleet-genesis', bundle);
+        logger.log(`[vapid-fleet] genesis создал/подписал общий VAPID epoch=${bundle.epoch}`);
+        return 'fleet-genesis';
       } catch (e) {
-        console.warn('[vapid-fleet] не удалось создать/сохранить общий VAPID:', e && e.message);
+        logger.warn('[vapid-fleet] не удалось создать/сохранить общий VAPID:', e && e.message);
+        return null;
       }
-      return;
     }
   }
 
   // Совместимость для bare-metal/стороннего standalone-релея без fleet-конфига.
-  let pair = validVapidPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
-  if (!pair && fromFile && validVapidPair(fromFile.publicKey, fromFile.privateKey)) {
+  let pair = validPair(fromEnv.publicKey, fromEnv.privateKey) ? fromEnv : null;
+  if (!pair && fromFile && validPair(fromFile.publicKey, fromFile.privateKey)) {
     pair = { publicKey: fromFile.publicKey, privateKey: fromFile.privateKey };
   }
-  if (!pair) pair = generateVapidKeys();
+  if (!pair) pair = generate();
   try {
     if (!fromFile || fromFile.publicKey !== pair.publicKey || fromFile.privateKey !== pair.privateKey) {
-      writeJsonAtomic(RELAY_VAPID_KEY_FILE, pair);
+      writeFile(keyFile, pair);
     }
-    activateVapid(pair.publicKey, pair.privateKey, 'standalone', null);
+    activate(pair.publicKey, pair.privateKey, 'standalone', null);
+    return 'standalone';
   } catch (e) {
-    console.warn('[push] не удалось создать/сохранить VAPID:', e && e.message);
+    logger.warn('[push] не удалось создать/сохранить VAPID:', e && e.message);
+    return null;
   }
+}
+function resolveVapidKeys() {
+  return resolveVapidKeysWith();
 }
 resolveVapidKeys();
 
@@ -870,16 +1185,53 @@ resolveVapidKeys();
 // генерация + персист (как relay-sign.key). Всё это едет в образе через watchtower.
 const TURN_SECRET_FILE = process.env.TURN_SECRET_FILE || path.join(path.dirname(DB_FILE), 'turn-secret');
 const COTURN_CONF_FILE = process.env.RELAY_COTURN_CONF || path.join(path.dirname(DB_FILE), 'turnserver.conf');
-function resolveTurnSecret() {
+/**
+ * Т-4: секрет TURN, и почему здесь НЕ отказ старта.
+ *
+ * Отличие от ключа подписи релея принципиальное. Тот пинят клиенты, и его смена
+ * отрезает их навсегда — потому там отказ в старте. Секрет TURN не пинят: его
+ * смена делает недействительными выданные часовые учётки, звонки перестают
+ * соединяться примерно на час и чинятся сами. Ронять из-за этого весь узел —
+ * лечение хуже болезни.
+ *
+ * Что здесь исправлено. Во-первых, нечитаемый СУЩЕСТВУЮЩИЙ файл больше не
+ * приводит к записи поверх него: прежний секрет мог быть цел, и затереть его,
+ * не сумев прочитать, значит превратить временную проблему с правами в
+ * постоянную потерю. Во-вторых, обе неудачи теперь громко названы: раньше узел
+ * молчал, а оператор видел только «звонки перестали соединяться после
+ * обновления» и не имел ни одной зацепки.
+ */
+function resolveTurnSecret({ fileSystem = fs } = {}) {
   if (process.env.TURN_SECRET) return process.env.TURN_SECRET; // явный override оператора
+  let mayPersist = true;
   try {
-    const f = fs.readFileSync(TURN_SECRET_FILE, 'utf8').trim();
+    const f = fileSystem.readFileSync(TURN_SECRET_FILE, 'utf8').trim();
     if (f) return f;
-  } catch (e) {}
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') {
+      // Файл есть, но не читается. Записывать поверх нельзя: под ним, скорее
+      // всего, лежит рабочий секрет, а мы просто не смогли до него добраться.
+      console.error(
+        `[turn] секрет ${TURN_SECRET_FILE} существует, но не читается (${(e && e.code) || 'ошибка'}). ` +
+          'Этот запуск работает на временном секрете, поверх файла НЕ пишу. ' +
+          'После рестарта выданные TURN-учётки протухнут — проверьте права.'
+      );
+      mayPersist = false;
+    }
+    // ENOENT — первый запуск: секрет генерируется ниже, это штатный путь.
+  }
   const gen = crypto.randomBytes(32).toString('hex');
-  try {
-    fs.writeFileSync(TURN_SECRET_FILE, gen, { mode: 0o600 });
-  } catch (e) {}
+  if (mayPersist) {
+    try {
+      fileSystem.writeFileSync(TURN_SECRET_FILE, gen, { mode: 0o600 });
+    } catch (e) {
+      console.error(
+        `[turn] не удалось сохранить секрет в ${TURN_SECRET_FILE} (${(e && e.code) || 'ошибка'}). ` +
+          'Секрет остаётся только в памяти: после рестарта он сменится, и выданные клиентам ' +
+          'учётки перестанут работать примерно на час. Дайте процессу право записи.'
+      );
+    }
+  }
   return gen;
 }
 
@@ -914,7 +1266,10 @@ function stopEmbeddedCoturn() {
   if (coturnChild) {
     try {
       coturnChild.kill('SIGTERM');
-    } catch (e) {}
+    } catch (e) {
+      // Процесс мог завершиться сам между проверкой и сигналом; ссылку
+      // обнуляем в любом случае, и перезапуск отключён флагом coturnStopped.
+    }
     coturnChild = null;
   }
 }
@@ -978,10 +1333,11 @@ const PREKEY_GET_MAX = 60;
 const PREKEY_TARGET_WINDOW_MS = Number(process.env.RELAY_PREKEY_TARGET_MS) || 60000;
 const PREKEY_TARGET_MAX = Number(process.env.RELAY_PREKEY_TARGET_MAX) || 30;
 const otpDrain = new Map(); // targetPubkey -> { start, count } (реально выданные OTP в окне)
-setInterval(() => {
-  const cutoff = Date.now() - PREKEY_TARGET_WINDOW_MS;
+function sweepOtpDrain(now = Date.now()) {
+  const cutoff = now - PREKEY_TARGET_WINDOW_MS;
   for (const [pk, d] of otpDrain) if (d.start < cutoff) otpDrain.delete(pk);
-}, PREKEY_TARGET_WINDOW_MS).unref();
+}
+setInterval(sweepOtpDrain, PREKEY_TARGET_WINDOW_MS).unref();
 const isB64Field = (s, max = 128) => typeof s === 'string' && s.length > 0 && s.length <= max;
 
 function verifySpkSignature(spkObj, signPublicKeyB64) {
@@ -1018,6 +1374,8 @@ const server = http.createServer((req, res) => {
         messages: st.totalQueued,
         relays: relayDir.length,
         vapid: !!vapidPublicKey(),
+        // ВЫС-51: это БАЗОВЫЙ ключ узла, по которому оператор сверяет
+        // синхронность флота. Клиентам он не выдаётся — у каждого своя пара.
         vapidPublicKey: vapidPublicKey(),
         vapidSource: vapidKeySource,
         vapidFleetMember: !!VAPID_MEMBER,
@@ -1050,6 +1408,46 @@ const server = http.createServer((req, res) => {
   }
   // Публичный каталог релеев — любой (клиент или другой релей) может забрать его
   // отсюда. Это и есть точка, из которой список реплицируется по сети.
+  // ПЯЩ-1: репликация ящика между узлами. Отдаём записки, появившиеся после
+  // курсора соседа, — тем же способом, каким уже реплицируется каталог релеев.
+  //
+  // Отдавать можно кому угодно и незачем что-либо скрывать: записка не несёт ни
+  // автора, ни адресата, а их не знает и сам отдающий. Ограничение только на
+  // объём одного ответа.
+  if (req.url === '/mbx' || req.url.startsWith('/mbx?')) {
+    // ВЫС-19: этот GET отдавал до 1,2 МБ на запрос в сорок байт — усилитель
+    // ×30000 — без аутентификации и без ограничения частоты. Записки по-прежнему
+    // открыты (они не несут ни автора, ни адресата, и репликация между
+    // операторами по замыслу свободна), но дёргать эндпойнт как насос больше
+    // нельзя: частота на IP ограничена, а страница ответа уменьшена — полный
+    // перенос и так идёт постранично по курсору. Сосед своего флота с общим
+    // токеном федерации (тем же, что у POST /relays) лимиту не подчиняется:
+    // его догоняющая репликация после простоя — самый законный из потоков.
+    const trustedPeer =
+      !!GOSSIP_TOKEN && safeEqual((req.headers && req.headers['x-gossip-token']) || '', GOSSIP_TOKEN);
+    if (!trustedPeer && !mbxHttpRate.allow(clientIp(req), Date.now())) {
+      counters.mbxHttpLimited += 1;
+      res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '60' });
+      res.end('rate');
+      return;
+    }
+    const after = Number(new URL(req.url, 'http://x').searchParams.get('after')) || 0;
+    const rows = store.mbxAfter(after, trustedPeer ? mbx.SYNC_LIMIT : MBX_HTTP_PAGE);
+    const last = rows.length ? rows[rows.length - 1].seq : after;
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+    res.end(
+      JSON.stringify({
+        seq: last,
+        slot: mbx.slotOf(Date.now()),
+        records: mbx
+          .packRecords(rows.map((row) => ({ key: row.key, value: row.val, mac: row.mac })))
+          .toString('base64'),
+        slots: rows.map((row) => row.slot),
+      })
+    );
+    return;
+  }
+
   if (req.url === '/relays') {
     // POST — другой релей сообщает о себе/своём каталоге (push-gossip): так
     // сосед, у которого мы в peers, узнаёт про нас без ручной настройки.
@@ -1077,7 +1475,11 @@ const server = http.createServer((req, res) => {
         try {
           const j = JSON.parse(body);
           if (gossipOk && Array.isArray(j.relays)) learnRelays(j.relays.filter(isValidRelayUrl));
-        } catch (e) {}
+        } catch (e) {
+          // Тело приходит от кого угодно из сети: мусор вместо JSON — обычное
+          // дело, каталог отдаём и без него. Жаловаться на чужой ввод значило
+          // бы дать любому желающему наполнять наш лог.
+        }
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(JSON.stringify({ relays: relayDir }));
       });
@@ -1200,6 +1602,41 @@ function queuedMessageFrame(item) {
   return frame;
 }
 
+/**
+ * ПРФ-14: отдать получателю кадр `message` — двоично, если он это умеет.
+ *
+ * Решение принимается ПО СОЕДИНЕНИЮ ПОЛУЧАТЕЛЯ, а не по отправителю: конверт
+ * лежит в очереди в одном и том же виде, а как его вынуть — дело того, кто
+ * забирает. Поэтому клиент прежней версии продолжает получать ровно тот же
+ * JSON-кадр, что и раньше, независимо от того, кто и чем ему написал.
+ *
+ * Двоично уходит только запечатанный конверт (см. envelopeFrame.sealedBytes).
+ * Незапечатанный отдаётся JSON-ом: разложить ЕГО поля по открытому заголовку
+ * значило бы вернуть релею отправителя и счётчики храповика.
+ *
+ * `immediate` повторяет разделение из deliver(): кадр, не попавший в очередь,
+ * нельзя откладывать в пакет — от него зависит смысл ответа отправителю.
+ */
+function sendMessageFrame(ws, frame, sizeHint, { immediate = false } = {}) {
+  if (ws && ws.binaryEnvelopeV1 && ws.readyState === ws.OPEN) {
+    const bytes = envelopeFrame.sealedBytes(frame.envelope);
+    if (bytes) {
+      try {
+        const header = envelopeFrame.buildMessageHeader(frame);
+        // Порядок кадров обязан сохраниться. Квитанции копятся в пакете до 10 мс,
+        // а двоичный кадр уходит сразу — не вытолкни мы накопленное сейчас,
+        // получатель увидел бы сообщение раньше квитанций, отправленных до него.
+        if (ws.frameBatchQueue && ws.frameBatchQueue.length) flushFrameBatch(ws);
+        return sendBinary(ws, header, bytes);
+      } catch (error) {
+        // Заголовок не влез (16 КиБ на roster и сертификат) — это не повод
+        // терять сообщение: отдаём прежним путём.
+      }
+    }
+  }
+  return immediate ? sendImmediate(ws, frame) : send(ws, frame, sizeHint);
+}
+
 function queuedBinaryHeader(item) {
   const header = {
     type: 'attachment-chunk',
@@ -1228,13 +1665,18 @@ function senderMetadata(ws) {
 // Follower может получить общий VAPID уже после того, как PWA аутентифицировалась.
 // Не заставляем пользователя ждать следующего реконнекта: сообщаем новый публичный
 // ключ всем уже готовым клиентам отдельным совместимым кадром.
-onVapidActivated = (publicKey) => {
+//
+// ВЫС-51: каждому — СВОЙ ключ, выведенный из его адреса. Разослать здесь общий
+// (тот, что приехал в bundle) значило бы отменить всю доработку ровно для тех
+// клиентов, которые дождались раздачи ключа, — а таких на follower'е
+// большинство.
+onVapidActivated = () => {
   for (const ws of wss.clients) {
-    if (ws.authed) send(ws, { type: 'vapid-key', vapidPublicKey: publicKey });
+    if (ws.authed) send(ws, { type: 'vapid-key', vapidPublicKey: vapidPublicKeyFor(ws.pubkey) });
   }
 };
 
-// S1: vergüt поток с backpressure. Раньше flushQueue материализовал ВСЮ очередь
+// S1: выгрузка очереди потоком, с backpressure. Раньше flushQueue материализовал ВСЮ очередь
 // получателя разом (queueFor → JSON.parse каждого тела) и синхронно писал всё в
 // буфер сокета без учёта bufferedAmount: 400 конвертов по 16 МБ (в пределах квот)
 // давали ~6 ГБ аллокаций в одном тике → OOM/блокировка event loop, а реконнекты
@@ -1243,47 +1685,147 @@ onVapidActivated = (publicKey) => {
 const FLUSH_HIGH_WATER = 4 * 1024 * 1024; // порог bufferedAmount, при котором ждём
 const FLUSH_RESUME_MS = 25; // пауза перед проверкой backpressure
 
+/**
+ * АУД-06 (продолжение): тело конверта читается с диска АСИНХРОННО.
+ *
+ * ЧТО БЫЛО НЕ ТАК
+ *
+ * Список идентификаторов брался дёшево, но каждое тело — синхронным
+ * `readFileSync` внутри `while`. Замер: выгрузка 500 чанков по 300 КБ держала
+ * событийный цикл 102–111 мс ОДНИМ СПЛОШНЫМ КУСКОМ — за это время узел не
+ * принимает ни одного кадра, не отвечает на heartbeat и не обслуживает
+ * остальных. И происходит это именно тогда, когда нагрузка максимальна: при
+ * переподключении, то есть у всех сразу после сбоя сети.
+ *
+ * ЧТО СТАЛО
+ *
+ * Асинхронное чтение той же очереди: 27–29 мс суммарно, максимум 0,38 мс за
+ * раз, задержка таймеров не больше 0,55 мс. Работа та же, но цикл отдаётся
+ * между конвертами.
+ *
+ * ЧТО ИЗ ЭТОГО СЛЕДУЕТ ДЛЯ КОДА
+ *
+ * Между чтением и записью в сокет теперь есть пауза, а значит появляются два
+ * состояния, которых раньше не существовало: сокет мог закрыться, пока читалось
+ * тело (поэтому проверка повторяется ПОСЛЕ await), и отказ чтения теперь
+ * отвергнутое обещание, а не исключение (поэтому у запуска есть catch).
+ */
 function flushQueue(pubkey, ws, onComplete) {
   const ids = store.queueIdsFor(pubkey);
   let i = 0;
-  function pump() {
+  async function pump() {
     if (ws.readyState !== ws.OPEN) return; // получатель ушёл — прекращаем
     while (i < ids.length) {
       // backpressure: не заливаем сокет, если предыдущее ещё не ушло в сеть.
       if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > FLUSH_HIGH_WATER) {
-        setTimeout(pump, FLUSH_RESUME_MS);
+        setTimeout(start, FLUSH_RESUME_MS);
         return;
       }
-      const item = store.getItem(ids[i]);
+      const item = await store.getItemAsync(ids[i]);
       i += 1;
+      // Сокет мог закрыться, пока читалось тело. В синхронной версии этого не
+      // могло случиться, поэтому проверки здесь и не было.
+      if (ws.readyState !== ws.OPEN) return;
       // АУД-12: размер конверта известен из очереди — сериализовать кадр ради
       // одной длины больше не нужно.
-      if (item) send(ws, queuedMessageFrame(item), item.bytes);
+      if (item) sendMessageFrame(ws, queuedMessageFrame(item), item.bytes);
     }
     if (onComplete) onComplete();
   }
-  pump();
+  function start() {
+    // Отказ чтения не должен превращаться в необработанное отвергнутое обещание:
+    // на релее это глобальный обработчик и запись в лог без всякого контекста.
+    pump().catch((error) => console.warn('[queue] выгрузка прервана:', (error && error.message) || error));
+  }
+  start();
   return ids.length;
 }
 
 function flushBinaryQueue(pubkey, ws) {
   const ids = store.binaryQueueIdsFor(pubkey);
   let index = 0;
-  function pump() {
+  async function pump() {
     if (ws.readyState !== ws.OPEN) return;
     while (index < ids.length) {
       if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > FLUSH_HIGH_WATER) {
-        setTimeout(pump, FLUSH_RESUME_MS);
+        setTimeout(start, FLUSH_RESUME_MS);
         return;
       }
-      const item = store.getBinaryItem(ids[index]);
+      const item = await store.getBinaryItemAsync(ids[index]);
       index += 1;
+      if (ws.readyState !== ws.OPEN) return;
       if (item) sendBinary(ws, queuedBinaryHeader(item), item.payload);
     }
   }
-  pump();
+  function start() {
+    pump().catch((error) =>
+      console.warn('[queue] выгрузка вложений прервана:', (error && error.message) || error)
+    );
+  }
+  start();
   return ids.length;
 }
+
+/**
+ * СРВ-11: значение поля `queued` в квитанции. КОНСТАНТА, а не состояние.
+ *
+ * ЧТО БЫЛО НЕ ТАК
+ *
+ * `deliver` возвращал `queued:false`, если кадр ушёл в живой сокет получателя, и
+ * `queued:true`, если лёг в очередь. Это значение уезжало отправителю в ack.
+ * То есть релей отвечал на вопрос, которого ему никто не задавал: «этот адрес
+ * сейчас в сети?».
+ *
+ * Спросить мог кто угодно. Регистрация свободна — достаточно сгенерировать пару
+ * ключей; адрес получателя есть у любого, кто когда-либо был в переписке или
+ * получил визитку. Служебный (`silent`) конверт получателя не будит и в UI не
+ * виден: пуш для него не отправляется, а конверт при онлайне просто уходит в
+ * сокет и отбрасывается клиентом. Ограничение — только частота кадров (80/с).
+ *
+ * Из посекундных ответов складывается профиль присутствия: во сколько человек
+ * встаёт и ложится, когда он в дороге (обрывы), в какие часы работает, был ли он
+ * онлайн в конкретную минуту. Опросив два адреса, видно и корреляцию — «эти двое
+ * в сети одновременно», то есть граф общения, ради сокрытия которого сделаны
+ * sealed sender и запечатанные метаданные очереди. Ни Signal, ни WhatsApp такого
+ * не отдают: presence у них не серверное понятие.
+ *
+ * КАК УСТРОЕНО ЗДЕСЬ
+ *
+ * Поле осталось на проводе (его читают старые клиенты), но перестало быть
+ * состоянием: в любой квитанции стоит одно и то же значение. Различить онлайн и
+ * офлайн по ответу больше нельзя — ответ одинаков.
+ *
+ * Значение выбрано `true` и это не подгонка: конверт кладётся в очередь ВСЕГДА,
+ * до всякой проверки сокета, и лежит там до квитанции `received` от получателя.
+ * Живая отправка — лишь ускорение поверх очереди, а не замена ей. Так что
+ * «принят и ждёт получателя» верно для каждого принятого конверта; неверным был
+ * как раз прежний `queued:false`, который обещал доставку, хотя копия оставалась
+ * в очереди.
+ *
+ * Полезное поведение не теряется. Настоящая доставка подтверждается отдельным
+ * кадром `delivered` — его релей шлёт, когда ПОЛУЧАТЕЛЬ прислал `received`, то
+ * есть разобрал конверт. Это сквозная квитанция (её нельзя получить, не имея
+ * рабочей сессии с адресом), а не наблюдение сервера за сокетами, и именно на
+ * ней стоят галочки в переписке. Признак `dropped` (конверт не принят) тоже
+ * остаётся — без него клиент вычеркнул бы сообщение из outbox и потерял его.
+ *
+ * ЧЕГО ЭТА МЕРА НЕ ДАЁТ
+ *
+ * Узкая щель остаётся у `dropped`: он поднимается, только когда очередь
+ * получателя забита под потолок И у отправителя нет своих слотов, а при живом
+ * сокете конверт в этой ситуации всё равно уходит напрямую. Значит для жертвы с
+ * ПЕРЕПОЛНЕННОЙ очередью ответ снова различает состояния. Закрыть это в ack
+ * нельзя: отказ принять конверт — то самое, что клиент обязан узнать, иначе
+ * сообщение молча пропадёт. Лечится это на уровне квот (server/store.js), где
+ * свежий отправитель не должен получать отказ вместо вытеснения; здесь мы
+ * ограничиваемся тем, что не создаём БЕСПЛАТНОГО опроса — забить чужую очередь
+ * до потолка стоит сотен конвертов с нескольких личностей и само по себе шумно.
+ *
+ * Счётчики `licno_messages_delivered_online_total` / `..._queued_offline_total`
+ * различие сохраняют, но это агрегат по узлу без адресов, и /metrics закрыт от
+ * публичного доступа (M-1) — оракула из них не собрать.
+ */
+const ACK_QUEUED = true;
 
 function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   const id = nextId();
@@ -1307,6 +1849,8 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
     maxPerSender: MAX_QUEUE_PER_SENDER,
     maxTotal: MAX_TOTAL_MESSAGES,
     maxTotalBytes: MAX_QUEUE_BYTES,
+    reserve: QUEUE_RESERVE_SLOTS,
+    reciprocityTtlMs: QUEUE_TTL_MS,
   });
 
   const ws = online.get(to);
@@ -1320,9 +1864,12 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   // его сразу, а не откладываем на 10 мс в пакет, чтобы `queued:false` означал
   // реальную передачу в WebSocket. Для сохранённого кадра пакет безопасен — при
   // обрыве до flush он останется в очереди и придёт после reconnect.
-  if (ws && (stored ? send(ws, liveFrame, metadata.envelopeBytes) : sendImmediate(ws, liveFrame))) {
+  if (ws && sendMessageFrame(ws, liveFrame, metadata.envelopeBytes, { immediate: !stored })) {
     counters.deliveredOnline += 1;
-    return { queued: false, id };
+    // СРВ-11: живая отправка состоялась, но отправителю об этом не сообщаем —
+    // именно здесь раньше уезжал `queued:false`, по которому строился профиль
+    // присутствия. Счётчик (агрегат по узлу, без адресов) состояние сохраняет.
+    return { queued: ACK_QUEUED, id };
   }
 
   // СРВ-2/СРВ-5: конверт НЕ влез в очередь (полная + нет своих слотов) и не ушёл
@@ -1331,7 +1878,9 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   // со флагом — клиент помечает «не доставлено» и не выдаёт ложный ✓.
   if (!stored) {
     counters.dropped += 1;
-    return { queued: false, dropped: true, id };
+    // СРВ-11: `queued` и здесь константа — различие несёт только `dropped`, без
+    // которого клиент вычеркнул бы сообщение из outbox и молча его потерял.
+    return { queued: ACK_QUEUED, dropped: true, id };
   }
 
   // recipient offline -> maybe wake them
@@ -1346,11 +1895,11 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
     if (token && Date.now() - (lastCallPushAt.get(to) || 0) >= CALL_PUSH_MIN_INTERVAL_MS) {
       lastCallPushAt.set(to, Date.now());
       counters.pushes += 1;
-      sendCallPush(token).then(onInvalid);
+      sendCallPush(token, to).then(onInvalid);
     }
-    return { queued: true, id };
+    return { queued: ACK_QUEUED, id };
   }
-  if (silent) return { queued: true, id }; // control message: deliver, no push
+  if (silent) return { queued: ACK_QUEUED, id }; // control message: deliver, no push
   // ПРФ-4: троттлинг считается на пару «получатель + чат», а не на получателя
   // целиком. Раньше сообщения из РАЗНЫХ чатов в одном 20-секундном окне давали
   // один пуш — остальные чаты устройство не будили вовсе, и это читалось как
@@ -1359,9 +1908,64 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   const chatTag = chatNotificationTag(metadata.fromAccount || from);
   if (token && messagePushGate.allow(to, chatTag, Date.now())) {
     counters.pushes += 1;
-    sendPush(token, metadata.notificationId || id, chatTag).then(onInvalid);
+    // ВЫС-51: адрес получателя — им выбирается VAPID-пара устройства. В само
+    // уведомление он не попадает (см. sendPush).
+    sendPush(token, metadata.notificationId || id, chatTag, to).then(onInvalid);
   }
-  return { queued: true, id };
+  return { queued: ACK_QUEUED, id };
+}
+
+/**
+ * ПРФ-14: приём конверта — ОДИН путь для JSON-кадра `send` и двоичного `send-v1`.
+ *
+ * Вынесено из обработчика кадра именно ради этого. Квоты очереди, потолок
+ * конверта, счётчики, признак `dropped` и форма квитанции обязаны совпадать до
+ * байта: разойдись они, двоичный путь стал бы обходом ограничений очереди
+ * (отправитель без квоты) или новым оракулом присутствия (квитанция другой
+ * формы). Проверяется тестом «квитанции обоих путей неразличимы».
+ *
+ * `envelopeJson` вызывающий может передать готовым (двоичный путь строит его
+ * сам, чтобы не сериализовать заново) — как и раньше на JSON-пути (АУД-06).
+ */
+function acceptEnvelope(ws, { to, envelope, silent, callPush, ref, envelopeJson, noMeta }) {
+  // СРВ-4: адрес получателя ограничен по длине (см. MAX_ADDR_LEN) — иначе
+  // гигантский `to` при крошечном envelope обходил байтовый потолок очереди.
+  if (to.length > MAX_ADDR_LEN) {
+    return send(ws, { type: 'error', error: 'invalid recipient' });
+  }
+  // АУД-06: сериализуем конверт ОДИН раз — и для проверки размера, и для
+  // хранения. Раньше он сериализовался здесь ради длины, строка тут же
+  // выбрасывалась, а store.enqueue строил её заново: на конверте в семь
+  // мегабайт это лишний полный проход по памяти в однопоточном процессе, то
+  // есть пауза для всех пользователей узла.
+  let json = envelopeJson;
+  if (json === undefined) {
+    try {
+      json = JSON.stringify(envelope);
+    } catch (e) {
+      return send(ws, { type: 'error', error: 'invalid envelope' });
+    }
+  }
+  const size = Buffer.byteLength(json);
+  if (size > MAX_ENVELOPE_BYTES) {
+    return send(ws, { type: 'error', error: 'envelope too large' });
+  }
+  counters.msgsIn += 1;
+  const r = deliver(ws.pubkey, to, envelope, silent, callPush, {
+    // ВЫС-41: отправитель просит НЕ подставлять его метаданные снаружи —
+    // значит получатель читает их изнутри запечатанного конверта, и внешняя
+    // копия была бы ровно тем, что запечатывание и убирает: адрес аккаунта и
+    // весь список устройств открытым текстом в очереди на диске.
+    ...(noMeta ? {} : senderMetadata(ws)),
+    notificationId: typeof ref === 'string' ? ref.slice(0, 160) : undefined,
+    envelopeJson: json,
+    envelopeBytes: size,
+  });
+  // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
+  // доставлено» вместо ложного «отправлено». Старый клиент поле игнорирует.
+  // СРВ-11: `queued` больше не состояние получателя, а константа (см. ACK_QUEUED).
+  // Отличить «в сети» от «не в сети» по квитанции нельзя ни здесь, ни в binary-ack.
+  return send(ws, { type: 'ack', ref, id: r.id, queued: r.queued, dropped: !!r.dropped });
 }
 
 function deliverBinary(from, header, payload, metadata = {}) {
@@ -1381,6 +1985,8 @@ function deliverBinary(from, header, payload, metadata = {}) {
     maxPerSender: MAX_QUEUE_PER_SENDER,
     maxTotal: MAX_TOTAL_MESSAGES,
     maxTotalBytes: MAX_QUEUE_BYTES,
+    reserve: QUEUE_RESERVE_SLOTS,
+    reciprocityTtlMs: QUEUE_TTL_MS,
   });
   const recipient = online.get(header.to);
   if (recipient && sendBinary(recipient, queuedBinaryHeader({
@@ -1392,20 +1998,29 @@ function deliverBinary(from, header, payload, metadata = {}) {
     metadata,
   }), payload)) {
     counters.deliveredOnline += 1;
-    return { id, queued: false, dropped: false };
+    // СРВ-11: тот же оракул присутствия жил и на бинарном пути. Кадр
+    // `attachment-chunk` отправляется так же свободно, как обычный конверт, — и
+    // `binary-ack` отвечал онлайн/офлайн ровно тем же способом. Константа здесь
+    // обязана совпадать с обычной квитанцией, иначе опрос просто переехал бы на
+    // вложения.
+    return { id, queued: ACK_QUEUED, dropped: false };
   }
   if (!stored) {
     counters.dropped += 1;
-    return { id, queued: false, dropped: true };
+    return { id, queued: ACK_QUEUED, dropped: true };
   }
   counters.queuedOffline += 1;
-  return { id, queued: true, dropped: false };
+  return { id, queued: ACK_QUEUED, dropped: false };
 }
 
 // Recipient confirmed receipt of `id`: drop it from their queue and tell the
 // original sender (if online) that it was delivered.
 function ackReceived(recipientPubkey, id) {
-  const from = store.ack(recipientPubkey, id); // from_pk, либо null если нет/не его
+  // ГРФ-1: адрес отправителя достаётся из зашифрованных метаданных строки очереди
+  // (в базе открытым текстом его больше нет). null — конверта нет, он не этого
+  // получателя, либо метаданные не открылись (потерян файл ключа): тогда квитанцию
+  // «доставлено» отправить некому, но сам конверт из очереди уходит как обычно.
+  const from = store.ack(recipientPubkey, id);
   if (from) {
     counters.acked += 1;
     const senderWs = online.get(from);
@@ -1440,6 +2055,31 @@ function rateLimited(ws) {
 }
 
 /**
+ * КРИТ-04: потолок на ДОРОГИЕ кадры — минутное окно на соединение.
+ *
+ * Считается отдельно для каждого вида: у них разная цена и разная нормальная
+ * частота, и общий счётчик означал бы, что поиск в ящике съедает право
+ * переписать список устройств. Возвращает true, когда пора отказать.
+ *
+ * Счётчик увеличивается ДО решения — то есть превышение продолжает считаться, и
+ * молотящий в лимит соединение не «сбрасывает» его редкими паузами.
+ */
+function costlyLimited(ws, kind, max, now = Date.now()) {
+  if (!ws.costly) ws.costly = new Map();
+  const state = ws.costly.get(kind);
+  let over;
+  if (!state || now - state.start > COSTLY_WINDOW_MS) {
+    ws.costly.set(kind, { start: now, count: 1 });
+    over = 1 > max;
+  } else {
+    state.count += 1;
+    over = state.count > max;
+  }
+  if (over) counters.costlyRefused += 1;
+  return over;
+}
+
+/**
  * БЕЗ-5: учёт входящего потока. Возвращает true, если соединение пора рвать
  * (длительное превышение = абуз). При обычном превышении не рвёт и не отказывает,
  * а перестаёт читать сокет до конца окна: TCP-окно закрывается, отправитель
@@ -1457,12 +2097,17 @@ function byteLimited(ws, bytes) {
     ws.throttledUntil = Date.now() + gate.pauseMs;
     try {
       ws.pause();
-    } catch (e) {}
+    } catch (e) {
+      // Приторможенный сокет мог уже закрыться. Придержать нечего — счётчики
+      // лимита всё равно выставлены, и следующий кадр от него не пройдёт.
+    }
     const timer = setTimeout(() => {
       ws.throttledUntil = 0;
       try {
         ws.resume();
-      } catch (e) {}
+      } catch (e) {
+        // Сокет закрылся, пока стоял на паузе: возобновлять нечего.
+      }
     }, gate.pauseMs);
     // Придержанный сокет не должен удерживать процесс от штатного завершения.
     if (typeof timer.unref === 'function') timer.unref();
@@ -1481,36 +2126,55 @@ function closeRevokedDevice(devicePk, accountPk) {
     } catch (e) {
       try {
         target.terminate();
-      } catch (e2) {}
+      } catch (e2) {
+        // Отозванному устройству закрыли соединение обоими способами. Если и
+        // terminate() не сработал, сокета уже нет — цель достигнута.
+      }
     }
   }
 }
 
+/**
+ * Состояние соединения в том виде, в каком его читает правило прав на ростер.
+ * Собирается по ЗАЯВЛЕННОМУ адресу аккаунта: до проверки подписей другого у нас
+ * нет, а само правило заявленному ничего не доверяет — см. rosterWriteGate.
+ */
+function rosterSession(ws, accountPublicKey) {
+  const known =
+    typeof accountPublicKey === 'string' && accountPublicKey ? store.getAccount(accountPublicKey) : null;
+  return {
+    proven: !!ws.proven,
+    sessionPublicKey: ws.pubkey,
+    knownAccountSignPublicKey: known ? known.accountSignPublicKey : null,
+    boundRootSignPublicKey:
+      typeof accountPublicKey === 'string' && accountPublicKey ? store.getSignKey(accountPublicKey) : null,
+  };
+}
+
 function acceptSignedRoster(ws, candidate) {
+  // КРИТ-04: права — ДО криптографии. Кадр может нести до тридцати двух
+  // сертификатов, и каждый стоит проверки подписи; выяснять после них, что
+  // прислал их посторонний, значит позволять постороннему назначать узлу работу.
+  // Заявленным полям здесь не доверяется ничего: то же правило применяется ниже
+  // к разобранному объекту, и решает именно оно.
+  const claimed = candidate && typeof candidate === 'object' ? candidate : {};
+  const early = rosterWriteGate(claimed, rosterSession(ws, claimed.accountPublicKey));
+  if (!early.ok) {
+    counters.rosterDeniedEarly += 1;
+    return { ok: false, reason: early.reason };
+  }
+
   let roster;
   try {
     roster = assertSignedRoster(candidate);
   } catch (error) {
     return { ok: false, reason: 'invalid-roster' };
   }
-  const known = store.getAccount(roster.accountPublicKey);
-  if (known) {
-    if (known.accountSignPublicKey !== roster.accountSignPublicKey) {
-      return { ok: false, reason: 'root-key-conflict' };
-    }
-  } else {
-    // Первичное создание аккаунта возможно только из доказанного сеанса прежнего
-    // root-адреса. Поэтому чужой подписанный объект не может занять account_pk до
-    // первого выхода владельца телефона на этот relay.
-    const boundRootSign = store.getSignKey(roster.accountPublicKey);
-    if (
-      !ws.proven ||
-      ws.pubkey !== roster.accountPublicKey ||
-      boundRootSign !== roster.accountSignPublicKey
-    ) {
-      return { ok: false, reason: 'account-bootstrap-requires-root' };
-    }
-  }
+  // Второй, авторитетный вызов — уже по проверенным полям. Он остаётся тем
+  // единственным местом, которое решает: подпись разобрана, значит и адрес
+  // аккаунта с корневым ключом теперь настоящие, а не заявленные.
+  const allowed = rosterWriteGate(roster, rosterSession(ws, roster.accountPublicKey));
+  if (!allowed.ok) return { ok: false, reason: allowed.reason };
   const result = store.putAccountRoster(roster);
   if (!result.ok) return result;
   for (const devicePk of result.revokedDeviceKeys || []) closeRevokedDevice(devicePk, roster.accountPublicKey);
@@ -1549,6 +2213,84 @@ function bindSocketToCertifiedDevice(ws, candidate) {
   return { ok: true, record, roster: store.getAccountRoster(certificate.accountPublicKey) };
 }
 
+function enforceAuthTimeout(ws) {
+  if (ws.authed) return false;
+  send(ws, { type: 'error', error: 'auth timeout' });
+  ws.terminate();
+  return true;
+}
+
+function handleSocketMessage(ws, raw, isBinary, options = {}) {
+  const handleBinary = options.handleBinary || handleBinaryFrameSafely;
+  const handleJson = options.handleJson || handleFrameSafely;
+  const topLevel = options.topLevel || handleTopLevelError;
+  const logger = options.logger || console;
+  if (rateLimited(ws)) {
+    send(ws, { type: 'error', error: 'rate limit' });
+    ws.terminate();
+    return;
+  }
+  // БЕЗ-5: байтовый потолок. Кадр всё равно обрабатываем (иначе легитимный
+  // отправитель потеряет чанк вложения) — притормаживание делает byteLimited.
+  if (byteLimited(ws, raw.length || 0)) {
+    send(ws, { type: 'error', error: 'byte rate limit' });
+    ws.terminate();
+    return;
+  }
+
+  if (isBinary) {
+    try {
+      handleBinary(ws, raw);
+    } catch (error) {
+      if (isFatalDbError(error)) {
+        topLevel('binary-frame-fatal-db', error);
+        return;
+      }
+      send(ws, { type: 'binary-error', error: 'invalid binary frame' });
+    }
+    return;
+  }
+
+  // АУД-06: отвергаем заведомо негодный кадр ДО toString и JSON.parse. Оба
+  // прохода идут по всему буферу и на 33 мегабайтах занимают однопоточный узел
+  // целиком — при том что кадр такого размера всё равно будет отвергнут ниже.
+  const frameLimit = ws.authed ? MAX_JSON_FRAME_BYTES : MAX_PREAUTH_FRAME_BYTES;
+  if (raw.length > frameLimit) {
+    counters.oversized += 1;
+    send(ws, { type: 'error', error: 'frame too large' });
+    // До аутентификации это заведомо не наш клиент: рвём, а не переписываемся.
+    if (!ws.authed) return ws.terminate();
+    return;
+  }
+
+  let msg;
+  try {
+    msg = JSON.parse(raw.toString());
+  } catch (e) {
+    return send(ws, { type: 'error', error: 'bad json' });
+  }
+  try {
+    handleJson(ws, msg);
+  } catch (e) {
+    // СРВ-5: фатальный сбой БД (SQLITE_CORRUPT/FULL/IOERR/READONLY) НЕ глушим здесь.
+    // Раньше почти все обращения к БД шли внутри handleFrameSafely, и этот catch
+    // отвечал `server error`, из-за чего механизм L4 (честный выход под рестарт
+    // systemd) не срабатывал: узел «работал», ничего не доставляя и не удаляя.
+    // Пробрасываем такие ошибки в top-level обработчик для управляемого выхода.
+    if (isFatalDbError(e)) {
+      topLevel('frame-fatal-db', e);
+      return;
+    }
+    logger.error('[frame]', e && e.stack ? e.stack : e);
+    try {
+      send(ws, { type: 'error', error: 'server error' });
+    } catch (e2) {
+      // Сама ошибка уже ушла в лог строкой выше; ответ клиенту — вежливость,
+      // а его сокет к этому моменту вполне мог оборваться.
+    }
+  }
+}
+
 wss.on('connection', (ws, req) => {
   // H4: per-IP лимит одновременных соединений (защита от коннект-флуда).
   const ip = clientIp(req);
@@ -1556,7 +2298,10 @@ wss.on('connection', (ws, req) => {
   if (nConn > MAX_CONN_PER_IP) {
     try {
       send(ws, { type: 'error', error: 'too many connections' });
-    } catch (e) {}
+    } catch (e) {
+      // Соединение всё равно закрывается следующей строкой: причина отказа —
+      // любезность, а не часть протокола.
+    }
     return ws.terminate();
   }
   ipConns.set(ip, nConn);
@@ -1573,6 +2318,10 @@ wss.on('connection', (ws, req) => {
   ws.deviceId = null;
   ws.deviceCertificate = null;
   ws.frameBatchV1 = false;
+  // ПРФ-14: пока получатель не объявил обратного, он получает конверты JSON-ом.
+  // Умолчание «не умеет» — единственная сторона ошибки, при которой обновление
+  // релея не ломает уже установленные приложения.
+  ws.binaryEnvelopeV1 = false;
   ws.frameBatchQueue = [];
   ws.frameBatchBytes = 0;
   ws.frameBatchTimer = null;
@@ -1588,78 +2337,16 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {
     try {
       ws.terminate();
-    } catch (e) {}
+    } catch (e) {
+      // Сюда приходят обрывы вроде ECONNRESET — сокета зачастую уже нет, и
+      // terminate() бросает по той же причине, по которой мы его зовём.
+    }
   });
 
   // Drop connections that never authenticate.
-  ws.authTimer = setTimeout(() => {
-    if (!ws.authed) {
-      send(ws, { type: 'error', error: 'auth timeout' });
-      ws.terminate();
-    }
-  }, AUTH_TIMEOUT_MS);
+  ws.authTimer = setTimeout(() => enforceAuthTimeout(ws), AUTH_TIMEOUT_MS);
 
-  ws.on('message', (raw, isBinary) => {
-    if (rateLimited(ws)) {
-      send(ws, { type: 'error', error: 'rate limit' });
-      ws.terminate();
-      return;
-    }
-    // БЕЗ-5: байтовый потолок. Кадр всё равно обрабатываем (иначе легитимный
-    // отправитель потеряет чанк вложения) — притормаживание делает byteLimited.
-    if (byteLimited(ws, raw.length || 0)) {
-      send(ws, { type: 'error', error: 'byte rate limit' });
-      ws.terminate();
-      return;
-    }
-
-    if (isBinary) {
-      try {
-        handleBinaryFrameSafely(ws, raw);
-      } catch (error) {
-        if (isFatalDbError(error)) {
-          handleTopLevelError('binary-frame-fatal-db', error);
-          return;
-        }
-        send(ws, { type: 'binary-error', error: 'invalid binary frame' });
-      }
-      return;
-    }
-
-    // АУД-06: отвергаем заведомо негодный кадр ДО toString и JSON.parse. Оба
-    // прохода идут по всему буферу и на 33 мегабайтах занимают однопоточный узел
-    // целиком — при том что кадр такого размера всё равно будет отвергнут ниже.
-    const frameLimit = ws.authed ? MAX_JSON_FRAME_BYTES : MAX_PREAUTH_FRAME_BYTES;
-    if (raw.length > frameLimit) {
-      counters.oversized += 1;
-      send(ws, { type: 'error', error: 'frame too large' });
-      // До аутентификации это заведомо не наш клиент: рвём, а не переписываемся.
-      if (!ws.authed) return ws.terminate();
-      return;
-    }
-
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch (e) {
-      return send(ws, { type: 'error', error: 'bad json' });
-    }
-    try {
-      handleFrameSafely(ws, msg);
-    } catch (e) {
-      // СРВ-5: фатальный сбой БД (SQLITE_CORRUPT/FULL/IOERR/READONLY) НЕ глушим здесь.
-      // Раньше почти все обращения к БД шли внутри handleFrameSafely, и этот catch
-      // отвечал `server error`, из-за чего механизм L4 (честный выход под рестарт
-      // systemd) не срабатывал: узел «работал», ничего не доставляя и не удаляя.
-      // Пробрасываем такие ошибки в top-level обработчик для управляемого выхода.
-      if (isFatalDbError(e)) {
-        handleTopLevelError('frame-fatal-db', e);
-        return;
-      }
-      console.error('[frame]', e && e.stack ? e.stack : e);
-      try { send(ws, { type: 'error', error: 'server error' }); } catch (e2) {}
-    }
-  });
+  ws.on('message', (raw, isBinary) => handleSocketMessage(ws, raw, isBinary));
 
   ws.on('close', () => {
     clearTimeout(ws.frameBatchTimer);
@@ -1680,6 +2367,23 @@ wss.on('connection', (ws, req) => {
 function handleBinaryFrameSafely(ws, raw) {
   if (!ws.authed) return send(ws, { type: 'binary-error', error: 'not authenticated' });
   const { header, payload } = unpackBinaryFrame(raw);
+  // СРЕД-03: кадр-пустышка. Уходит в мусор ЗДЕСЬ и целиком: тело не читается, в
+  // очередь ничего не встаёт, `msgsIn` не растёт, пуш не уходит, ОТВЕТА НЕТ.
+  //
+  // Молчание — обязательное условие, а не экономия. Ответь узел хоть чем-нибудь
+  // (`ack`, `binary-error`, что угодно), и в канале появился бы второй кадр,
+  // жёстко привязанный к первому: наблюдатель отличал бы пустышку от сообщения
+  // по одному только наличию пары, и вся мера свелась бы к самопометке.
+  //
+  // Проверка стоит первой: после сообщений это самый частый двоичный кадр, и
+  // платить за него разбором остальных веток незачем. Учёт при этом остаётся
+  // общим — пустышка проходит через потолок кадров и байтовый потолок соединения
+  // наравне со всеми (handleSocketMessage), то есть полосу узла она занимает
+  // честно и злоупотребить ею не проще, чем любым другим кадром.
+  if (header.type === 'cover-v1' && header.version === 1) {
+    counters.cover += 1;
+    return true;
+  }
   if (header.type === 'frame-batch-v1' && header.version === 1) {
     if (!ws.frameBatchV1 || payload.length > 256 * 1024) {
       return send(ws, { type: 'binary-error', error: 'frame batch not negotiated' });
@@ -1704,6 +2408,40 @@ function handleBinaryFrameSafely(ws, raw) {
       handleFrameSafely(ws, frame);
     }
     return true;
+  }
+  // ПРФ-14: обычное сообщение двоичным кадром. Тело — сырые байты запечатанного
+  // конверта, base64 вокруг них больше нет.
+  if (header.type === envelopeFrame.SEND_FRAME_TYPE && header.version === 1) {
+    if (
+      typeof header.to !== 'string' ||
+      !header.to ||
+      header.to.length > MAX_ADDR_LEN ||
+      (header.ref != null && (typeof header.ref !== 'string' || header.ref.length > 160)) ||
+      !payload.length ||
+      payload.length > MAX_SEALED_PAYLOAD_BYTES
+    ) {
+      return send(ws, { type: 'error', error: 'invalid envelope frame' });
+    }
+    // Конверт собирается ЗДЕСЬ, а не в очереди: store хранит его JSON-ом, как и
+    // прежде. То есть двоичным стал провод, а не хранилище — и получатель со
+    // старым клиентом достаёт из очереди ровно тот конверт, что раньше.
+    const envelope = envelopeFrame.sealedEnvelope(header.sv, payload);
+    if (!envelope) return send(ws, { type: 'error', error: 'invalid envelope frame' });
+    // СРЕД-01: флаги читаются ОБЩИМ правилом, а не сравнением на месте. По
+    // проводу ходят обе записи сразу — цифра от нынешнего клиента (её длина не
+    // зависит от значения) и булево от клиента прежней версии, — и обе обязаны
+    // читаться одинаково. Сравни релей с `true` — тихая копия веера стала бы
+    // «громкой», и одно сообщение будило бы человека с каждого релея.
+    const flags = envelopeFrame.sendHeaderFlags(header);
+    return acceptEnvelope(ws, {
+      to: header.to,
+      envelope,
+      envelopeJson: JSON.stringify(envelope),
+      silent: flags.silent,
+      callPush: flags.callPush,
+      noMeta: flags.noMeta,
+      ref: header.ref == null ? undefined : header.ref,
+    });
   }
   if (
     header.type !== 'attachment-chunk' ||
@@ -1736,6 +2474,25 @@ function handleBinaryFrameSafely(ws, raw) {
     queued: result.queued,
     dropped: result.dropped,
   });
+}
+
+function sendPushTestResult(ws, token, testId, channel, provider = sendTestPush, tokenStore = store) {
+  // ВЫС-51: проверочный пуш подписывается ТОЙ ЖЕ парой, что и обычный, — иначе
+  // диагностика в Профиле проверяла бы не тот путь, которым ходят уведомления.
+  return provider(token, testId, channel, ws.pubkey)
+    .then((result) => {
+      if (result === 'invalid') tokenStore.delToken(ws.pubkey);
+      send(ws, {
+        type: 'push-test-result',
+        testId,
+        channel,
+        accepted: result === true,
+        error: result === 'invalid' ? 'invalid-subscription' : result === true ? undefined : 'provider-unavailable',
+      });
+    })
+    .catch(() => {
+      send(ws, { type: 'push-test-result', testId, channel, accepted: false, error: 'provider-error' });
+    });
 }
 
 function handleFrameSafely(ws, msg) {
@@ -1780,6 +2537,12 @@ function handleFrameSafely(ws, msg) {
       }
       ws.frameBatchV1 =
         Array.isArray(msg.capabilities) && msg.capabilities.includes('frame-batch-v1');
+      // ПРФ-14: получатель сам говорит, разберёт ли он двоичный кадр `message-v1`.
+      // Спросить об этом больше некого: конверт ходит от узла к узлу, отправитель
+      // о клиенте получателя ничего не знает и знать не должен.
+      ws.binaryEnvelopeV1 =
+        Array.isArray(msg.capabilities) &&
+        msg.capabilities.includes(envelopeFrame.BINARY_ENVELOPE_CAPABILITY);
       ws.pendingPubkey = msg.pubkey;
       ws.pendingSpk = msg.signPublicKey;
       ws.nonce = naclUtil.encodeBase64(crypto.randomBytes(32));
@@ -1855,9 +2618,54 @@ function handleFrameSafely(ws, msg) {
       ws.nonce = null;
       ws.ephSec = null;
       clearTimeout(ws.authTimer);
+
+      // АУД-Э1: недоказанный сеанс НЕ получает входящий поток.
+      //
+      // Раньше флаг `proven` защищал только квитанции: сквоттер не мог стереть
+      // очередь жертвы. Но соединение всё равно индексировалось в `online`, и
+      // очередь ему выгружалась — то есть занявший ещё не закреплённый адрес
+      // читал в реальном времени и шифртекст, и метаданные КАЖДОГО отправителя:
+      // его адрес, идентификатор устройства, имя устройства из сертификата и
+      // весь список устройств. Это тот самый социальный граф, который весь
+      // остальной код прячет.
+      //
+      // Занять чужой адрес несложно: он публичен (это QR контакта), а
+      // закрепление живёт на КАЖДОМ релее отдельно — достаточно найти узел, где
+      // жертва ещё не аутентифицировалась. Вытеснение холодных identity
+      // (evictColdIdentities ниже) возвращает адрес в незакреплённое состояние и
+      // открывает окно заново.
+      //
+      // Теперь без доказательства владения box-ключом соединение авторизовано
+      // ровно настолько, чтобы ОТПРАВЛЯТЬ. Приём требует доказательства.
+      // Клиент узнаёт об этом явным полем, а не молчаливой тишиной в чатах.
+      if (!ws.proven) {
+        counters.unprovenReceive = (counters.unprovenReceive || 0) + 1;
+        return send(ws, {
+          type: 'ready',
+          queued: 0,
+          prekeys: 0,
+          vapidPublicKey: vapidPublicKeyFor(ws.pubkey),
+          protocol: RELAY_PROTOCOL,
+          capabilities: RELAY_CAPABILITIES,
+          maxLinkedDevices: MAX_ACTIVE_DEVICES,
+          overloaded: relayOverloaded(),
+          // Приём выключен, пока не доказано владение адресом. Старый клиент
+          // поле игнорирует — он просто не увидит входящих, как не увидел бы их
+          // и раньше, если бы адрес занял сквоттер.
+          receiveBlocked: 'box-proof-required',
+        });
+      }
+
       // If a stale socket still claims this pubkey, replace it.
       const prev = online.get(ws.pubkey);
-      if (prev && prev !== ws) try { prev.terminate(); } catch (e) {}
+      if (prev && prev !== ws) {
+        try {
+          prev.terminate();
+        } catch (e) {
+          // Устаревший сокет этого адреса вытесняется из каталога строкой ниже
+          // независимо от исхода: обычно он уже мёртв, оттого и вытесняется.
+        }
+      }
       online.set(ws.pubkey, ws);
       // M-02: отмечаем активность identity и держим каталог под глобальным потолком
       // (вытеснение самых холодных identity без ожидающих конвертов). Текущий pk
@@ -1869,8 +2677,12 @@ function handleFrameSafely(ws, msg) {
       const flushed = flushQueue(ws.pubkey, ws, () => flushBinaryQueue(ws.pubkey, ws));
       // prekeys: сколько одноразовых prekey клиента осталось у этого релея —
       // клиент по этому числу решает, пора ли выгрузить свежую пачку.
-      // vapidPublicKey: web-push (UnifiedPush) публичный ключ релея — клиент передаёт
-      // его в expo-unified-push registerDevice(). null, если web-push не настроен.
+      // vapidPublicKey: web-push (UnifiedPush) публичный ключ ЭТОГО УСТРОЙСТВА —
+      // клиент передаёт его в expo-unified-push registerDevice()/subscribe().
+      // ВЫС-51: ключ выводится из адреса соединения, поэтому у каждого
+      // устройства он свой и push-провайдеру нечем склеить подписки «Лично» в
+      // одну группу. Узнать чужой ключ кадром ready нельзя: адрес берётся из
+      // аутентифицированного соединения. null — web-push не настроен.
       // АУД-06: `overloaded` — честный ответ узла на вопрос «тебе сейчас тяжело?».
       // Раньше сказать это было нечем: клиент держит пул релеев и умеет
       // переключаться, но признака, по которому стоит предпочесть соседа, у него
@@ -1881,7 +2693,7 @@ function handleFrameSafely(ws, msg) {
         type: 'ready',
         queued: flushed + flushedBinary,
         prekeys: store.countOtps(ws.pubkey),
-        vapidPublicKey: vapidPublicKey(),
+        vapidPublicKey: vapidPublicKeyFor(ws.pubkey),
         protocol: RELAY_PROTOCOL,
         capabilities: RELAY_CAPABILITIES,
         maxLinkedDevices: MAX_ACTIVE_DEVICES,
@@ -1910,6 +2722,12 @@ function handleFrameSafely(ws, msg) {
     if (!ws.authed) return send(ws, { type: 'error', error: 'not authenticated' });
 
     if (msg.type === 'device-roster-put') {
+      // КРИТ-04: список устройств переписывают при привязке или отзыве — у
+      // человека это событие нескольких раз в год. Кадр же стоит проверки
+      // подписи каждого сертификата, до тридцати двух в штуке.
+      if (costlyLimited(ws, 'rosterPut', ROSTER_PUT_MAX_PER_MIN)) {
+        return send(ws, { type: 'device-roster-error', error: 'rate' });
+      }
       const accepted = acceptSignedRoster(ws, msg.roster);
       if (!accepted.ok) {
         return send(ws, { type: 'device-roster-error', error: accepted.reason || 'invalid-roster' });
@@ -1976,6 +2794,13 @@ function handleFrameSafely(ws, msg) {
     }
 
     if (msg.type === 'prekeys-put') {
+      // АУД-Э1: публиковать prekey можно только доказав владение адресом.
+      // Иначе занявший незакреплённый адрес подменяет бандл жертвы своим, и
+      // отправители строят первую сессию с ним — то есть подпись SPK сверяется
+      // с ЕГО ключом, закреплённым тем же захватом.
+      if (!ws.proven) {
+        return send(ws, { type: 'error', error: 'box ownership proof required' });
+      }
       // Выгрузка СВОИХ публичных X3DH-prekey. Подпись SPK сверяется с TOFU-ключом
       // этого соединения — чужие/битые бандлы не сохраняются.
       const b = msg.bundle || {};
@@ -1999,6 +2824,90 @@ function handleFrameSafely(ws, msg) {
       store.setSpk(ws.pubkey, { id: spkObj.id, pub: spkObj.pub, sig: spkObj.sig, pq: spkObj.pq });
       store.replaceOtps(ws.pubkey, opks);
       return send(ws, { type: 'prekeys-ok', otps: store.countOtps(ws.pubkey) });
+    }
+
+    // --- ПЯЩ-1: общий ящик записок -----------------------------------------
+    //
+    // Кадра «есть ли у тебя ключ K» здесь НЕТ и быть не должно. Ответив на него,
+    // узел связал бы положившего со спросившим — то есть выдал бы ребро графа
+    // знакомств, ради сокрытия которого весь замысел и существует. Вместо
+    // вопроса узел отдаёт сводку обо ВСЁМ, что у него лежит; она одинакова для
+    // всех, сверка идёт на телефоне, а при попадании забирается целая корзина
+    // чужих записок.
+
+    if (msg.type === 'mbx-put') {
+      // Записки кладутся пачкой в base64: кадр редкий (раз в шесть часов) и
+      // маленький (восемь записок — 1,8 КБ), заводить ради него двоичный путь
+      // незачем.
+      if (typeof msg.records !== 'string' || msg.records.length > 4 * mbx.RECORD_BYTES * mbx.MAX_PUT_RECORDS + 8) {
+        return send(ws, { type: 'mbx-error', error: 'bad records' });
+      }
+      const nowPut = Date.now();
+      if (nowPut - (ws.mbxPutStart || 0) > MBX_PUT_WINDOW_MS) {
+        ws.mbxPutStart = nowPut;
+        ws.mbxPutCount = 0;
+      }
+      ws.mbxPutCount = (ws.mbxPutCount || 0) + 1;
+      if (ws.mbxPutCount > MBX_PUT_MAX) {
+        return send(ws, { type: 'mbx-error', error: 'rate' });
+      }
+      let raw = null;
+      try {
+        raw = Buffer.from(msg.records, 'base64');
+      } catch (e) {
+        return send(ws, { type: 'mbx-error', error: 'bad records' });
+      }
+      const parsed = mbx.parsePut(raw, { now: nowPut, slot: msg.slot });
+      if (!parsed) return send(ws, { type: 'mbx-error', error: 'bad records' });
+      // Владельца у записки нет: ws.pubkey здесь НЕ сохраняется никуда, и это
+      // не упущение, а условие. Узел, знающий автора, знал бы половину ребра.
+      const added = store.mbxPut(parsed, mbxValueHash);
+      mbxTrim();
+      // КРИТ-04: сводку пересчитывает тот, кто изменил ящик, а не тот, кто о ней
+      // спросил. Иначе стоимость пересчёта назначает спрашивающий.
+      mbxRefreshDigest();
+      return send(ws, { type: 'mbx-ok', added });
+    }
+
+    if (msg.type === 'mbx-digest') {
+      if (costlyLimited(ws, 'mbxDigest', MBX_DIGEST_MAX_PER_MIN)) {
+        return send(ws, { type: 'mbx-error', error: 'rate' });
+      }
+      const size = store.mbxCount();
+      // Ключи берутся ФУНКЦИЕЙ: при попадании в кэш выборка всех ключей ящика не
+      // происходит вовсе. Прежде она выполнялась до обращения к кэшу, то есть на
+      // каждую просьбу, и кэш экономил только кодирование.
+      const digest = mbxDigest.get(store.mbxRevision(), () => store.mbxKeys());
+      return send(ws, {
+        type: 'mbx-digest',
+        size,
+        depth: mbx.bucketDepth(size),
+        p: digest.p,
+        n: digest.n,
+        bits: digest.bitsBase64,
+      });
+    }
+
+    if (msg.type === 'mbx-fetch') {
+      if (costlyLimited(ws, 'mbxFetch', MBX_FETCH_MAX_PER_MIN)) {
+        return send(ws, { type: 'mbx-error', error: 'rate' });
+      }
+      const size = store.mbxCount();
+      // Слишком узкую корзину не отдаём даже по просьбе: попросивший корзину из
+      // десятка записок тем самым почти назвал ключ.
+      if (!mbx.depthAllowed(msg.depth, size)) {
+        return send(ws, { type: 'mbx-error', error: 'depth' });
+      }
+      const range = mbx.bucketRange(msg.bucket, msg.depth);
+      if (!range) return send(ws, { type: 'mbx-error', error: 'bucket' });
+      const rows = store.mbxBucket(range.low, range.high, mbx.SYNC_LIMIT);
+      return send(ws, {
+        type: 'mbx-bucket',
+        depth: msg.depth,
+        bucket: msg.bucket,
+        count: rows.length,
+        records: mbx.packRecords(rows.map((row) => ({ key: row.key, value: row.val, mac: row.mac }))).toString('base64'),
+      });
     }
 
     // АУД-13: сколько СВОИХ одноразовых prekey у релея осталось.
@@ -2051,6 +2960,13 @@ function handleFrameSafely(ws, msg) {
       // Токен пробуждения: FCM-токен ЛИБО web-push подписка UnifiedPush (JSON-строка
       // {endpoint,keys} — F-Droid/FOSS/hybrid). Тип определяется в push.js по форме.
       // Потолок длины — подписка (endpoint + ключи) длиннее FCM-токена.
+      // АУД-Э1: перебить токен пробуждения можно только доказав владение
+      // адресом. Иначе занявший незакреплённый адрес забирает себе ВСЕ пуши
+      // жертвы: он получает точное время каждого входящего (трафик-анализ), а
+      // она перестаёт получать уведомления вовсе и считает, что ей не пишут.
+      if (!ws.proven) {
+        return send(ws, { type: 'error', error: 'box ownership proof required' });
+      }
       if (typeof msg.pushToken === 'string' && msg.pushToken && msg.pushToken.length <= 1024) {
         store.setToken(ws.pubkey, msg.pushToken);
       }
@@ -2072,20 +2988,7 @@ function handleFrameSafely(ws, msg) {
       if (!token) {
         return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'not-registered' });
       }
-      sendTestPush(token, testId, channel)
-        .then((result) => {
-          if (result === 'invalid') store.delToken(ws.pubkey);
-          send(ws, {
-            type: 'push-test-result',
-            testId,
-            channel,
-            accepted: result === true,
-            error: result === 'invalid' ? 'invalid-subscription' : result === true ? undefined : 'provider-unavailable',
-          });
-        })
-        .catch(() => {
-          send(ws, { type: 'push-test-result', testId, channel, accepted: false, error: 'provider-error' });
-        });
+      sendPushTestResult(ws, token, testId, channel);
       return;
     }
 
@@ -2106,43 +3009,14 @@ function handleFrameSafely(ws, msg) {
       if (typeof msg.to !== 'string' || !msg.to || !msg.envelope) {
         return send(ws, { type: 'error', error: 'send requires to + envelope' });
       }
-      // СРВ-4: адрес получателя ограничен по длине (см. MAX_ADDR_LEN) — иначе
-      // гигантский `to` при крошечном envelope обходил байтовый потолок очереди.
-      if (msg.to.length > MAX_ADDR_LEN) {
-        return send(ws, { type: 'error', error: 'invalid recipient' });
-      }
-      // АУД-06: сериализуем конверт ОДИН раз — и для проверки размера, и для
-      // хранения. Раньше он сериализовался здесь ради длины, строка тут же
-      // выбрасывалась, а store.enqueue строил её заново: на конверте в семь
-      // мегабайт это лишний полный проход по памяти в однопоточном процессе, то
-      // есть пауза для всех пользователей узла.
-      let envelopeJson;
-      try {
-        envelopeJson = JSON.stringify(msg.envelope);
-      } catch (e) {
-        return send(ws, { type: 'error', error: 'invalid envelope' });
-      }
-      const size = Buffer.byteLength(envelopeJson);
-      if (size > MAX_ENVELOPE_BYTES) {
-        return send(ws, { type: 'error', error: 'envelope too large' });
-      }
-      counters.msgsIn += 1;
-      const r = deliver(
-        ws.pubkey,
-        msg.to,
-        msg.envelope,
-        !!msg.silent,
-        !!msg.callPush,
-        {
-          ...senderMetadata(ws),
-          notificationId: typeof msg.ref === 'string' ? msg.ref.slice(0, 160) : undefined,
-          envelopeJson,
-          envelopeBytes: size,
-        }
-      );
-      // СРВ-2: dropped — конверт не принят (полная очередь); клиент покажет «не
-      // доставлено» вместо ложного «отправлено». Старый клиент поле игнорирует.
-      return send(ws, { type: 'ack', ref: msg.ref, id: r.id, queued: r.queued, dropped: !!r.dropped });
+      return acceptEnvelope(ws, {
+        to: msg.to,
+        envelope: msg.envelope,
+        silent: !!msg.silent,
+        callPush: !!msg.callPush,
+        noMeta: !!msg.noMeta,
+        ref: msg.ref,
+      });
     }
 
     send(ws, { type: 'error', error: 'unknown type' });
@@ -2267,42 +3141,60 @@ async function pushSelfTo(wsUrl) {
   });
 }
 
-let vapidSyncRunning = false;
-async function vapidSyncOnce() {
+const vapidSyncState = { running: false };
+async function vapidSyncWith(options = {}) {
+  const state = options.state || vapidSyncState;
+  const bundle = options.bundle === undefined ? vapidFleetBundle : options.bundle;
+  const fleet = options.fleet === undefined ? VAPID_FLEET : options.fleet;
+  const member = options.member === undefined ? VAPID_MEMBER : options.member;
+  const selfUrl = options.selfUrl === undefined ? SELF_URL : options.selfUrl;
+  const relayPublicKey = options.relayPublicKey || RELAY_KEYS.pub;
+  const relaySecretKey = options.relaySecretKey || RELAY_KEYS.sec;
+  const allowPrivate = options.allowPrivate === undefined ? VAPID_FLEET_ALLOW_PRIVATE : options.allowPrivate;
+  const acceptsKey = options.acceptsKey || memberAcceptsKey;
+  const resolvePeer = options.resolvePeer || safePeerAddrs;
+  const createRequest = options.createRequest || createVapidRequest;
+  const requestJson = options.requestJson || httpJson;
+  const httpBase = options.httpBase || relayHttpBase;
+  const openResponse = options.openResponse || openVapidResponse;
+  const writeFile = options.writeFile || writeJsonAtomic;
+  const keyFile = options.keyFile || RELAY_VAPID_KEY_FILE;
+  const activate = options.activate || activateVapid;
+  const logger = options.logger || console;
   if (
-    vapidSyncRunning ||
-    vapidFleetBundle ||
-    !VAPID_FLEET ||
-    !VAPID_MEMBER ||
-    !SELF_URL ||
-    !memberAcceptsKey(VAPID_MEMBER, RELAY_KEYS.pub)
+    state.running ||
+    bundle ||
+    !fleet ||
+    !member ||
+    !selfUrl ||
+    !acceptsKey(member, relayPublicKey)
   ) {
-    return;
+    return false;
   }
-  vapidSyncRunning = true;
+  state.running = true;
   try {
     // Сначала genesis, затем остальные участники: после первой раздачи любой
     // получивший bundle может помочь новому узлу, поэтому падение genesis не
     // становится постоянной точкой отказа.
-    const peers = [...VAPID_FLEET.relays]
-      .filter((entry) => entry.url.toLowerCase() !== SELF_URL.toLowerCase())
-      .sort((a, b) => Number(b.url === VAPID_FLEET.genesis) - Number(a.url === VAPID_FLEET.genesis));
+    const peers = [...fleet.relays]
+      .filter((entry) => entry.url.toLowerCase() !== selfUrl.toLowerCase())
+      .sort((a, b) => Number(b.url === fleet.genesis) - Number(a.url === fleet.genesis));
     for (const peer of peers) {
-      const pinned = await safePeerAddrs(peer.url, { allowPrivate: VAPID_FLEET_ALLOW_PRIVATE });
+      const pinned = await resolvePeer(peer.url, { allowPrivate });
       if (!pinned) continue;
       let pending;
       try {
-        pending = createVapidRequest({
-          config: VAPID_FLEET,
-          relayUrl: SELF_URL,
-          relayPub: RELAY_KEYS.pub,
-          relaySecret: RELAY_KEYS.sec,
+        pending = createRequest({
+          config: fleet,
+          relayUrl: selfUrl,
+          relayPub: relayPublicKey,
+          relaySecret: relaySecretKey,
         });
       } catch (e) {
-        console.warn('[vapid-fleet] локальная идентичность не разрешена:', e && e.message);
-        return;
+        logger.warn('[vapid-fleet] локальная идентичность не разрешена:', e && e.message);
+        return false;
       }
-      const response = await httpJson(relayHttpBase(peer.url) + '/vapid-fleet', {
+      const response = await requestJson(httpBase(peer.url) + '/vapid-fleet', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(pending.request),
@@ -2316,27 +3208,78 @@ async function vapidSyncOnce() {
       ) {
         continue;
       }
-      const bundle = openVapidResponse({
-        config: VAPID_FLEET,
+      const receivedBundle = openResponse({
+        config: fleet,
         request: pending.request,
         response,
         boxSecret: pending.boxSecret,
       });
-      if (!bundle) continue;
+      if (!receivedBundle) continue;
       try {
-        writeJsonAtomic(RELAY_VAPID_KEY_FILE, bundle);
-        if (!activateVapid(bundle.publicKey, bundle.privateKey, `fleet-peer:${peer.url}`, bundle)) {
+        writeFile(keyFile, receivedBundle);
+        if (!activate(receivedBundle.publicKey, receivedBundle.privateKey, `fleet-peer:${peer.url}`, receivedBundle)) {
           throw new Error('web-push rejected the verified VAPID pair');
         }
-        console.log(`[vapid-fleet] общий VAPID epoch=${bundle.epoch} получен от ${peer.url}`);
-        return;
+        logger.log(`[vapid-fleet] общий VAPID epoch=${receivedBundle.epoch} получен от ${peer.url}`);
+        return true;
       } catch (e) {
-        console.warn('[vapid-fleet] не удалось сохранить полученный VAPID:', e && e.message);
+        logger.warn('[vapid-fleet] не удалось сохранить полученный VAPID:', e && e.message);
       }
     }
+    return false;
   } finally {
-    vapidSyncRunning = false;
+    state.running = false;
   }
+}
+async function vapidSyncOnce() {
+  return vapidSyncWith();
+}
+
+// ПЯЩ-1: забрать у соседа записки, появившиеся после нашего курсора.
+//
+// Курсор свой на каждого соседа и живёт в памяти: перезапуск узла означает
+// повторную тягу с нуля, а это дёшево (записки живут тринадцать часов) и честнее
+// хранения ещё одной таблицы. Ответ разбирается ровно так же строго, как кадр от
+// клиента: сосед — такой же чужой ввод.
+const mbxCursors = new Map();
+
+async function fetchPeerNotes(wsUrl) {
+  const after = mbxCursors.get(wsUrl) || 0;
+  const pinned = await safePeerAddrs(wsUrl);
+  if (!pinned) return 0;
+  const body = await httpJson(relayHttpBase(wsUrl) + '/mbx?after=' + after, { pinned });
+  if (!body || typeof body.records !== 'string') return 0;
+  if (!Array.isArray(body.slots)) return 0;
+  let raw = null;
+  try {
+    raw = Buffer.from(body.records, 'base64');
+  } catch (e) {
+    return 0;
+  }
+  if (!raw.length || raw.length % mbx.RECORD_BYTES !== 0) return 0;
+  const count = raw.length / mbx.RECORD_BYTES;
+  if (count !== body.slots.length || count > mbx.SYNC_LIMIT) return 0;
+  const now = Date.now();
+  const here = mbx.slotOf(now);
+  const records = [];
+  for (let i = 0; i < count; i += 1) {
+    const slot = body.slots[i];
+    // Отрезок сверяем по СВОИМ часам: сосед мог отдать давно протухшее либо
+    // «из будущего», и хранить это у себя мы не обязаны.
+    if (!Number.isInteger(slot) || Math.abs(slot - here) > mbx.SLOT_TOLERANCE) continue;
+    const at = i * mbx.RECORD_BYTES;
+    records.push({
+      key: raw.subarray(at, at + mbx.KEY_BYTES),
+      value: raw.subarray(at + mbx.KEY_BYTES, at + mbx.KEY_BYTES + mbx.VALUE_BYTES),
+      mac: raw.subarray(at + mbx.KEY_BYTES + mbx.VALUE_BYTES, at + mbx.RECORD_BYTES),
+      slot,
+    });
+  }
+  if (Number.isInteger(body.seq) && body.seq > after) mbxCursors.set(wsUrl, body.seq);
+  if (!records.length) return 0;
+  const added = store.mbxPut(records, mbxValueHash);
+  if (added) mbxTrim(now);
+  return added;
 }
 
 async function gossipOnce() {
@@ -2346,23 +3289,44 @@ async function gossipOnce() {
     const list = await fetchPeerRelays(peer);
     if (list && learnRelays(list)) learned = true;
     await pushSelfTo(peer); // рассказываем peer'у про себя (двунаправленно)
+    // ПЯЩ-1: и тянем его записки. Без этого записка лежала бы ровно на том узле,
+    // куда её положили, — то есть находила бы только тех, кто и так рядом.
+    await fetchPeerNotes(peer);
   }
+  mbxTrim();
   if (learned) console.log(`[gossip] directory now ${relayDir.length} relays`);
 }
-if (SELF_URL || PEER_SEED.length) {
-  setInterval(() => {
-    gossipOnce().catch(() => {});
-  }, GOSSIP_INTERVAL_MS).unref();
+function scheduleFederation(options = {}) {
+  const selfUrl = options.selfUrl === undefined ? SELF_URL : options.selfUrl;
+  const seeds = options.seeds || PEER_SEED;
+  const fleet = options.fleet === undefined ? VAPID_FLEET : options.fleet;
+  const member = options.member === undefined ? VAPID_MEMBER : options.member;
+  const bundle = options.bundle === undefined ? vapidFleetBundle : options.bundle;
+  const runGossip = options.runGossip || gossipOnce;
+  const runVapidSync = options.runVapidSync || vapidSyncOnce;
+  const setEvery = options.setEvery || setInterval;
+  const setLater = options.setLater || setTimeout;
+  const timers = [];
+  if (selfUrl || seeds.length) {
+    const timer = setEvery(() => runGossip().catch(() => {}), GOSSIP_INTERVAL_MS);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    timers.push(timer);
+  }
+  if (fleet && member && !bundle) {
+    const initial = setLater(() => runVapidSync().catch(() => {}), 2000);
+    const repeat = setEvery(() => runVapidSync().catch(() => {}), VAPID_SYNC_INTERVAL_MS);
+    if (initial && typeof initial.unref === 'function') initial.unref();
+    if (repeat && typeof repeat.unref === 'function') repeat.unref();
+    timers.push(initial, repeat);
+  }
+  return timers;
 }
-if (VAPID_FLEET && VAPID_MEMBER && !vapidFleetBundle) {
-  setTimeout(() => vapidSyncOnce().catch(() => {}), 2000).unref();
-  setInterval(() => vapidSyncOnce().catch(() => {}), VAPID_SYNC_INTERVAL_MS).unref();
-}
+scheduleFederation();
 
 // drop dead connections + backpressure (H4): рвём сокеты, чей буфер отправки
 // раздулся (клиент не вычитывает) — иначе они держат память узла.
-setInterval(() => {
-  for (const ws of wss.clients) {
+function heartbeatConnections(clients = wss.clients) {
+  for (const ws of clients) {
     if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
       ws.terminate();
       continue;
@@ -2374,47 +3338,92 @@ setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, 30000).unref();
+}
+setInterval(heartbeatConnections, 30000).unref();
 
 // TTL: периодически чистим протухшие конверты (не забрали за QUEUE_TTL_MS).
-setInterval(() => {
+function expireQueuedEnvelopes(now = Date.now(), queueStore = store, { onFatal = handleTopLevelError } = {}) {
   try {
-    const removed = store.expireOlderThan(Date.now() - QUEUE_TTL_MS);
+    const removed = queueStore.expireOlderThan(now - QUEUE_TTL_MS);
     if (removed) console.log(`[ttl] expired ${removed} stale envelope(s)`);
-  } catch (e) {}
-}, 3600 * 1000).unref();
+    // ГРФ-3: тем же часовым проходом стираем имена давно отозванных устройств —
+    // раньше они лежали в account_devices открытым текстом и НАВСЕГДА.
+    const redacted = store.redactRevokedDevices(Date.now());
+    if (redacted) console.log(`[ttl] redacted ${redacted} revoked device record(s)`);
+    return removed;
+  } catch (e) {
+    // Т-4: фатальный сбой БД здесь НЕ глушим.
+    //
+    // Раньше гасилась любая ошибка, включая SQLITE_CORRUPT. Узел после этого
+    // «жил», а часовой проход молча переставал работать: очередь росла без TTL, а
+    // имена отозванных устройств (ГРФ-3) продолжали лежать открытым текстом —
+    // навсегда. Механизм L4 (честный выход под рестарт супервизора) до этого
+    // места просто не дотягивался, потому что ошибка сюда не выходила.
+    //
+    // Нефатальные ошибки по-прежнему переживаются: разовая заминка не повод
+    // ронять узел, а следующий проход через час попробует снова. Но о ней теперь
+    // говорится — беззвучно пропущенная уборка выглядела как выполненная.
+    if (isFatalDbError(e)) {
+      onFatal('ttl', e);
+      return 0;
+    }
+    console.warn('[ttl] проход уборки не выполнен:', (e && e.message) || e);
+  }
+  return 0;
+}
+setInterval(expireQueuedEnvelopes, 3600 * 1000).unref();
 
 // АУД-06: тела крупных конвертов пишутся вне event-loop, поэтому перед выходом
 // начатые записи надо дождаться — иначе конверт, чья запись шла в момент
 // SIGTERM, потерял бы тело, а строка очереди осталась бы. Ждём ограниченно:
 // зависшая файловая система не должна мешать перезапуску узла.
 const SHUTDOWN_FLUSH_MS = 5000;
-let shuttingDown = false;
-function shutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  stopEmbeddedCoturn();
+function performShutdown({
+  queueStore = store,
+  exit = (code) => process.exit(code),
+  timeoutMs = SHUTDOWN_FLUSH_MS,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  let finished = false;
   const finish = () => {
+    if (finished) return;
+    finished = true;
     try {
-      store.close();
-    } catch (e) {}
-    process.exit(0);
-  };
-  const flush = typeof store.flushPendingBlobs === 'function' ? store.flushPendingBlobs() : null;
-  if (!flush) return finish();
-  const timer = setTimeout(finish, SHUTDOWN_FLUSH_MS);
-  if (typeof timer.unref === 'function') timer.unref();
-  flush.then(
-    () => {
-      clearTimeout(timer);
-      finish();
-    },
-    () => {
-      clearTimeout(timer);
-      finish();
+      queueStore.close();
+    } catch (e) {
+      // Конверты уже сброшены на диск, процесс завершается следующей строкой.
+      // Незакрытый дескриптор переживёт нас ровно на мгновение.
     }
-  );
+    exit(0);
+  };
+  const flush = typeof queueStore.flushPendingBlobs === 'function' ? queueStore.flushPendingBlobs() : null;
+  if (!flush) {
+    finish();
+    return Promise.resolve();
+  }
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  const complete = () => {
+    clearTimer(timer);
+    finish();
+    resolveDone();
+  };
+  const timer = setTimer(complete, timeoutMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  Promise.resolve(flush).then(complete, complete);
+  return done;
 }
+function createShutdownHandler({ stop = stopEmbeddedCoturn, perform = performShutdown } = {}) {
+  let shuttingDown = false;
+  return function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    stop();
+    return perform();
+  };
+}
+const shutdown = createShutdownHandler();
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
@@ -2434,14 +3443,20 @@ function isFatalDbError(err) {
     /malformed|not a database|disk image is malformed|disk I\/O error/i.test(msg)
   );
 }
-function handleTopLevelError(tag, err) {
+function handleTopLevelError(tag, err, {
+  queueStore = store,
+  exit = (code) => process.exit(code),
+} = {}) {
   console.error(`[${tag}]`, err && err.stack ? err.stack : err);
   if (isFatalDbError(err)) {
     console.error('[fatal] сбой/повреждение БД — управляемый выход для рестарта под systemd');
     try {
-      store.close();
-    } catch (e) {}
-    process.exit(1);
+      queueStore.close();
+    } catch (e) {
+      // База уже признана повреждённой — именно поэтому мы здесь. Отказ
+      // close() ожидаем и ничего не добавляет к уже напечатанной причине.
+    }
+    exit(1);
   }
 }
 process.on('uncaughtException', (err) => handleTopLevelError('uncaughtException', err));
@@ -2451,20 +3466,33 @@ process.on('unhandledRejection', (err) => handleTopLevelError('unhandledRejectio
 // уходила в uncaughtException-backstop, isFatalDbError=false → процесс продолжал
 // жить, НЕ слушая порт (зомби; systemd не рестартует, т.к. процесс жив). Теперь на
 // ошибке старта честно выходим — под рестарт супервизора.
-server.on('error', (err) => {
+function handleServerError(err, {
+  queueStore = store,
+  exit = (code) => process.exit(code),
+} = {}) {
   console.error('[server] listen/HTTP error:', err && err.stack ? err.stack : err);
   if (err && (err.code === 'EADDRINUSE' || err.code === 'EACCES')) {
     try {
-      store.close();
-    } catch (e) {}
-    process.exit(1);
+      queueStore.close();
+    } catch (e) {
+      // Причина выхода — занятый порт, она уже в логе. Процесс всё равно
+      // умирает следующей строкой, и супервизор поднимет его заново.
+    }
+    exit(1);
   }
-});
+}
+server.on('error', handleServerError);
 // СРВ-4: ошибки на уровне ws-сервера (до/во время апгрейда) — тоже гасим, чтобы не
 // уходили в uncaughtException.
 wss.on('error', (err) => {
   console.error('[wss] error:', err && err.message ? err.message : err);
 });
+
+function logMetricsAccess(metricsToken = METRICS_TOKEN, logger = console) {
+  if (metricsToken) return false;
+  logger.log('[metrics] /metrics доступен только из приватной сети/localhost (задайте RELAY_METRICS_TOKEN для внешнего доступа)');
+  return true;
+}
 
 server.listen(PORT, () => {
   console.log(`Лично relay listening on :${PORT} (health: /health, directory: /relays)`);
@@ -2472,6 +3500,20 @@ server.listen(PORT, () => {
   // S6: публичный ключ подлинности этого релея — впишите его клиентам в
   // config.SEED_RELAY_KEYS для пиннинга (иначе релей не проверяется).
   console.log(`[relay-key] RELAY_SIGN_PUBLIC=${RELAY_KEYS.pub}${SELF_URL ? `  (для ${SELF_URL})` : ''}`);
+  // НАТ-1: на чём именно проверяются подписи. Печатаем всегда, а не только при
+  // отказе: «релей почему-то не держит нагрузку» разбирается с этой строки.
+  console.log(
+    '[sign]',
+    ed25519.nativeAvailable()
+      ? 'подпись через OpenSSL (×13 к JavaScript)'
+      : `подпись через JavaScript — OpenSSL не включён: ${nativeEd25519.reason}`
+  );
+  console.log(
+    '[dh]',
+    x25519.nativeAvailable()
+      ? 'общий секрет через OpenSSL (×18 к JavaScript)'
+      : `общий секрет через JavaScript — OpenSSL не включён: ${nativeX25519.reason}`
+  );
   console.log(
     '[push]',
     pushReady()
@@ -2486,7 +3528,94 @@ server.listen(PORT, () => {
   );
   // M-1: без токена /metrics доступен ТОЛЬКО из приватной сети/localhost (публичный
   // скрейп отвергается). Для внешнего мониторинга задайте RELAY_METRICS_TOKEN.
-  if (!METRICS_TOKEN) {
-    console.log('[metrics] /metrics доступен только из приватной сети/localhost (задайте RELAY_METRICS_TOKEN для внешнего доступа)');
-  }
+  logMetricsAccess();
 });
+
+// Программный runtime-контракт нужен для встраивания релея в служебный процесс
+// и для адресной проверки тех же обработчиков, которые обслуживают сеть.
+module.exports.runtime = {
+  server,
+  wss,
+  store,
+  online,
+  accountOnline,
+  counters,
+  eventLoopLag,
+  sampleEventLoopLag,
+  sweepPushGates,
+  sweepOtpDrain,
+  heartbeatConnections,
+  expireQueuedEnvelopes,
+  turnIceServers,
+  learnRelays,
+  eventLoopLagP99,
+  relayOverloaded,
+  renderMetrics,
+  safeEqual,
+  metricsAuthorized,
+  readJsonRequest,
+  vapidRequestRateAllowed,
+  rememberVapidRequest,
+  handleVapidFleetHttpWith,
+  handleVapidFleetHttp,
+  unindexAccountSocket,
+  indexAccountSocket,
+  broadcastAccount,
+  clientIp,
+  nextId,
+  verifySignature,
+  hmacSha512,
+  concatU8,
+  verifyBoxProof,
+  loadOrCreateRelaySignKeys,
+  signRelayAuth,
+  activateVapid,
+  resolveVapidKeysWith,
+  resolveVapidKeys,
+  resolveTurnSecret,
+  startEmbeddedCoturn,
+  stopEmbeddedCoturn,
+  verifySpkSignature,
+  flushFrameBatch,
+  sendImmediate,
+  frameBatchBytes,
+  send,
+  sendBinary,
+  queuedMessageFrame,
+  queuedBinaryHeader,
+  senderMetadata,
+  flushQueue,
+  flushBinaryQueue,
+  deliver,
+  deliverBinary,
+  ackReceived,
+  ackBinaryReceived,
+  rateLimited,
+  byteLimited,
+  closeRevokedDevice,
+  acceptSignedRoster,
+  bindSocketToCertifiedDevice,
+  enforceAuthTimeout,
+  handleSocketMessage,
+  handleBinaryFrameSafely,
+  sendPushTestResult,
+  handleFrameSafely,
+  relayHttpBase,
+  hostOf,
+  safePeerAddrs,
+  pinnedLookup,
+  httpJson,
+  fetchPeerRelays,
+  pushSelfTo,
+  vapidSyncWith,
+  vapidSyncOnce,
+  gossipOnce,
+  scheduleFederation,
+  performShutdown,
+  createShutdownHandler,
+  shutdown,
+  isFatalDbError,
+  handleTopLevelError,
+  handleServerError,
+  logMetricsAccess,
+};

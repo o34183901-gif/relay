@@ -42,6 +42,17 @@
  * КАЖДЫЙ входящий конверт. Формат подписи не изменился ни на байт: подпись
  * tweetnacl проверяется noble и наоборот, это закреплено тестом
  * (test/ed25519.test.js), поэтому клиенты разных версий совместимы в обе стороны.
+ *
+ * НАТ-1: у обёртки появился третий, самый быстрый уровень — OpenSSL. Он есть не
+ * везде (на релее и на настольном клиенте есть, на телефоне зависит от сборки),
+ * поэтому и приходит СНАРУЖИ, через `setNative`: этот файл — общее ядро, он
+ * копируется и на релей, и на компьютер, и подключать здесь `node:crypto`
+ * означало бы сломать сборку телефона. Кто дотянулся до OpenSSL — тот и вносит,
+ * проверив его на известном векторе (src/nativeEd25519.js).
+ *
+ * Порядок такой: OpenSSL, если внесён; @noble/curves; tweetnacl. Формат подписи
+ * у всех трёх один и тот же байт в байт — это закреплено тестом, и значит
+ * уровень можно менять на ходу, не думая о совместимости.
  */
 
 const nacl = require('tweetnacl');
@@ -53,43 +64,91 @@ const nacl = require('tweetnacl');
 // модуля сборщиком, при котором импорт молча даёт undefined.
 const { ed25519 } = require('@noble/curves/ed25519.js');
 
-const fast =
-  ed25519 &&
-  typeof ed25519.sign === 'function' &&
-  typeof ed25519.verify === 'function'
-    ? ed25519
-    : null;
+function createEd25519(implementation = ed25519) {
+  const fast =
+    implementation &&
+    typeof implementation.sign === 'function' &&
+    typeof implementation.verify === 'function'
+      ? implementation
+      : null;
 
-/** Доступна ли быстрая реализация — для диагностики и тестов. */
-function fastAvailable() {
-  return !!fast;
-}
+  // НАТ-1: самый быстрый уровень. Вносится снаружи и только после самопроверки
+  // на известном векторе — см. шапку и src/nativeEd25519.js.
+  let native = null;
 
-/**
- * Подписать. secretKey — 64-байтная секретка в формате tweetnacl (seed + public);
- * быстрой реализации нужен только seed, поэтому берём первые 32 байта.
- */
-function sign(message, secretKey) {
-  if (fast) return fast.sign(message, secretKey.subarray(0, 32));
-  return nacl.sign.detached(message, secretKey);
-}
-
-/**
- * Проверить. Любая ошибка разбора точки или длины — это «подпись не сошлась», а
- * не исключение: значения приходят из сети, и бросать здесь означало бы отдать
- * отправителю управление потоком выполнения.
- */
-function verify(message, signature, publicKey) {
-  try {
-    if (fast) return fast.verify(signature, message, publicKey);
-    return nacl.sign.detached.verify(message, signature, publicKey);
-  } catch (error) {
-    return false;
+  /** Доступна ли быстрая реализация — для диагностики и тестов. */
+  function fastAvailable() {
+    return !!fast;
   }
+
+  /** Внесён ли уровень OpenSSL — для диагностики и тестов. */
+  function nativeAvailable() {
+    return !!native;
+  }
+
+  /**
+   * Внести реализацию поверх OpenSSL.
+   *
+   * Вызывается один раз при старте тем, кто до OpenSSL дотянулся и проверил его.
+   * `null` снимает уровень обратно — это нужно тестам и это же способ откатиться,
+   * не пересобирая приложение.
+   *
+   * Здесь сознательно НЕТ собственной проверки: она стоила бы времени на каждом
+   * старте и создавала бы ложное чувство, будто внести можно что попало. Условие
+   * прямое — вносит только тот, кто проверил (src/nativeEd25519.js), и это
+   * стережётся отдельной проверкой связки.
+   */
+  function setNative(next) {
+    if (next === null || next === undefined) {
+      native = null;
+      return false;
+    }
+    if (typeof next.sign !== 'function' || typeof next.verify !== 'function') {
+      throw new Error('setNative: реализация обязана иметь sign и verify');
+    }
+    native = next;
+    return true;
+  }
+
+  /**
+   * Подписать. secretKey — 64-байтная секретка в формате tweetnacl (seed + public);
+   * быстрой реализации нужен только seed, поэтому берём первые 32 байта.
+   *
+   * Уровню OpenSSL секретка передаётся целиком: он берёт из неё seed сам. На
+   * результат это не влияет — обрезка дала бы тот же ключ, — но интерфейс у
+   * всех трёх уровней остаётся один: «вот сообщение, вот секретка».
+   */
+  function sign(message, secretKey) {
+    if (native) return native.sign(message, secretKey);
+    if (fast) return fast.sign(message, secretKey.subarray(0, 32));
+    return nacl.sign.detached(message, secretKey);
+  }
+
+  /**
+   * Проверить. Любая ошибка разбора точки или длины — это «подпись не сошлась», а
+   * не исключение: значения приходят из сети, и бросать здесь означало бы отдать
+   * отправителю управление потоком выполнения.
+   */
+  function verify(message, signature, publicKey) {
+    try {
+      if (native) return native.verify(message, signature, publicKey);
+      if (fast) return fast.verify(signature, message, publicKey);
+      return nacl.sign.detached.verify(message, signature, publicKey);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  return { sign, verify, fastAvailable, nativeAvailable, setNative };
 }
+
+const { sign, verify, fastAvailable, nativeAvailable, setNative } = createEd25519();
 
 module.exports = {
   sign,
   verify,
   fastAvailable,
+  nativeAvailable,
+  setNative,
+  createEd25519,
 };

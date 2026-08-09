@@ -5,7 +5,7 @@
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js",
-    "test": "node linked-devices.test.js && node store.test.js && node push.test.js && node notifications.test.js && node vapid-fleet.test.js && node vapid-fleet.integration.test.js && node test.js && node throttle.test.js"
+    "test": "code=0; for f in linked-devices.test.js store.test.js push.test.js notifications.test.js vapid-fleet.test.js vapid-fleet.integration.test.js vapid-identity.test.js test.js throttle.test.js mbx.test.js mailboxEvict.test.js; do echo \"--- $f\"; node $f || code=1; done; exit $code"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",

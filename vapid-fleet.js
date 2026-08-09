@@ -20,6 +20,11 @@ const net = require('net');
 const path = require('path');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
+// ВЫС-10: подпись и проверка — только через обёртку (server/ed25519.js —
+// сгенерированная копия src/ed25519.js). Быстрая реализация и единая точка
+// смены криптографического основания; прямых nacl.sign.detached вне обёртки
+// быть не должно, и это закреплено проверкой в scripts/verify-wired.js.
+const ed25519 = require('./ed25519');
 const { normalizeRelayUrl, isPrivateHost } = require('./relays');
 
 const REQUEST_PREFIX = 'licno-vapid-fleet-request-v1|';
@@ -158,7 +163,7 @@ function signVapidBundle({ publicKey, privateKey }, config, genesisRelaySecret, 
     privateKey,
   };
   bundle.signature = naclUtil.encodeBase64(
-    nacl.sign.detached(naclUtil.decodeUTF8(bundlePayload(bundle)), secret)
+    ed25519.sign(naclUtil.decodeUTF8(bundlePayload(bundle)), secret)
   );
   return bundle;
 }
@@ -179,7 +184,7 @@ function verifyVapidBundle(bundle, config) {
     }
     const sig = decodeB64(bundle.signature, nacl.sign.signatureLength);
     const pub = decodeB64(genesisMember.relayPub, nacl.sign.publicKeyLength);
-    return !!sig && nacl.sign.detached.verify(naclUtil.decodeUTF8(bundlePayload(bundle)), sig, pub);
+    return !!sig && ed25519.verify(naclUtil.decodeUTF8(bundlePayload(bundle)), sig, pub);
   } catch (e) {
     return false;
   }
@@ -217,7 +222,7 @@ function createVapidRequest({ config, relayUrl, relayPub, relaySecret, now = Dat
     boxPub: naclUtil.encodeBase64(box.publicKey),
   };
   request.signature = naclUtil.encodeBase64(
-    nacl.sign.detached(naclUtil.decodeUTF8(requestPayload(request)), secret)
+    ed25519.sign(naclUtil.decodeUTF8(requestPayload(request)), secret)
   );
   return { request, boxSecret: box.secretKey };
 }
@@ -240,7 +245,7 @@ function verifyVapidRequest(request, config, now = Date.now()) {
     const sig = decodeB64(request.signature, nacl.sign.signatureLength);
     const pub = decodeB64(request.relayPub, nacl.sign.publicKeyLength);
     if (!sig || !pub) return null;
-    if (!nacl.sign.detached.verify(naclUtil.decodeUTF8(requestPayload(request)), sig, pub)) return null;
+    if (!ed25519.verify(naclUtil.decodeUTF8(requestPayload(request)), sig, pub)) return null;
     return member;
   } catch (e) {
     return null;
@@ -289,7 +294,7 @@ function createVapidResponse({ config, request, bundle, senderUrl, senderRelayPu
     ciphertext: naclUtil.encodeBase64(ciphertext),
   };
   response.signature = naclUtil.encodeBase64(
-    nacl.sign.detached(naclUtil.decodeUTF8(responsePayload(response)), secret)
+    ed25519.sign(naclUtil.decodeUTF8(responsePayload(response)), secret)
   );
   return response;
 }
@@ -312,7 +317,7 @@ function openVapidResponse({ config, request, response, boxSecret }) {
     if (
       !senderPub ||
       !sig ||
-      !nacl.sign.detached.verify(naclUtil.decodeUTF8(responsePayload(response)), sig, senderPub)
+      !ed25519.verify(naclUtil.decodeUTF8(responsePayload(response)), sig, senderPub)
     ) {
       return null;
     }
@@ -365,11 +370,18 @@ function writeJsonAtomic(filePath, value) {
     fs.renameSync(temp, filePath);
     try {
       fs.chmodSync(filePath, 0o600);
-    } catch (e) {}
+    } catch (e) {
+      // Временный файл уже создан с режимом 0600, и rename его сохраняет. Этот
+      // chmod — подстраховка для файловых систем, где это не так; отказ на них
+      // означает лишь, что подстраховка не понадобилась или невозможна.
+    }
   } finally {
     try {
       fs.unlinkSync(temp);
-    } catch (e) {}
+    } catch (e) {
+      // Уборка в finally: при удачном rename временного файла уже нет, и это
+      // самый частый путь сюда. Ошибку самой записи мы не заслоняем.
+    }
   }
 }
 

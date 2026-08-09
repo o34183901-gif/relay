@@ -16,7 +16,18 @@ const verifyCode = require('./verification-code');
 const ed25519 = require('./ed25519');
 // Пробрасываем как есть: правило сверки и цена вывода — часть контракта привязки,
 // и вызывающим не должно быть дела до того, в каком файле они живут.
-const { verificationCodesMatch, STRONG_CODE_ROUNDS } = verifyCode;
+// ПРВ-1: код подключения выводится там же, где остальные коды привязки, — иначе
+// появился бы второй файл, от которого зависит, можно ли привязать чужой ПК.
+const {
+  verificationCodesMatch,
+  STRONG_CODE_ROUNDS,
+  LINK_CODE_DIGITS,
+  LINK_CODE_MAX_ATTEMPTS,
+  generateLinkCode,
+  normalizeLinkCode,
+  formatLinkCode,
+  linkProofsMatch,
+} = verifyCode;
 
 const LINKED_DEVICE_VERSION = 2;
 const DEVICE_CERT_TYPE = 'licno-device-certificate';
@@ -25,7 +36,26 @@ const PAIRING_REQUEST_TYPE = 'licno-device-link-request';
 const PAIRING_QR_PREFIX = 'licno://link-device/v2#';
 const PAIRING_QR_COMPACT_PREFIX = 'licno://ld/3#';
 const PAIRING_QR_BINARY_PREFIX = 'LICNO:LD4:';
-const PAIRING_TTL_MS = 2 * 60 * 1000;
+/**
+ * ПРВ-1: срок жизни QR — полторы минуты вместо прежних двух.
+ *
+ * Две минуты выбирались под сценарий «взять телефон, открыть приложение, дойти
+ * до сканера и СВЕРИТЬ КОД». Сверки глазами больше нет: телефон показывает код
+ * подключения, и на его ввод отведено отдельное окно (PAIRING_APPROVAL_WINDOW_MS
+ * в src/pairingFlow.js). Самому QR остаётся «поднести телефон к экрану», и
+ * полутора минут хватает с запасом — истёкший QR обновляется автоматически.
+ * Дыру сокращение не закрывает (переслать картинку успевают и за минуту), её
+ * закрывает код подключения; но длинный срок после этого нечем оправдать.
+ *
+ * ВНИМАНИЕ, СОВМЕСТИМОСТЬ. Значение входит в компактный QR как флаг «срок по
+ * умолчанию», и декодер разворачивает его в PAIRING_TTL_MS СВОЕЙ версии. Разные
+ * версии получат разный expiresAt, подпись не сойдётся, и QR не отсканируется.
+ * Это НАМЕРЕННО: телефон прежней версии не умеет требовать код подключения и
+ * привязался бы по старому — уязвимому — пути. Отказ на сканировании лучше
+ * тихой привязки без кода. Уже привязанных устройств это не касается: новых
+ * запросов привязки они не создают.
+ */
+const PAIRING_TTL_MS = 90 * 1000;
 const PAIRING_CLOCK_SKEW_MS = 30 * 1000;
 const MAX_ACTIVE_DEVICES = 10;
 const MAX_ROSTER_ENTRIES = 32;
@@ -418,6 +448,74 @@ function assertSignedRoster(roster, options = {}) {
   return { ...payload, rootSignature: roster.rootSignature };
 }
 
+/**
+ * КРИТ-04: имеет ли эта сторона ПРАВО переписывать список устройств аккаунта.
+ *
+ * ПОЧЕМУ ОТДЕЛЬНО ОТ ПРОВЕРКИ ПОДПИСЕЙ
+ *
+ * Раньше порядок был обратным: сначала assertSignedRoster разбирал кандидата
+ * целиком — а это проверка корневой подписи плюс отдельная проверка подписи
+ * КАЖДОГО сертификата устройства, до тридцати двух штук в одном кадре, — и
+ * только потом выяснялось, что прислал его вообще не владелец аккаунта.
+ *
+ * То есть работу назначал тот, у кого нет никаких прав: аноним слал кадр с
+ * тридцатью двумя сертификатами, узел честно проверял тридцать три подписи
+ * Ed25519 и отвечал «нельзя». Общий лимит — восемьдесят кадров в секунду, узел
+ * однопоточный, и всё это время он не обслуживает никого.
+ *
+ * Здесь смотрят ровно на два ЗАЯВЛЕННЫХ поля и на состояние соединения. Этого
+ * достаточно, чтобы отказать до единой криптографической операции. Заявленным
+ * полям при этом ничего не доверяется: то же правило применяется второй раз,
+ * уже к разобранному и проверенному объекту, — и авторитетно именно оно.
+ * Первый вызов только экономит работу, второй решает.
+ *
+ * Правила ровно те же, что были:
+ *   • аккаунт уже известен — корневой ключ обязан совпасть с закреплённым;
+ *   • аккаунта ещё нет — создать его может только доказанный сеанс того самого
+ *     адреса, к которому привязан этот же корневой ключ подписи.
+ *
+ * ПОЧЕМУ ПРИЧИНА ОТКАЗА ГОВОРИТСЯ НЕ ВСЕМ
+ *
+ * Отвечать точной причиной кому угодно нельзя, и это не мелочь. «Корневой ключ
+ * не тот» означает «аккаунт X узлу известен», а «нужен корневой сеанс» —
+ * «неизвестен». Раньше добраться до этих ответов без валидной подписи было
+ * нельзя вовсе: до них просто не доходило. Пусти сюда всех — и любой,
+ * назвавшийся чужим адресом, спрашивал бы у релея, заводил ли там аккаунт
+ * конкретный человек, и с каким корневым ключом. Ускорение не стоит нового
+ * способа узнавать про чужие аккаунты.
+ *
+ * Поэтому точная причина полагается только тому, кто сидит на САМОМ адресе
+ * аккаунта. Воспользоваться этим, не заняв адрес, нельзя, а закреплённый адрес
+ * занять нельзя без доказательства владения (АУД-Э1) — значит и спросить про
+ * существующий чужой аккаунт таким способом не выйдет. Всем остальным отказ
+ * выглядит так же, как негодный ростер, то есть ровно так, как выглядел раньше.
+ *
+ * Условие намеренно НЕ включает `proven`: владелец, ещё не предъявивший
+ * доказательство, — самый частый получатель отказа «нужен корневой сеанс», и
+ * именно эта строка объясняет ему, что делать дальше. Спрятать её значило бы
+ * ради приватности, которой здесь не прибавится, сломать единственную подсказку.
+ */
+function rosterWriteGate(claimed, session = {}) {
+  const accountPublicKey = claimed && claimed.accountPublicKey;
+  const accountSignPublicKey = claimed && claimed.accountSignPublicKey;
+  const onOwnAddress = !!accountPublicKey && session.sessionPublicKey === accountPublicKey;
+  const deny = (reason) => ({ ok: false, reason: onOwnAddress ? reason : 'invalid-roster' });
+  if (typeof accountPublicKey !== 'string' || !accountPublicKey) {
+    return { ok: false, reason: 'invalid-roster' };
+  }
+  if (typeof accountSignPublicKey !== 'string' || !accountSignPublicKey) {
+    return { ok: false, reason: 'invalid-roster' };
+  }
+  if (session.knownAccountSignPublicKey) {
+    return session.knownAccountSignPublicKey === accountSignPublicKey
+      ? { ok: true }
+      : deny('root-key-conflict');
+  }
+  const bootstrap =
+    !!session.proven && onOwnAddress && session.boundRootSignPublicKey === accountSignPublicKey;
+  return bootstrap ? { ok: true } : deny('account-bootstrap-requires-root');
+}
+
 function verifySignedRoster(roster, options = {}) {
   try {
     assertSignedRoster(roster, options);
@@ -713,6 +811,20 @@ function strongVerificationCodeAsync(request) {
   return verifyCode.strongCodeAsync(pairingCanonical(request));
 }
 
+/**
+ * ПРВ-1: доказательство компьютера — «код с экрана телефона введён у меня».
+ * Привязано к КАНОНИЗИРОВАННОМУ запросу, а не к одному pairingId: иначе
+ * доказательство одной попытки годилось бы для другой с тем же идентификатором.
+ */
+function pairingLinkProof(request, challenge, code) {
+  return verifyCode.linkCodeProof(pairingCanonical(request), challenge, code);
+}
+
+/** Встречное подтверждение телефона: едет вместе с сертификатом устройства. */
+function pairingLinkConfirmation(request, challenge, code) {
+  return verifyCode.linkCodeConfirmation(pairingCanonical(request), challenge, code);
+}
+
 module.exports = {
   LINKED_DEVICE_VERSION,
   DEVICE_CERT_TYPE,
@@ -733,15 +845,25 @@ module.exports = {
   createSignedRoster,
   assertSignedRoster,
   verifySignedRoster,
+  rosterWriteGate,
   createPairingRequest,
   assertPairingRequest,
   verifyPairingRequest,
   encodePairingQr,
   encodePairingQrCompat,
   decodePairingQr,
+  encodeBase41,
   verificationCode,
   strongVerificationCode,
   strongVerificationCodeAsync,
   verificationCodesMatch,
   STRONG_CODE_ROUNDS,
+  LINK_CODE_DIGITS,
+  LINK_CODE_MAX_ATTEMPTS,
+  generateLinkCode,
+  normalizeLinkCode,
+  formatLinkCode,
+  linkProofsMatch,
+  pairingLinkProof,
+  pairingLinkConfirmation,
 };

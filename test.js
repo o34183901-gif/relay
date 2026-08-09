@@ -72,6 +72,20 @@ function waitFor(inbox, type, timeout = 2000) {
   });
 }
 
+/**
+ * КРИТ-04: прочитать счётчик из /metrics.
+ *
+ * Часть свойств узла снаружи иначе не видна: отказ до проверки подписей и
+ * отказ после неё выглядят для клиента одинаково — и это намеренно, иначе по
+ * тексту ответа посторонний узнавал бы про чужие аккаунты. Метрика показывает
+ * то же самое оператору, которому знать положено.
+ */
+async function metricValue(name) {
+  const resp = await fetch(`http://127.0.0.1:${PORT}/metrics`);
+  const body = await resp.text();
+  return Number((body.match(new RegExp(`^${name} (\\d+)`, 'm')) || [])[1] || 0);
+}
+
 function waitForAfter(inbox, type, startIndex, timeout = 2000) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -79,6 +93,21 @@ function waitForAfter(inbox, type, startIndex, timeout = 2000) {
       const m = inbox.slice(startIndex).find((x) => x.type === type);
       if (m) return resolve(m);
       if (Date.now() - started > timeout) return reject(new Error('timeout waiting for new ' + type));
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
+// СРВ-11: квитанции надо сличать попарно, поэтому ждём КОНКРЕТНЫЙ ref, а не
+// «первый кадр такого типа»: в inbox одновременно лежат ответы на оба зонда.
+function waitForRef(inbox, type, ref, timeout = 2000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      const m = inbox.find((x) => x.type === type && x.ref === ref);
+      if (m) return resolve(m);
+      if (Date.now() - started > timeout) return reject(new Error(`нет ${type} с ref=${ref}`));
       setTimeout(tick, 20);
     };
     tick();
@@ -107,7 +136,7 @@ function waitForBinaryAfter(inbox, startIndex, timeout = 2000) {
 // box-ключом (см. src/relay.js). СРВ-1: квитанции `received` сервер принимает
 // только от доказанного владельца, поэтому тестовый клиент должен вести себя как
 // боевой. Легаси-путь (без boxProof) проверяется отдельными raw-соединениями ниже.
-function client(id, { autoAck = true, signId, boxProof = true } = {}) {
+function client(id, { autoAck = true, signId, boxProof = true, capabilities = null } = {}) {
   const ws = new WebSocket(URL);
   const inbox = [];
   const binaryInbox = [];
@@ -121,7 +150,11 @@ function client(id, { autoAck = true, signId, boxProof = true } = {}) {
       const frame = unpackBinaryFrame(d);
       binaryInbox.push(frame);
       if (autoAck && frame.header.id) {
-        ws.send(JSON.stringify({ type: 'binary-received', id: frame.header.id }));
+        // ПРФ-14: у обычного сообщения квитанция СВОЯ (`received`), как и при
+        // JSON-доставке. Подтверди мы его как чанк вложения — конверт остался бы
+        // в очереди навсегда, а отправитель не получил бы `delivered`.
+        const type = frame.header.type === 'message-v1' ? 'received' : 'binary-received';
+        ws.send(JSON.stringify({ type, id: frame.header.id }));
       }
       return;
     }
@@ -142,7 +175,12 @@ function client(id, { autoAck = true, signId, boxProof = true } = {}) {
   });
   return new Promise((resolve, reject) => {
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'hello', pubkey: id.publicKey, signPublicKey: id.signPublicKey }));
+      const hello = { type: 'hello', pubkey: id.publicKey, signPublicKey: id.signPublicKey };
+      // ПРФ-14: возможности объявляются В HELLO. Клиент, который их не назвал
+      // (умолчание в тестах, как и у прежних версий приложения), обязан и дальше
+      // получать конверты JSON-ом.
+      if (capabilities) hello.capabilities = capabilities;
+      ws.send(JSON.stringify(hello));
       resolve({ ws, inbox, binaryInbox, id });
     });
     ws.on('error', (e) => reject(e)); // соединение не открылось — не виснем
@@ -169,11 +207,17 @@ async function main() {
   };
 
   try {
-    assert.strictEqual(health.protocol, 4);
+    // СРЕД-03: версия поднята с 5 до 6 — узел принимает кадр-пустышку и молча
+    // её выбрасывает. Клиент включает прикрывающий трафик только при совпадении
+    // И версии, И имени возможности, поэтому число здесь рабочее: занизив его,
+    // мы бы молча выключили прикрытие у всех, кто ходит через этот узел.
+    assert.strictEqual(health.protocol, 6);
     assert.ok(Array.isArray(health.capabilities));
     assert.ok(health.capabilities.includes('linked-devices-v2'));
     assert.ok(health.capabilities.includes('binary-attachments-v1'));
     assert.ok(health.capabilities.includes('frame-batch-v1'));
+    assert.ok(health.capabilities.includes('binary-envelope-v1'));
+    assert.ok(health.capabilities.includes('cover-traffic-v1'));
     assert.strictEqual(health.maxLinkedDevices, linked.MAX_ACTIVE_DEVICES);
     ok('health reports linked-device protocol capabilities');
 
@@ -236,6 +280,261 @@ async function main() {
     const dr = await waitFor(a.inbox, 'delivered');
     assert.strictEqual(dr.id, delivered.id);
     ok('sender receives ack + delivered receipt');
+
+    // --- СРВ-11: квитанция не выдаёт присутствия получателя ------------------
+    //
+    // Раньше `ack` отвечал `queued:false`, если кадр ушёл в живой сокет, и
+    // `queued:true`, если лёг в очередь. Регистрация свободна, служебный
+    // (`silent`) конверт получателя не будит и в его переписке не виден — то
+    // есть любой желающий мог опрашивать ЧУЖОЙ адрес хоть каждую секунду и
+    // строить профиль присутствия: сон, работа, поездки, «эти двое онлайн
+    // одновременно». Ниже — прямая проверка того самого зонда: два конверта, у
+    // одного получатель в сети, у другого адрес не подключался НИ РАЗУ. Ответы
+    // обязаны совпасть во всём, кроме ref и идентификатора конверта.
+    const ghost = crypto.generateIdentity(); // адрес, за которым никто не стоит
+    const probeEnv = crypto.encryptMessage({
+      plaintext: 'зонд присутствия',
+      mySecretKey: alice.secretKey,
+      myPublicKey: alice.publicKey,
+      theirPublicKey: bob.publicKey,
+    });
+    const probe = (ref, to) =>
+      a.ws.send(JSON.stringify({ type: 'send', to, envelope: probeEnv, ref, silent: true }));
+    probe('probe-online', bob.publicKey);
+    probe('probe-offline', ghost.publicKey);
+    const ackOnline = await waitForRef(a.inbox, 'ack', 'probe-online');
+    const ackOffline = await waitForRef(a.inbox, 'ack', 'probe-offline');
+    assert.strictEqual(ackOnline.queued, true, 'queued — константа, а не состояние получателя');
+    assert.strictEqual(ackOnline.dropped, false, 'принятый конверт не помечается отказом');
+    assert.deepStrictEqual(
+      { ...ackOnline, ref: null, id: null },
+      { ...ackOffline, ref: null, id: null },
+      'ack онлайн-получателю обязан быть неотличим от ack офлайн-получателю'
+    );
+    ok('СРВ-11: ack не различает онлайн и офлайн получателя (оракула присутствия нет)');
+
+    // Тот же зонд на бинарном пути: `attachment-chunk` шлётся так же свободно,
+    // и если бы `binary-ack` сохранил различие, опрос просто переехал бы на
+    // вложения.
+    const probeChunk = require('crypto').randomBytes(64);
+    const binaryProbe = (ref, to) =>
+      a.ws.send(
+        packBinaryFrame(
+          { type: 'attachment-chunk', version: 1, to, transferId: 'presence-probe-1', index: 0, total: 1, ref },
+          probeChunk
+        )
+      );
+    binaryProbe('bprobe-online', bob.publicKey);
+    binaryProbe('bprobe-offline', ghost.publicKey);
+    const binOnline = await waitForRef(a.inbox, 'binary-ack', 'bprobe-online');
+    const binOffline = await waitForRef(a.inbox, 'binary-ack', 'bprobe-offline');
+    assert.strictEqual(binOnline.queued, true, 'binary-ack: queued — та же константа, что и в ack');
+    assert.deepStrictEqual(
+      { ...binOnline, ref: null, id: null },
+      { ...binOffline, ref: null, id: null },
+      'binary-ack онлайн-получателю обязан быть неотличим от офлайн'
+    );
+    ok('СРВ-11: binary-ack тоже не различает онлайн и офлайн (зонд не переезжает на вложения)');
+
+    // --- ПРФ-14: обычное сообщение двоичным кадром ---------------------------
+    //
+    // Проверяется не «принял ли релей кадр», а два свойства, от которых зависит,
+    // дойдёт ли сообщение вообще.
+    //
+    // Первое: путь один. Квоты очереди, признак `dropped` и форма квитанции у
+    // двоичного и JSON-кадра обязаны совпадать — иначе двоичный кадр стал бы
+    // обходом ограничений очереди либо новым оракулом присутствия.
+    //
+    // Второе: согласование. Клиент, не объявивший возможность, обязан
+    // ПРОДОЛЖАТЬ получать конверты JSON-ом, кем бы они ни были отправлены.
+    // Конверт идёт от узла к узлу, поэтому отправитель о клиенте получателя
+    // ничего не знает и решение принимается по соединению ПОЛУЧАТЕЛЯ.
+    {
+      const sealedOf = (bytes) => ({ v: 1, sealed: Buffer.from(bytes).toString('base64') });
+      const blob = require('crypto').randomBytes(320);
+      const outer = sealedOf(blob);
+
+      /**
+       * Каким кадром конверт доехал до получателя.
+       *
+       * Ждём ЛЮБОЙ реакции, а не кадра нужного вида: иначе «уехало не тем
+       * форматом» было бы не отличить от «ещё не дошло», и поломка
+       * совместимости выглядела бы как таймаут без объяснения.
+       */
+      const arrivedAs = async (peer, jsonStart, binaryStart, timeout = 3000) => {
+        const started = Date.now();
+        while (Date.now() - started < timeout) {
+          if (peer.binaryInbox.length > binaryStart) return 'двоично';
+          if (peer.inbox.slice(jsonStart).some((m) => m.type === 'message')) return 'JSON';
+          await wait(20);
+        }
+        return 'не дошло';
+      };
+
+      // 1. Двоичный кадр от отправителя → получатель прежней версии (b) читает
+      //    его прежним JSON-кадром. Именно так работает совместимость.
+      const jsonStart = b.inbox.length;
+      const bBinaryStart = b.binaryInbox.length;
+      const ackStart2 = a.inbox.length;
+      a.ws.send(
+        packBinaryFrame(
+          { type: 'send-v1', version: 1, to: bob.publicKey, sv: 1, ref: 'bin-r1' },
+          blob
+        )
+      );
+      assert.strictEqual(
+        await arrivedAs(b, jsonStart, bBinaryStart),
+        'JSON',
+        'клиент, не объявивший возможность, обязан продолжать получать конверты JSON-ом'
+      );
+      const gotJson = await waitForAfter(b.inbox, 'message', jsonStart);
+      assert.deepStrictEqual(gotJson.envelope, outer, 'конверт обязан доехать байт в байт');
+      const binAck = await waitForRef(a.inbox, 'ack', 'bin-r1');
+      assert.strictEqual(binAck.dropped, false);
+      await waitForAfter(a.inbox, 'delivered', ackStart2);
+      ok('ПРФ-14: конверт, отправленный двоичным кадром, доходит до клиента прежней версии как JSON');
+
+      // 2. Квитанции обоих путей неразличимы (кроме ref и id) — общий путь
+      //    приёма, а не две расходящиеся ветки.
+      a.ws.send(JSON.stringify({ type: 'send', to: bob.publicKey, envelope: outer, ref: 'json-r1' }));
+      const jsonAck = await waitForRef(a.inbox, 'ack', 'json-r1');
+      assert.deepStrictEqual(
+        { ...binAck, ref: null, id: null },
+        { ...jsonAck, ref: null, id: null },
+        'квитанция двоичного пути обязана быть неотличима от квитанции JSON-пути'
+      );
+      ok('ПРФ-14: квитанции двоичного и JSON-пути неразличимы');
+
+      // 3. Получатель, объявивший возможность, получает ДВОИЧНЫЙ кадр — и
+      //    полезная нагрузка в нём сырая, без base64.
+      const carol = crypto.generateIdentity();
+      const c = await client(carol, { capabilities: ['binary-envelope-v1'] });
+      await waitFor(c.inbox, 'ready');
+      const cBinaryStart = c.binaryInbox.length;
+      const cJsonStart = c.inbox.length;
+      const ackStart3 = a.inbox.length;
+      a.ws.send(JSON.stringify({ type: 'send', to: carol.publicKey, envelope: outer, ref: 'to-carol' }));
+      const gotBinary = await waitForBinaryAfter(c.binaryInbox, cBinaryStart);
+      assert.strictEqual(gotBinary.header.type, 'message-v1');
+      assert.strictEqual(gotBinary.header.sv, 1);
+      assert.ok(typeof gotBinary.header.id === 'string' && gotBinary.header.id);
+      assert.ok(Buffer.from(gotBinary.payload).equals(blob), 'тело обязано быть сырыми байтами конверта');
+      assert.strictEqual(
+        c.inbox.slice(cJsonStart).filter((m) => m.type === 'message').length,
+        0,
+        'тот же конверт не должен приехать ещё и JSON-ом'
+      );
+      // Квитанция `received` из двоичного кадра снимает конверт с очереди так же,
+      // как из JSON: иначе он лежал бы до истечения срока и приезжал снова.
+      await waitForAfter(a.inbox, 'delivered', ackStart3);
+      ok('ПРФ-14: получатель, объявивший возможность, получает конверт двоичным кадром без base64');
+
+      // 4. ГРАНИЦА ПРИВАТНОСТИ. Незапечатанный конверт двоично не отдаётся: его
+      //    поля (отправитель, эфемерный ключ храповика, счётчики цепочки) иначе
+      //    вышли бы в открытый заголовок кадра.
+      const plainEnvelope = {
+        v: 1,
+        dr: 1,
+        from: alice.publicKey,
+        header: { dh: 'ZWZlbWVybnlqLWtsanVjaA==', pn: 3, n: 11 },
+        nonce: 'bm9uY2UtMjQtYmFqdGEtcm92bm8h',
+        cipher: 'c2hpZnJvdGVrc3Q=',
+      };
+      const beforePlain = c.binaryInbox.length;
+      const beforePlainJson = c.inbox.length;
+      a.ws.send(
+        JSON.stringify({ type: 'send', to: carol.publicKey, envelope: plainEnvelope, ref: 'plain-1' })
+      );
+      assert.strictEqual(
+        await arrivedAs(c, beforePlainJson, beforePlain),
+        'JSON',
+        'незапечатанный конверт не имеет права уехать двоичным кадром'
+      );
+      const plainDelivered = await waitForAfter(c.inbox, 'message', beforePlainJson);
+      assert.deepStrictEqual(plainDelivered.envelope, plainEnvelope);
+      ok('ПРФ-14: незапечатанный конверт остаётся в JSON — его поля не выходят в открытый заголовок');
+
+      // 5. Очередь не теряется. Отправляем на адрес, которого нет в сети, затем
+      //    поднимаем его с объявленной возможностью — конверт обязан приехать
+      //    двоично и сняться с очереди по квитанции.
+      const dave = crypto.generateIdentity();
+      const queuedBlob = require('crypto').randomBytes(200);
+      a.ws.send(
+        packBinaryFrame(
+          { type: 'send-v1', version: 1, to: dave.publicKey, sv: 1, ref: 'queued-1', silent: true },
+          queuedBlob
+        )
+      );
+      await waitForRef(a.inbox, 'ack', 'queued-1');
+      const d = await client(dave, { capabilities: ['binary-envelope-v1'] });
+      await waitFor(d.inbox, 'ready');
+      const fromQueue = await waitForBinaryAfter(d.binaryInbox, 0);
+      assert.strictEqual(fromQueue.header.type, 'message-v1');
+      assert.ok(Buffer.from(fromQueue.payload).equals(queuedBlob), 'из очереди обязан прийти тот же конверт');
+      const readyFrame = d.inbox.find((m) => m.type === 'ready');
+      assert.ok(readyFrame.queued >= 1, 'релей обязан сообщить о непустой очереди');
+      ok('ПРФ-14: конверт из ОЧЕРЕДИ выдаётся двоичным кадром и не теряется');
+
+      // 6. Негодный двоичный кадр отвергается внятной ошибкой, а соединение
+      //    остаётся живым: разбор идёт над данными из сети.
+      const errStart = a.inbox.length;
+      a.ws.send(packBinaryFrame({ type: 'send-v1', version: 1, to: bob.publicKey, sv: 7 }, blob));
+      const badVersion = await waitForAfter(a.inbox, 'error', errStart);
+      assert.ok(/envelope frame/.test(badVersion.error));
+      const errStart2 = a.inbox.length;
+      a.ws.send(packBinaryFrame({ type: 'send-v1', version: 1, to: '', sv: 1 }, blob));
+      await waitForAfter(a.inbox, 'error', errStart2);
+      // Соединение живо: следующий нормальный кадр по-прежнему принимается.
+      a.ws.send(
+        packBinaryFrame({ type: 'send-v1', version: 1, to: bob.publicKey, sv: 1, ref: 'after-err' }, blob)
+      );
+      await waitForRef(a.inbox, 'ack', 'after-err');
+      ok('ПРФ-14: негодный двоичный кадр конверта отвергается, соединение переживает это');
+
+      // 7. СРЕД-03: кадр-пустышка. Узел обязан принять его и молча выбросить —
+      //    ни ответа, ни квитанции, ни очереди, ни доставки.
+      //
+      //    Проверяется на настоящем узле, потому что цена ошибки здесь двойная.
+      //    Ответь он хоть чем-нибудь — и в канале появится вторая запись,
+      //    жёстко привязанная к первой: наблюдатель отличит пустышку от
+      //    сообщения по одному наличию пары, и вся мера сведётся к самопометке.
+      //    Прими он её за конверт — мусор пойдёт между людьми как сообщение и
+      //    займёт место в очереди получателя.
+      //
+      //    Следующий обычный кадр служит меткой времени: дождавшись ЕГО
+      //    квитанции, мы точно знаем, что узел успел обработать и пустышку.
+      //    Каждый принятый конверт отвечает ровно одной `ack`, поэтому «одна
+      //    квитанция на два отправленных кадра» и означает, что пустышка
+      //    сообщением не стала.
+      const coverStart = a.inbox.length;
+      a.ws.send(
+        packBinaryFrame(
+          { type: 'cover-v1', version: 1, p: 'a'.repeat(51) },
+          require('crypto').randomBytes(48 + 2048)
+        )
+      );
+      a.ws.send(
+        packBinaryFrame(
+          { type: 'send-v1', version: 1, to: bob.publicKey, sv: 1, ref: 'after-cover' },
+          blob
+        )
+      );
+      await waitForRef(a.inbox, 'ack', 'after-cover');
+      const afterCover = a.inbox.slice(coverStart);
+      assert.ok(
+        !afterCover.some((m) => m.type === 'error' || m.type === 'binary-error'),
+        'СРЕД-03: на пустышку узел не отвечает ничем — ответ размечал бы её'
+      );
+      assert.strictEqual(
+        afterCover.filter((m) => m.type === 'ack' || m.type === 'binary-ack').length,
+        1,
+        'СРЕД-03: пустышка не встаёт в очередь и не считается сообщением'
+      );
+      ok('СРЕД-03: пустышка принята, молча выброшена и сообщением не стала');
+
+      c.ws.close();
+      d.ws.close();
+    }
 
     // --- linked devices v2 + mixed legacy recipient -----------------------
     const desktop = crypto.generateIdentity();
@@ -320,6 +619,30 @@ async function main() {
       'сообщение с компьютера'
     );
     ok('v2 device metadata reaches an unchanged legacy queue/delivery path');
+
+    // ВЫС-41: отправитель просит НЕ подставлять его метаданные снаружи —
+    // получатель читает их изнутри запечатанного конверта. Прежде адрес
+    // аккаунта и весь список устройств ложились в очередь на диск открытым
+    // текстом рядом с запечатанным конвертом: изъятая база релея прямо
+    // говорила, какие ключи принадлежат одному человеку и кому он писал.
+    const noMetaStart = b.inbox.length;
+    desktopClient.ws.send(
+      JSON.stringify({
+        type: 'send',
+        to: bob.publicKey,
+        envelope: desktopEnvelope,
+        ref: 'desktop-r2',
+        noMeta: true,
+      })
+    );
+    const hidden = await waitForAfter(b.inbox, 'message', noMetaStart);
+    assert.strictEqual(hidden.fromAccount, undefined, 'адрес аккаунта отправителя наружу не выходит');
+    assert.strictEqual(hidden.fromDeviceId, undefined);
+    assert.strictEqual(hidden.deviceCertificate, undefined);
+    assert.strictEqual(hidden.deviceRoster, undefined, 'и весь список его устройств — тоже');
+    assert.strictEqual(hidden.from, desktop.publicKey, 'адрес устройства остаётся: без него кадр некому доставить');
+    assert.ok(hidden.envelope, 'сам конверт при этом доезжает как обычно');
+    ok('ВЫС-41: по просьбе отправителя релей не подставляет его метаданные наружу');
 
     const rosterStart = desktopClient.inbox.length;
     desktopClient.ws.send(JSON.stringify({ type: 'device-roster-get' }));
@@ -655,12 +978,36 @@ async function main() {
       s.ws.send(JSON.stringify({ type: 'send', to: victim.publicKey, envelope: envV, ref: 'rv' }));
       await waitFor(s.inbox, 'ack');
 
-      // недоказанный держатель (boxProof:false) занимает ещё не занятый адрес,
-      // получает конверт онлайн и автоматически шлёт `received` — квитанция должна
-      // быть ПРОИГНОРИРОВАНА (иначе он вычерпал бы очередь и жертва не получила бы своё).
+      // АУД-Э1: недоказанный держатель (boxProof:false) занимает ещё не занятый
+      // адрес — и не получает НИЧЕГО.
+      //
+      // Раньше он получал конверт онлайн, и защищена была только квитанция: он
+      // не мог вычерпать очередь, но читал и шифртекст, и метаданные каждого
+      // отправителя (адрес, идентификатор и имя устройства, весь его список
+      // устройств). Для продукта, который прячет социальный граф, это сводило
+      // усилия на нет: адрес публичен, а закрепление живёт на каждом релее
+      // отдельно, поэтому найти узел, где жертва ещё не входила, несложно.
       const unproven = await client(victim, { boxProof: false });
-      await waitFor(unproven.inbox, 'message'); // онлайн-доставка (шифртекст)
-      await wait(200); // autoAck отправил received (должен игнорироваться)
+      const readyUnproven = await waitFor(unproven.inbox, 'ready');
+      assert.strictEqual(
+        readyUnproven.receiveBlocked,
+        'box-proof-required',
+        'релей обязан сказать, почему входящих не будет, а не молчать'
+      );
+      assert.strictEqual(readyUnproven.queued, 0, 'очередь недоказанному сеансу не выгружается');
+      await wait(250); // за это время конверт НЕ должен приехать
+      assert.strictEqual(
+        unproven.inbox.filter((m) => m.type === 'message').length,
+        0,
+        'ни один конверт не уходит тому, кто не доказал владение адресом'
+      );
+
+      // Публикация prekey и перехват токена пробуждения тоже закрыты: иначе
+      // захвативший адрес подменял бы бандл жертвы и забирал её уведомления.
+      unproven.ws.send(JSON.stringify({ type: 'register', pushToken: 'ТОКЕН-ЗАХВАТЧИКА' }));
+      const regErr = await waitFor(unproven.inbox, 'error');
+      assert.strictEqual(regErr.error, 'box ownership proof required', 'push-токен не перебивается без доказательства');
+
       unproven.ws.close();
       await wait(150);
 
@@ -673,7 +1020,7 @@ async function main() {
         senderPublicKey: sender.publicKey,
       });
       assert.strictEqual(text, 'секрет жертве', 'конверт не вычерпан недоказанной квитанцией');
-      ok('СРВ-1: недоказанная квитанция `received` не удаляет конверт из очереди');
+      ok('АУД-Э1: незакреплённый адрес нельзя занять — ни приём, ни очередь, ни push, ни prekey');
       real.ws.close();
       s.ws.close();
       await wait(100);
@@ -728,13 +1075,137 @@ async function main() {
       raw.close();
     }
 
+    // --- КРИТ-04: цена дорогих кадров назначает узел, а не спрашивающий ---
+    {
+      const crit = await client(crypto.generateIdentity());
+      await waitFor(crit.inbox, 'ready');
+
+      // 1. Права на список устройств проверяются ДО криптографии.
+      //
+      // Отличить «отказали до разбора» от «отказали после» по ответу нельзя, и
+      // это намеренно: постороннему причина не рассказывается, иначе он узнавал
+      // бы, заводил ли на узле аккаунт конкретный человек. Наблюдаемым порядок
+      // делает счётчик — он же и нужен оператору, чтобы отличать обстрел
+      // дорогими кадрами от «узел стал медленным».
+      //
+      // Ростер здесь ВАЛИДНО ПОДПИСАН: проверяется именно порядок, а не то, что
+      // мусор отвергается. Права на чужой аккаунт у соединения при этом нет.
+      const victim = crypto.generateIdentity();
+      const victimCert = linked.createDeviceCertificate(
+        {
+          accountPublicKey: victim.publicKey,
+          accountSignPublicKey: victim.signPublicKey,
+          deviceId: linked.deriveDeviceId(victim.publicKey),
+          devicePublicKey: victim.publicKey,
+          deviceSignPublicKey: victim.signPublicKey,
+          name: 'Телефон',
+          platform: 'android',
+          issuedAt: Date.now(),
+          capabilities: ['messages', 'files', 'voice', 'history-sync', 'notifications'],
+        },
+        victim.signSecretKey
+      );
+      const victimRoster = linked.createSignedRoster(
+        {
+          accountPublicKey: victim.publicKey,
+          accountSignPublicKey: victim.signPublicKey,
+          version: 1,
+          updatedAt: Date.now(),
+          devices: [{ certificate: victimCert, revokedAt: null }],
+        },
+        victim.signSecretKey
+      );
+      const earlyBefore = await metricValue('licno_roster_denied_early_total');
+      const before = crit.inbox.length;
+      crit.ws.send(JSON.stringify({ type: 'device-roster-put', roster: victimRoster }));
+      const denied = await waitForAfter(crit.inbox, 'device-roster-error', before);
+      assert.strictEqual(denied.error, 'invalid-roster', 'посторонний получает отказ и ничего не узнаёт');
+      assert.strictEqual(
+        await metricValue('licno_roster_denied_early_total'),
+        earlyBefore + 1,
+        'отказ обязан случиться ДО проверки подписей, а не после'
+      );
+      ok('КРИТ-04: чужой список устройств отвергается без проверки подписей');
+
+      // 2. Сводка ящика отдаётся из готового, а не пересчитывается на просьбу.
+      //
+      // Проверяется наблюдаемое следствие: между двумя просьбами подряд, если
+      // ящик не менялся, ответ обязан совпасть побайтно. Пересчёт на каждую
+      // просьбу был бы не только дорог, но и опасен: сводки двух спросивших
+      // подряд отличались бы, и по разнице читалось бы, что легло между ними.
+      const firstAt = crit.inbox.length;
+      crit.ws.send(JSON.stringify({ type: 'mbx-digest' }));
+      const d1 = await waitForAfter(crit.inbox, 'mbx-digest', firstAt);
+      const secondAt = crit.inbox.length;
+      crit.ws.send(JSON.stringify({ type: 'mbx-digest' }));
+      const d2 = await waitForAfter(crit.inbox, 'mbx-digest', secondAt);
+      assert.strictEqual(d1.bits, d2.bits, 'ящик не менялся — байты сводки обязаны совпасть');
+      assert.strictEqual(d1.size, d2.size);
+      ok('КРИТ-04: сводка отдаётся готовой и не меняется между просьбами');
+
+      // 3. Дорогие кадры живут по своему потолку, а не по общему.
+      //
+      // Общий лимит — восемьдесят кадров в секунду; в него укладываются и
+      // просьбы, каждая из которых стоит выборки по всей базе. Здесь их идёт
+      // полсотни — заведомо больше минутной нормы и заведомо меньше общего
+      // лимита, поэтому отказ может прийти только от отдельного потолка.
+      const refusedBefore = await metricValue('licno_costly_refused_total');
+      const floodAt = crit.inbox.length;
+      for (let i = 0; i < 50; i += 1) crit.ws.send(JSON.stringify({ type: 'mbx-digest' }));
+      const refused = await waitForAfter(crit.inbox, 'mbx-error', floodAt);
+      assert.strictEqual(refused.error, 'rate', 'сверх минутной нормы узел отказывает');
+      assert.ok(
+        (await metricValue('licno_costly_refused_total')) > refusedBefore,
+        'оператор обязан видеть обстрел дорогими кадрами, а не только рост задержек'
+      );
+      const served = crit.inbox.slice(floodAt).filter((m) => m.type === 'mbx-digest').length;
+      assert.ok(served <= 10, `обслужено ${served} просьб — не больше минутной нормы`);
+      // Отказ, а не разрыв: легитимный клиент мог попасть сюда из-за повторов
+      // при плохой связи, и рвать ему соединение дороже, чем отказать.
+      assert.strictEqual(crit.ws.readyState, WebSocket.OPEN, 'соединение живо');
+      crit.ws.send(JSON.stringify({ type: 'ping' }));
+      await waitForAfter(crit.inbox, 'pong', crit.inbox.length - 1);
+      ok('КРИТ-04: у дорогих кадров свой потолок, и превышение не рвёт связь');
+      crit.ws.close();
+
+      // 4. ВЫС-19: HTTP-репликация ящика — не бесплатный усилитель.
+      //
+      // GET /mbx отдавал до 1,2 МБ на запрос в сорок байт (усилитель ×30000)
+      // без аутентификации и без ограничения частоты, при том что WS-кадры
+      // ящика давно и за auth, и под своим потолком.
+      const limitedBefore = await metricValue('licno_mbx_http_limited_total');
+      let served200 = 0;
+      let refused429 = 0;
+      for (let i = 0; i < 40; i += 1) {
+        const resp = await fetch(`http://127.0.0.1:${PORT}/mbx?after=0`);
+        if (resp.status === 429) refused429 += 1;
+        else if (resp.status === 200) served200 += 1;
+        await resp.arrayBuffer();
+      }
+      assert.ok(refused429 > 0, 'поток обращений обязан упереться в потолок частоты');
+      assert.ok(served200 <= 12, `обслужено ${served200} обращений — не больше минутной нормы`);
+      assert.ok(
+        (await metricValue('licno_mbx_http_limited_total')) > limitedBefore,
+        'оператор обязан видеть, что узел дёргают как усилитель'
+      );
+      // Отказ — обычный 429 с retry-after, а не разрыв: сосед мог упереться в
+      // потолок из-за повторов, и молчание объяснило бы ему меньше.
+      const limitedResp = await fetch(`http://127.0.0.1:${PORT}/mbx?after=0`);
+      assert.strictEqual(limitedResp.status, 429);
+      assert.strictEqual(limitedResp.headers.get('retry-after'), '60');
+      await limitedResp.arrayBuffer();
+      ok('ВЫС-19: HTTP-репликация ящика ограничена по частоте и это видно оператору');
+    }
+
     a.ws.close();
     b3.ws.close();
     c.ws.close();
     dAck.ws.close();
     console.log(`\nrelay: ${passed} passed`);
   } finally {
+    const serverExited = new Promise((resolve) => srv.once('exit', resolve));
     srv.kill();
+    await serverExited;
     for (const f of [DB, DB + '-wal', DB + '-shm', VAPID_FILE]) try { fs.unlinkSync(f); } catch (e) {}
     try { fs.rmSync(BLOB_DIR, { recursive: true, force: true }); } catch (e) {}
   }

@@ -12,6 +12,7 @@ const { generateVapidKeys } = require('./push');
 const {
   loadFleetConfig,
   memberFor,
+  memberAcceptsKey,
   validVapidPair,
   signVapidBundle,
   verifyVapidBundle,
@@ -57,11 +58,41 @@ fs.writeFileSync(
 );
 const config = loadFleetConfig(configPath);
 
+function configFile(name, value) {
+  const filename = path.join(tmp, name);
+  fs.writeFileSync(filename, JSON.stringify(value));
+  return filename;
+}
+
 try {
   test('fleet config loads pinned genesis and dynamic future member', () => {
     assert.strictEqual(config.genesis, 'wss://genesis.example.com');
     assert.strictEqual(memberFor(config, 'wss://FOLLOWER.example.com/').relayPub, b64(followerKeys.publicKey));
     assert.strictEqual(memberFor(config, 'wss://new.example.com').allowDynamicKey, true);
+  });
+
+  test('fleet config rejects every malformed trust boundary', () => {
+    const base = {
+      version: 1,
+      fleetId: 'invalid-cases',
+      epoch: 1,
+      genesis: 'wss://genesis.example.com',
+      relays: [{ url: 'wss://genesis.example.com', relayPub: b64(genesisKeys.publicKey) }],
+    };
+    const invalid = [
+      { ...base, version: 2 },
+      { ...base, relays: [] },
+      { ...base, relays: [{ url: 'wss://%', relayPub: b64(genesisKeys.publicKey) }] },
+      { ...base, relays: [{ url: 'wss://genesis.example.com', relayPub: 'broken' }] },
+      { ...base, relays: [{ url: 'wss://genesis.example.com' }] },
+      { ...base, genesis: 'wss://other.example.com' },
+    ];
+    invalid.forEach((value, index) => {
+      assert.throws(() => loadFleetConfig(configFile(`invalid-${index}.json`, value)), /vapid-fleet/);
+    });
+    const throwingString = { toString() { throw new Error('bad base64 input'); } };
+    assert.strictEqual(memberAcceptsKey({ relayPub: null }, throwingString), false);
+    assert.strictEqual(validVapidPair(throwingString, 'x'), false);
   });
 
   const vapid = generateVapidKeys();
@@ -72,6 +103,7 @@ try {
     assert.strictEqual(verifyVapidBundle(bundle, config), true);
     assert.strictEqual(verifyVapidBundle({ ...bundle, publicKey: bundle.publicKey.slice(1) }, config), false);
     assert.strictEqual(verifyVapidBundle({ ...bundle, epoch: 2 }, config), false);
+    assert.strictEqual(verifyVapidBundle(bundle, { ...config, relays: [] }), false);
   });
 
   test('allowed follower performs signed request and decrypts the exact genesis bundle', () => {
@@ -101,6 +133,29 @@ try {
     const corrupted = { ...response, ciphertext: response.ciphertext.slice(0, -2) + 'AA' };
     assert.strictEqual(
       openVapidResponse({ config, request: pending.request, response: corrupted, boxSecret: pending.boxSecret }),
+      null
+    );
+    assert.strictEqual(verifyVapidRequest(null, config), null);
+    assert.strictEqual(
+      verifyVapidRequest(new Proxy({}, { get() { throw new Error('request getter'); } }), config),
+      null
+    );
+    assert.throws(() => createVapidResponse({
+      config,
+      request: { ...pending.request, boxPub: 'broken' },
+      bundle,
+      senderUrl: config.genesis,
+      senderRelayPub: b64(genesisKeys.publicKey),
+      senderRelaySecret: genesisKeys.secretKey,
+    }), /response keys/);
+    assert.strictEqual(openVapidResponse({ config, request: pending.request, response: null, boxSecret: pending.boxSecret }), null);
+    assert.strictEqual(
+      openVapidResponse({
+        config,
+        request: pending.request,
+        response: new Proxy({}, { get() { throw new Error('response getter'); } }),
+        boxSecret: pending.boxSecret,
+      }),
       null
     );
   });
@@ -133,6 +188,7 @@ try {
     writeJsonAtomic(bundlePath, bundle);
     assert.deepStrictEqual(readJsonFile(bundlePath), bundle);
     assert.strictEqual(verifyVapidBundle(readJsonFile(bundlePath), config), true);
+    assert.strictEqual(readJsonFile(path.join(tmp, 'missing.json')), null);
   });
 
   console.log(`\nvapid fleet: ${passed} passed`);

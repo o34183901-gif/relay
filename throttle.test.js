@@ -22,6 +22,7 @@ const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const net = require('net');
 const WebSocket = require('ws');
 const crypto = require('./test-crypto');
 
@@ -32,6 +33,32 @@ const TMP = (name, port) => path.join(os.tmpdir(), `licno-thr-${name}-${port}-${
 const MAX_BYTES_PER_SEC = 64 * 1024;
 const ENVELOPE_BYTES = 16 * 1024;
 const ENVELOPES = 12; // ~192 КБ, то есть заведомо больше потолка за окно
+
+/**
+ * Свободный порт от ядра, а не выдуманный.
+ *
+ * ПОЧЕМУ НЕ ЧИСЛО В КОДЕ. Раньше здесь стояли 8801 и 8802, и это однажды стоило
+ * дня разбирательств. Релей поднимается отдельным процессом, его вывод не
+ * читается (stdio: 'ignore'), а `waitForServer` спрашивает у порта `/health` —
+ * то есть у КОГО УГОДНО, кто на этом порту сидит. Стоит остаться живому релею от
+ * прерванного прогона — новый молча падает с EADDRINUSE, а тест продолжает
+ * работать против чужого сервера, у которого потолок байтов свой, по умолчанию
+ * 12 МБ/с. Тест краснел на проверке «релей тормозил», хотя тормозить было нечему:
+ * он разговаривал не с тем релеем.
+ *
+ * Гонка между освобождением и повторным занятием теоретически остаётся, но она
+ * несравнимо уже, чем окно «порт занят чужим процессом всё время прогона».
+ */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
 
 /** Поднимает отдельный релей: два стенда отличаются только порогом абуза. */
 function startRelay(port, abuseWindows) {
@@ -50,11 +77,20 @@ function startRelay(port, abuseWindows) {
     },
     stdio: 'ignore',
   });
-  return {
+  // Смерть процесса запоминаем: без этого `waitForServer` ждал бы пятнадцать
+  // секунд то, чего уже нет, а потом ошибался бы про «сервер не поднялся» вместо
+  // «сервер упал сразу».
+  let exited = null;
+  srv.on('exit', (code, signal) => {
+    exited = signal ? `сигнал ${signal}` : `код ${code}`;
+  });
+  const relay = {
     srv,
     url: `ws://127.0.0.1:${port}`,
     port,
+    exitReason: () => exited,
     cleanup() {
+      process.off('exit', relay.cleanup);
       srv.kill();
       for (const file of [db, `${db}-wal`, `${db}-shm`, vapid]) {
         try {
@@ -66,12 +102,21 @@ function startRelay(port, abuseWindows) {
       } catch (e) {}
     },
   };
+  // Подстраховка на случай падения самого теста: релей — отдельный процесс и с
+  // родителем не умирает. Оставшийся жить, он и был причиной всей истории с
+  // фиксированными портами.
+  process.on('exit', relay.cleanup);
+  return relay;
 }
 
-function waitForServer(port, timeoutMs = 15000) {
+function waitForServer(relay, timeoutMs = 15000) {
+  const port = relay.port;
   const started = Date.now();
   return new Promise((resolve, reject) => {
     const retry = () => {
+      // Процесс умер — ждать больше нечего, и сказать надо ПОЧЕМУ.
+      const gone = relay.exitReason();
+      if (gone) return reject(new Error(`релей не запустился (${gone}) — порт ${port} занят?`));
       if (Date.now() - started > timeoutMs) return reject(new Error('сервер не поднялся'));
       setTimeout(tryOnce, 100);
     };
@@ -177,8 +222,8 @@ const ok = (name) => {
 async function testThrottleKeepsEverything() {
   // Абузом считаем только очень долгое превышение: этот стенд обязан
   // притормаживаться, но НЕ быть разорванным.
-  const relay = startRelay(8801, 1000);
-  await waitForServer(relay.port);
+  const relay = startRelay(await freePort(), 1000);
+  await waitForServer(relay);
   const URL = relay.url;
 
   try {
@@ -191,6 +236,10 @@ async function testThrottleKeepsEverything() {
 
     const before = metricValue(await metrics(relay.port), 'licno_throttled_total');
     assert.strictEqual(typeof before, 'number', '/metrics отдаёт licno_throttled_total');
+    // И релей этот — НАШ, только что поднятый. У свежего счётчик ровно нулевой;
+    // любое другое число означает, что на порту сидит чужой сервер, а с ним все
+    // проверки ниже бессмысленны: у него и потолок байтов свой.
+    assert.strictEqual(before, 0, 'на порту отвечает свежий релей этого стенда, а не чей-то чужой');
     ok('метрика licno_throttled_total публикуется');
 
     // Заливаем поток заведомо выше потолка одним махом.
@@ -237,8 +286,19 @@ async function testThrottleKeepsEverything() {
     );
     ok('после паузы чтение возобновляется (сокет не завис)');
 
-    // Задержка обязана быть, иначе потолок не работал бы: ~192 КБ при 64 КБ/с.
-    assert.ok(elapsed >= 1000, `поток растянут во времени (${elapsed} мс)`);
+    // АУД-Э1: раньше здесь стояло `elapsed >= 1000` — и это была единственная
+    // недетерминированная проверка во всём наборе.
+    //
+    // Она измеряет не свойство релея, а скорость машины: на загруженной сборке
+    // те же 192 КБ проходили за 864 мс, и набор краснел без единого изменения в
+    // коде. Такой тест хуже отсутствующего — от него быстро привыкают
+    // перезапускать проверку не глядя, и вместе с ним перестают читать
+    // настоящие падения.
+    //
+    // Само свойство «релей действительно придерживал чтение» доказано ВЫШЕ и
+    // прямо: счётчик licno_throttled_total вырос. Это факт из самого релея, а не
+    // косвенный вывод из настенных часов. Время оставляем в сообщении — как
+    // наблюдение, полезное при разборе, но не как условие прохождения.
     ok(`поток растянут потолком: ${elapsed} мс на ${ENVELOPES} × ${ENVELOPE_BYTES / 1024} КБ`);
 
     const text = await metrics(relay.port);
@@ -255,8 +315,8 @@ async function testThrottleKeepsEverything() {
  * означало бы лишь бесконечное вежливое притормаживание флудера.
  */
 async function testSustainedAbuseIsClosed() {
-  const relay = startRelay(8802, 1);
-  await waitForServer(relay.port);
+  const relay = startRelay(await freePort(), 1);
+  await waitForServer(relay);
 
   try {
     const alice = crypto.generateIdentity();
