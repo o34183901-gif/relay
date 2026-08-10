@@ -1,0 +1,11 @@
+{
+  "version": "0.1.8",
+  "notes": "Первый публичный выпуск настольного клиента через сеть релеев",
+  "pub_date": "2026-08-10T18:34:43Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSTktCS1Z4T3ZjTDJCQnZnOXBNdVQ5d1M1eEFSeTBrblRiYjRGT1loYzdWUS9xVWtDbHJjWlo0bTNZTWRpV0tnRU5HQmEzaTdOL3JKTXEwQkNiLzVjcnBENlA1NDgzTXdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2Mzg2ODgzCWZpbGU60JvQuNGH0L3Qvl8wLjEuOF94NjQtc2V0dXAuZXhlCms4blNPRk5XMSt3dzNzWlA5RDlmTllwcVZySGg5QUFKRUpNZ1hwR2NWMGVlZ2o2S0NrVFVJTDIyaFJZTkZyU2Y4ZTZ0anlmOGdPWUxBM0lJNXZZaERBPT0K",
+      "url": "https://github.com/o34183901-gif/relay/releases/download/desktop-v0.1.8/licno-windows-x64-setup.exe"
+    }
+  }
+}
