@@ -1,0 +1,21 @@
+{
+  "version": "0.1.8",
+  "url": "https://github.com/o34183901-gif/relay/releases/download/desktop-v0.1.8/licno-windows-x64-setup.exe",
+  "size": 4363646,
+  "sha256": "26aa9e62427885fe6211c7f85dc0d5de38e3d7edc10a1ef7c33dbae8f9677161",
+  "platform": "desktop",
+  "filesHash": "dc97ec4352e91638a96330bc3498c062ba41635b1240d70a0654758c08ca9c3f",
+  "files": [
+    {
+      "path": "desktop-latest.json",
+      "size": 814,
+      "sha256": "2ce39ecd321252a1173be403fc0911c3eeccaa7dc7bdc4daf86a6b96c35b2382"
+    },
+    {
+      "path": "licno-windows-x64-setup.exe.sig",
+      "size": 420,
+      "sha256": "5e7c1dc9e1669ed3ae6c3b7998d57bc355bea0a45512b44cd76a74e281368c8b"
+    }
+  ],
+  "signature": "QrqOI1oCqz2EMsXTqzlUlL18leF81+euyMCKNgkx2/Uthm310Xe6gqeme2wqZ3Im9ENH9m3fQPt8cpxetLA7CQ=="
+}
