@@ -1,0 +1,86 @@
+{
+  "version": "0.0.61",
+  "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
+  "size": 1919,
+  "sha256": "a504aec198508c3b5d70cc5c4ca261ee6b60ded501dec93088c17bc6a530d025",
+  "platform": "web",
+  "filesHash": "ae978769bf89266885c7bd20cac616f7e16303e03d8a0e6ce851d66633860bef",
+  "files": [
+    {
+      "path": "_expo/static/js/web/index-292a14f40a3912de21930befb89f83cf.js",
+      "size": 2893171,
+      "sha256": "84130f2af9f1b7e8780098013f68b5caa71932c6f6f25a54e479cae69df28d52"
+    },
+    {
+      "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
+      "size": 913,
+      "sha256": "2c95e8c2675e799335fd0046bb07dbda06cb7ecff51ed37922c6309d619cc4d3"
+    },
+    {
+      "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon.35ba0eaec5a4f5ed12ca16fabeae451d.png",
+      "size": 207,
+      "sha256": "84cf5eb3b20250f69e0e4733beb4da5f417f0682892a5ad1b5e62570753c21b1"
+    },
+    {
+      "path": "attachment-decrypt-worker.js",
+      "size": 2780,
+      "sha256": "730b14402ef078058f08efd4717297a193093b8129851f109a1d0e05252b4562"
+    },
+    {
+      "path": "favicon.ico",
+      "size": 14510,
+      "sha256": "0434c68a2602a93b90aaf1d86c5562da8716a9c303e143e8200c424811db320d"
+    },
+    {
+      "path": "icons/icon-1024.png",
+      "size": 10533,
+      "sha256": "7ac6fe1b2abcf0001a0d9580e11cb18c59ad6a0d5c6e5d3de409dbfff0abb879"
+    },
+    {
+      "path": "icons/icon-maskable-1024.png",
+      "size": 9656,
+      "sha256": "3ddd7ce49d12f78b4911858dfc85013c1fe3ac8c6b74142753ea90bf275ea3f5"
+    },
+    {
+      "path": "index.html",
+      "size": 1919,
+      "sha256": "a504aec198508c3b5d70cc5c4ca261ee6b60ded501dec93088c17bc6a530d025"
+    },
+    {
+      "path": "jsqr.bundle.js",
+      "size": 256885,
+      "sha256": "bc40c8a15196236b2314db0856f72ca0b49980cd5413b8c852a7349f5fee0859"
+    },
+    {
+      "path": "manifest.webmanifest",
+      "size": 769,
+      "sha256": "d998bcdff464b17bb4fc0d3060ee8fd2949f0487460a86cc8851410e4d281d21"
+    },
+    {
+      "path": "metadata.json",
+      "size": 49,
+      "sha256": "aa5f19cc84d41c0f8c70ececb2bc82e863227ea1e121632aca879eb616056991"
+    },
+    {
+      "path": "nacl-fast.min.js",
+      "size": 32110,
+      "sha256": "3ec535c004aeeb225785d8e93fb33bf99f52e399bd7dfc01969b5629baea5131"
+    },
+    {
+      "path": "qr-decode-worker.js",
+      "size": 961,
+      "sha256": "3482c7f2ccfe3b55abc87d27b23bfc9eb660b2c4ddfd5e9c036e8e000e8c4946"
+    },
+    {
+      "path": "sw.js",
+      "size": 5602,
+      "sha256": "507e267c4988e21e28deee49aa58109ece80116c5846a1ecceba13e109e8a67d"
+    },
+    {
+      "path": "version.json",
+      "size": 75,
+      "sha256": "2f61c180dfa684f515d6810fe3e24b9d88f91c61cf5fe742be24c059946464a3"
+    }
+  ],
+  "signature": "zISG7/mDCi7717txsTBy/CyP7A1OgW3xwdtLpLRfN/Oici76IGbQbz+EX0SUclKZN9fJoOHV98Oyj19bNdckCQ=="
+}
