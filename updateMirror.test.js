@@ -238,6 +238,31 @@ const check = (manifest, over = {}) =>
 }
 
 {
+  // Сквозная связка, которой не было в отдельных проверках выше: сначала
+  // проверяем подписанный desktop-манифест, затем берём filesHash ИЗ результата
+  // проверки и им же проверяем список. Именно так делает mirrorTree.
+  const files = [
+    { path: 'desktop-latest.json', size: 814, sha256: 'a'.repeat(64) },
+    { path: 'licno-windows-x64-setup.exe.sig', size: 420, sha256: 'b'.repeat(64) },
+  ];
+  const filesHash = crypto.createHash('sha256').update(filesPayload(files), 'utf8').digest('hex');
+  const checked = check(release({ platform: 'desktop', filesHash }), { platform: 'desktop' });
+  assert.strictEqual(checked.ok, true, `desktop-манифест отвергнут: ${checked.reason}`);
+  assert.strictEqual(checked.release.filesHash, filesHash, 'filesHash потерян после проверки подписи');
+  assert.strictEqual(
+    webFilesVerdict({ files, filesHash: checked.release.filesHash }).ok,
+    true,
+    'mirrorTree не принимает список настоящего подписанного desktop-выпуска'
+  );
+  assert.strictEqual(
+    check(release({ platform: 'desktop', filesHash: 'не-sha256' }), { platform: 'desktop' }).ok,
+    false,
+    'зеркало приняло подписанную, но негодную свёртку списка'
+  );
+  ok('подписанная desktop-свёртка проходит полный путь до проверки списка');
+}
+
+{
   // Настольный манифест — в НАШЕМ формате, а не Tauri: по манифесту узел решает,
   // что качать, и доверять такой выбор документу без нашей подписи нельзя.
   assert.strictEqual(manifestUrl(DEFAULT_SOURCE, 'desktop'), `${DEFAULT_SOURCE}/desktop-version.json`);

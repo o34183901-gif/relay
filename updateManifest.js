@@ -188,6 +188,19 @@ function verifyUpdateManifest(input) {
   }
   const size = Number(manifest.size);
   if (!Number.isFinite(size) || size <= 0) return { ok: false, reason: 'в манифесте нет размера файла' };
+  // Многофайловые web/desktop-выпуски подписывают не весь список, а его
+  // SHA-256. Поле нужно не только проверить подписью выше, но и передать дальше
+  // зеркалу: без него список неизбежно сравнивается с пустой свёрткой и каждый
+  // настоящий выпуск отвергается. Для старых однофайловых манифестов поле
+  // по-прежнему необязательно.
+  const filesHash = manifest.filesHash;
+  if (
+    filesHash !== undefined &&
+    filesHash !== null &&
+    (typeof filesHash !== 'string' || !/^[0-9a-f]{64}$/i.test(filesHash))
+  ) {
+    return { ok: false, reason: 'в манифесте нет свёртки списка файлов' };
+  }
 
   return {
     ok: true,
@@ -198,6 +211,7 @@ function verifyUpdateManifest(input) {
       size,
       sha256: manifest.sha256.toLowerCase(),
       notes: typeof manifest.notes === 'string' ? manifest.notes : '',
+      filesHash: typeof filesHash === 'string' ? filesHash.toLowerCase() : '',
     },
   };
 }
