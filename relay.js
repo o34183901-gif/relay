@@ -73,6 +73,13 @@ const mbx = require('./mbx');
 // ВЫС-19: частота обращений к HTTP-репликации ящика на IP. Чистое правило,
 // проверяется отдельно (server/httpRateLimit.test.js).
 const { createHttpRateLimit } = require('./httpRateLimit');
+// ОБН-2: раздача обновлений. Правила (какой платформе что и чего не отдавать
+// никогда) — в server/updateFeed.js, здесь только проводка и отдача файла.
+const updateFeed = require('./updateFeed');
+const updateMirror = require('./updateMirror');
+const webApp = require('./webApp');
+const landing = require('./landing');
+const { RELEASE_PUBLIC_KEY } = require('./releaseKey');
 // В-2: подпись и её проверка — через единую обёртку (внутри @noble/curves,
 // формат прежний побайтно). На релее это путь аутентификации КАЖДОГО
 // подключения: challenge подписывает клиент, свою подпись ставит релей, и
@@ -421,6 +428,40 @@ const MBX_HTTP_PAGE = Math.min(mbx.SYNC_LIMIT, Number(process.env.RELAY_MBX_HTTP
 const mbxHttpRate = createHttpRateLimit({ max: MBX_HTTP_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
 const ROSTER_PUT_MAX_PER_MIN = Number(process.env.RELAY_ROSTER_PUT_PER_MIN) || 10;
 
+// ОБН-2: раздача обновлений приложения.
+//
+// Пусто — раздачи нет вовсе, и это умолчание правильное: файл выпуска весит
+// десятки мегабайт, а платит за них оператор. Включает тот, кто сам решил
+// раздавать: RELAY_UPDATE_DIR=/srv/licno/releases, и туда кладутся подписанные
+// android-version.json и licno-android.apk (см. scripts/release-manifest.js).
+//
+// Частота на IP: манифест спрашивают раз в полчаса на устройство, поэтому
+// десяток в минуту с одного адреса — уже далеко за пределами обычного. Файл
+// ограничен отдельно и жёстче: это десятки мегабайт за запрос, и качают его
+// один раз на выпуск, а не по расписанию.
+// ВЫП-8: РАЗДАЧА ВКЛЮЧЕНА ПО УМОЛЧАНИЮ, и выпуск узел забирает сам.
+//
+// Раньше здесь было пусто, и оператор включал раздачу вручную: задать каталог,
+// скачать пару «манифест + файл», положить. На каждый выпуск, на каждом узле.
+// На практике это означало, что не раздавал никто, — а через релеи обновление
+// доезжает единственным путём: ни сайта, ни магазина у проекта нет. Выпустить
+// исправление и не доставить его — то же самое, что не выпустить.
+//
+// Отказаться можно: RELAY_UPDATE_MIRROR=off выключает и загрузку, и раздачу.
+const UPDATE_DIR = process.env.RELAY_UPDATE_DIR || path.join(path.dirname(DB_FILE), 'releases');
+const UPDATE_MIRROR_OFF = String(process.env.RELAY_UPDATE_MIRROR || '').trim().toLowerCase() === 'off';
+const UPDATE_SOURCE = String(process.env.RELAY_UPDATE_SOURCE || updateMirror.DEFAULT_SOURCE).trim();
+const UPDATE_MIRROR_MS = Number(process.env.RELAY_UPDATE_MIRROR_MS) || updateMirror.DEFAULT_INTERVAL_MS;
+// ВЫП-9: веб-версия лежит деревом внутри того же каталога раздачи.
+const WEB_DIR = path.join(UPDATE_DIR, 'web');
+const UPDATE_MANIFEST_MAX_PER_MIN = Number(process.env.RELAY_UPDATE_MANIFEST_PER_MIN) || 12;
+const UPDATE_FILE_MAX_PER_MIN = Number(process.env.RELAY_UPDATE_FILE_PER_MIN) || 3;
+const updateManifestRate = createHttpRateLimit({
+  max: UPDATE_MANIFEST_MAX_PER_MIN,
+  windowMs: COSTLY_WINDOW_MS,
+});
+const updateFileRate = createHttpRateLimit({ max: UPDATE_FILE_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+
 // Resource limits (H4): защита узла от исчерпания ресурсов при абузе/DoS.
 // ВАЖНО: мобильные операторы прячут тысячи абонентов за одним IP (CGNAT),
 // поэтому per-IP лимит — грубый предохранитель от одиночного хоста, а не от
@@ -461,6 +502,12 @@ const counters = {
   // ВЫС-19: отказов HTTP-репликации ящика по частоте. Рост числа — узел дёргают
   // как усилитель, а не реплицируют.
   mbxHttpLimited: 0,
+  // ОБН-2: раздача обновлений. Оператору это единственный способ увидеть, во
+  // что ему обходится включённая раздача: манифест — байты, файл — десятки
+  // мегабайт за штуку.
+  updateManifestServed: 0,
+  updateFileServed: 0,
+  updateHttpLimited: 0,
 };
 
 // ПРФ-3: задержка event-loop. Релей однопоточный, а хранилище (better-sqlite3) и
@@ -630,6 +677,24 @@ function renderMetrics() {
     'counter',
     'Отказов HTTP-репликации ящика по частоте (ВЫС-19). Рост — узел дёргают как усилитель, а не реплицируют.',
     counters.mbxHttpLimited
+  );
+  metric(
+    'licno_update_manifest_served_total',
+    'counter',
+    'Манифестов выпуска отдано (ОБН-2). Байты; растёт вместе с числом устройств, которым этот релей известен.',
+    counters.updateManifestServed
+  );
+  metric(
+    'licno_update_file_served_total',
+    'counter',
+    'Файлов выпуска отдано (ОБН-2). Десятки мегабайт за штуку — это и есть цена включённой раздачи.',
+    counters.updateFileServed
+  );
+  metric(
+    'licno_update_http_limited_total',
+    'counter',
+    'Отказов раздачи обновлений по частоте (ОБН-2). Рост — узел качают как файлопомойку.',
+    counters.updateHttpLimited
   );
   return lines.join('\n') + '\n';
 }
@@ -1394,6 +1459,184 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  // ОБН-2: раздача обновлений приложения.
+  //
+  // Обновление жило по одному адресу — `https://lichno.pro/download/…`. Один
+  // домен — одна точка отказа, и отказ этот чаще не технический: домен
+  // блокируют, разделегируют, за него забывают заплатить. Обновления встают у
+  // всех разом и ровно тогда, когда нужнее всего: после находки дыры в
+  // предыдущей сборке.
+  //
+  // Раздавать это с релея безопасно ровно потому, что доверия к релею нет:
+  // манифест подписан ключом выпуска, ключ вшит в приложение, файл сверяется с
+  // отпечатком из подписанного манифеста. Релей не может подсунуть свою сборку
+  // — у него нет ключа; он может только не отдать ничего.
+  //
+  // Раздача ВЫКЛЮЧЕНА, пока оператор не задал RELAY_UPDATE_DIR: файл весит
+  // десятки мегабайт, и платит за них он.
+  // ВЫП-10: страница знакомства. Сюда приводит системная камера того, у кого
+  // приложения ещё нет: код знакомства теперь ссылка, а не набор символов.
+  //
+  // Данные знакомства узел НЕ ВИДИТ и видеть не должен — они во фрагменте
+  // ссылки, а фрагмент браузер на сервер не отправляет.
+  if (req.url === '/i' || req.url.startsWith('/i?') || req.url.startsWith('/i#')) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { 'content-type': 'text/plain' });
+      res.end('method');
+      return;
+    }
+    const html = landing.landingHtml({
+      userAgent: (req.headers && req.headers['user-agent']) || '',
+      downloadUrl: `${updateFeed.RELEASE_FILE_PATH}?platform=android`,
+      webUrl: webApp.WEB_APP_PREFIX,
+    });
+    const body = Buffer.from(html, 'utf8');
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': String(body.length),
+      'x-content-type-options': 'nosniff',
+      'cache-control': 'no-cache',
+    });
+    if (req.method === 'HEAD') return res.end();
+    res.end(body);
+    return;
+  }
+
+  // ВЫП-9: веб-версия приложения. Её открывают там, где приложения не поставить
+  // — на iPhone магазина у проекта нет, а APK туда не ставится вовсе.
+  //
+  // Отдаём только GET/HEAD и только из каталога веб-сборки: путь приходит из
+  // сети, и ошибка здесь означала бы выдачу любого файла с диска узла.
+  {
+    const relative = webApp.webAppPath(req.url);
+    if (relative !== null) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { 'content-type': 'text/plain' });
+        res.end('method');
+        return;
+      }
+      const full = relative ? webApp.resolveWebFile(WEB_DIR, relative) : '';
+      let stat = null;
+      try {
+        stat = full ? fs.statSync(full) : null;
+      } catch (e) {
+        stat = null;
+      }
+      if (!stat || !stat.isFile()) {
+        // Нет файла — отдаём страницу приложения: у веб-версии свои внутренние
+        // адреса, и по прямой ссылке на них браузер приходит сюда.
+        const page = webApp.resolveWebFile(WEB_DIR, 'index.html');
+        let pageStat = null;
+        try {
+          pageStat = page ? fs.statSync(page) : null;
+        } catch (e) {
+          pageStat = null;
+        }
+        if (!pageStat || !pageStat.isFile()) {
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end('веб-версия на этом узле ещё не разложена');
+          return;
+        }
+        res.writeHead(200, webApp.webAppHeaders('index.html', pageStat.size));
+        if (req.method === 'HEAD') return res.end();
+        fs.createReadStream(page).pipe(res);
+        return;
+      }
+      res.writeHead(200, webApp.webAppHeaders(relative, stat.size));
+      if (req.method === 'HEAD') return res.end();
+      fs.createReadStream(full).pipe(res);
+      return;
+    }
+  }
+
+  if (req.url === '/update' || req.url.startsWith('/update?') || req.url.startsWith('/update/')) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { 'content-type': 'text/plain' });
+      res.end('method');
+      return;
+    }
+    const parsed = new URL(req.url, 'http://x');
+    const platform = parsed.searchParams.get('platform');
+    const wantsFile = parsed.pathname === '/update/file';
+    if (!wantsFile && parsed.pathname !== '/update') {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+      return;
+    }
+    const limiter = wantsFile ? updateFileRate : updateManifestRate;
+    if (!limiter.allow(clientIp(req), Date.now())) {
+      counters.updateHttpLimited += 1;
+      res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '60' });
+      res.end('rate');
+      return;
+    }
+    if (wantsFile) {
+      const verdict = updateFeed.fileResponse({
+        dir: UPDATE_DIR,
+        platform,
+        stat: (target) => fs.statSync(target),
+      });
+      if (verdict.status !== 200) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end(verdict.reason || 'not found');
+        return;
+      }
+      counters.updateFileServed += 1;
+      res.writeHead(200, {
+        'content-type': verdict.type,
+        'content-length': String(verdict.size),
+        'content-disposition': `attachment; filename="${verdict.filename}"`,
+        'access-control-allow-origin': '*',
+      });
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+      // Потоком: держать десятки мегабайт в памяти релея ради раздачи —
+      // верный способ уронить узел, на котором лежит чужая переписка.
+      const stream = fs.createReadStream(verdict.path);
+      stream.on('error', () => {
+        // Файл убрали прямо во время отдачи. Заголовки уже ушли, и сказать об
+        // этом нечем — рвём соединение: клиент увидит недокачанный файл, не
+        // сойдётся отпечаток и пойдёт к следующему источнику.
+        res.destroy();
+      });
+      stream.pipe(res);
+      return;
+    }
+    // ОБН-5: адрес, по которому к нам пришли. Нужен, чтобы подставить себя в
+    // манифест Tauri: у него адрес файла не подписан, а вот сам файл подписан,
+    // и отправлять клиента за ним на недоступный сайт бессмысленно.
+    //
+    // Берём из заголовка Host, а не из настройки: релей стоит за прокси, знает
+    // о себе только внутренний адрес, и любая настройка здесь разошлась бы с
+    // действительностью молча. Подделать Host может только сам клиент — и
+    // навредит этим лишь себе.
+    const host = String((req.headers && req.headers.host) || '').trim();
+    const selfUrl = /^[A-Za-z0-9.\-:[\]]{1,255}$/.test(host) ? `https://${host}` : '';
+    const verdict = updateFeed.manifestResponse({
+      dir: UPDATE_DIR,
+      platform,
+      selfUrl,
+      read: (target) => fs.readFileSync(target, 'utf8'),
+    });
+    if (verdict.status !== 200) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end(verdict.reason || 'not found');
+      return;
+    }
+    counters.updateManifestServed += 1;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+      // Манифест меняется раз в выпуск, но кэш здесь опаснее лишнего запроса:
+      // придержанный старый манифест — это человек, не узнавший о починке.
+      'cache-control': 'no-store',
+    });
+    res.end(req.method === 'HEAD' ? undefined : verdict.body);
+    return;
+  }
+
   // Метрики для мониторинга (Prometheus text format). Закрывается токеном
   // через RELAY_METRICS_TOKEN (см. metricsAuthorized).
   if (req.url === '/metrics' || req.url.startsWith('/metrics?')) {
@@ -3373,6 +3616,311 @@ function expireQueuedEnvelopes(now = Date.now(), queueStore = store, { onFatal =
 }
 setInterval(expireQueuedEnvelopes, 3600 * 1000).unref();
 
+// --- ВЫП-8: узел сам забирает актуальный выпуск ------------------------------
+//
+// Через релеи обновление доезжает до установленного приложения ЕДИНСТВЕННЫМ
+// путём: сайта и магазина у проекта нет. Пока выпуск клал оператор руками, на
+// каждом узле и на каждую версию, — не раздавал никто, и выпущенное исправление
+// до людей не доходило.
+//
+// Порядок здесь важен и объяснён в шапке updateMirror.js: подпись проверяется
+// ДО того, как узел пойдёт по адресу из манифеста. Иначе подставленный манифест
+// отправил бы его куда угодно и занял бы диск.
+let mirrorRunning = false;
+
+/** Что узел раздаёт сейчас: версия и отпечаток из лежащего манифеста. */
+function mirroredRelease(platform) {
+  try {
+    const file = path.join(UPDATE_DIR, updateFeed.RELEASES[platform].manifest);
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return { version: String(parsed.version || ''), sha256: String(parsed.sha256 || '') };
+  } catch (e) {
+    return null; // ещё ничего не раздаём — это норма, а не беда
+  }
+}
+
+/** Проверка подписи — тем же кодом и тем же ключом, что и в приложении. */
+function verifyReleaseSignature(payload, signature, key) {
+  try {
+    return ed25519.verify(
+      naclUtil.decodeUTF8(payload),
+      naclUtil.decodeBase64(signature),
+      naclUtil.decodeBase64(key)
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+async function fetchText(url, limit) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    if (!response.ok) return null;
+    const text = await response.text();
+    return text.length > limit ? null : text;
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function mirrorPlatform(platform) {
+  const url = updateMirror.manifestUrl(UPDATE_SOURCE, platform);
+  if (!url) return;
+  const body = await fetchText(url, updateMirror.MAX_MANIFEST_BYTES);
+  if (!body) return;
+
+  const have = mirroredRelease(platform);
+  const checked = updateMirror.checkedManifest({
+    body,
+    platform,
+    publicKey: RELEASE_PUBLIC_KEY,
+    verifySignature: verifyReleaseSignature,
+    currentVersion: '0.0.0',
+  });
+  if (!checked.ok) {
+    console.warn(`[update] манифест ${platform} отвергнут: ${checked.reason}`);
+    return;
+  }
+  if (!updateMirror.needsFetch({ have, release: checked.release })) return;
+
+  const fileUrl = updateMirror.usableFileUrl(checked.release.url);
+  if (!fileUrl) {
+    console.warn(`[update] адрес файла ${platform} не годится: нужен https`);
+    return;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 300000);
+  let bytes = null;
+  try {
+    const response = await fetch(fileUrl, { signal: controller.signal, redirect: 'follow' });
+    if (!response.ok) return;
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (e) {
+    console.warn(`[update] файл ${platform} не скачался:`, (e && e.message) || e);
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const verdict = updateMirror.fileVerdict({ size: bytes.length, sha256, release: checked.release });
+  if (!verdict.ok) {
+    console.warn(`[update] файл ${platform} не сошёлся с подписанным манифестом: ${verdict.reason}`);
+    return;
+  }
+
+  // Сначала файл, потом манифест. Манифест — объявление «файл готов»: появись
+  // оно раньше, приложение пришло бы за файлом, которого ещё нет. Запись через
+  // временное имя: оборвись процесс на середине, узел раздавал бы огрызок.
+  fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  const names = updateFeed.RELEASES[platform];
+  const filePath = path.join(UPDATE_DIR, names.file);
+  const tmpPath = `${filePath}.part`;
+  fs.writeFileSync(tmpPath, bytes);
+  fs.renameSync(tmpPath, filePath);
+  fs.writeFileSync(path.join(UPDATE_DIR, names.manifest), body, 'utf8');
+  console.warn(`[update] ${platform}: раздаём ${checked.release.version} (${bytes.length} байт)`);
+}
+
+
+// --- ВЫП-9: веб-версия на узле ----------------------------------------------
+//
+// Её открывают там, где приложения нет и не будет: на iPhone магазина у проекта
+// нет, а поставить APK туда нельзя. Для этих людей веб-версия — не запасной
+// путь, а единственный.
+//
+// Дерево файлов, а не один файл, поэтому и проверок больше: подпись покрывает
+// СВЁРТКУ списка, свёртка сверяется с самим списком, а каждый скачанный файл —
+// со своим отпечатком. Подменить достаточно одного файла, того, который
+// исполняется в браузере.
+
+/** Какая версия многофайлового выпуска лежит сейчас. */
+function mirroredTreeVersion(manifestName) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(UPDATE_DIR, manifestName), 'utf8'));
+    return String(parsed.version || '');
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * Забрать выпуск, состоящий из НЕСКОЛЬКИХ файлов (ВЫП-9, ВЫП-11).
+ *
+ * Так устроены веб-версия (страница, бандл, значки) и настольный клиент
+ * (установщик, его подпись minisign, манифест Tauri). Подписана свёртка списка,
+ * список сверяется с ней, каждый файл — со своим отпечатком: подменить довольно
+ * одного файла, а не всей сборки.
+ *
+ * `replaceDir` — для веб-версии: там сборку кладут ЦЕЛИКОМ через временный
+ * каталог, иначе на середине загрузки узел раздавал бы половину новой и половину
+ * старой, а это белый экран. Настольные файлы лежат рядом с андроидными, сносить
+ * каталог нельзя — переносим по одному, каждый через временное имя.
+ */
+async function mirrorTree(platform, manifestName, targetDir, replaceDir) {
+  const url = updateMirror.manifestUrl(UPDATE_SOURCE, platform);
+  if (!url) return;
+  const body = await fetchText(url, updateMirror.MAX_MANIFEST_BYTES);
+  if (!body) return;
+
+  const checked = updateMirror.checkedManifest({
+    body,
+    platform,
+    publicKey: RELEASE_PUBLIC_KEY,
+    verifySignature: verifyReleaseSignature,
+    currentVersion: '0.0.0',
+  });
+  if (!checked.ok) {
+    console.warn(`[update] манифест ${platform} отвергнут: ${checked.reason}`);
+    return;
+  }
+  const have = mirroredTreeVersion(manifestName);
+  if (
+    have &&
+    !updateMirror.needsFetch({
+      have: { version: have, sha256: '' },
+      release: { version: checked.release.version, sha256: '' },
+    })
+  ) {
+    return;
+  }
+
+  let list = [];
+  try {
+    list = JSON.parse(body).files;
+  } catch (e) {
+    return;
+  }
+  const verdict = updateMirror.webFilesVerdict({ files: list, filesHash: checked.release.filesHash });
+  if (!verdict.ok) {
+    console.warn(`[update] список файлов ${platform} отвергнут: ${verdict.reason}`);
+    return;
+  }
+
+  const stageDir = replaceDir ? `${replaceDir}.new` : path.join(targetDir, `.${platform}.new`);
+  fs.rmSync(stageDir, { recursive: true, force: true });
+  fs.mkdirSync(stageDir, { recursive: true });
+  for (const item of list) {
+    const safe = updateMirror.safeWebPath(item.path);
+    const fileUrl = updateMirror.treeFileUrl(UPDATE_SOURCE, platform, safe);
+    if (!safe || !fileUrl) {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      return;
+    }
+    let bytes = null;
+    try {
+      const response = await fetch(fileUrl, { redirect: 'follow' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      bytes = Buffer.from(await response.arrayBuffer());
+    } catch (e) {
+      console.warn(`[update] файл ${platform} ${safe} не скачался:`, (e && e.message) || e);
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      return;
+    }
+    const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+    if (bytes.length !== Number(item.size) || digest !== String(item.sha256).toLowerCase()) {
+      console.warn(`[update] файл ${platform} ${safe} не сошёлся с подписанным списком`);
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      return;
+    }
+    const target = path.join(stageDir, safe);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, bytes);
+  }
+
+  if (replaceDir) {
+    const oldDir = `${replaceDir}.old`;
+    fs.rmSync(oldDir, { recursive: true, force: true });
+    if (fs.existsSync(replaceDir)) fs.renameSync(replaceDir, oldDir);
+    fs.renameSync(stageDir, replaceDir);
+    fs.rmSync(oldDir, { recursive: true, force: true });
+  } else {
+    for (const item of list) {
+      const safe = updateMirror.safeWebPath(item.path);
+      const from = path.join(stageDir, safe);
+      const to = path.join(targetDir, safe);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+    }
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+  // ОСНОВНОЙ ФАЙЛ ВЫПУСКА, если его нет в списке.
+  //
+  // У настольного клиента установщик лежит в РЕЛИЗЕ, а не в дереве: держать
+  // десятки мегабайт в истории git незачем, и с каждым выпуском она росла бы
+  // навсегда. В дереве едут только мелочи — манифест Tauri и подпись minisign.
+  // Адрес установщика взят из подписанного манифеста, длина и отпечаток тоже
+  // подписаны, так что проверять его есть чем.
+  const mainName = (updateFeed.RELEASES[platform] || {}).file || '';
+  const inList = list.some((item) => updateMirror.safeWebPath(item.path) === mainName);
+  if (mainName && !inList) {
+    const fileUrl = updateMirror.usableFileUrl(checked.release.url);
+    if (!fileUrl) {
+      console.warn(`[update] адрес файла ${platform} не годится: нужен https`);
+      return;
+    }
+    let bytes = null;
+    try {
+      const response = await fetch(fileUrl, { redirect: 'follow' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      bytes = Buffer.from(await response.arrayBuffer());
+    } catch (e) {
+      console.warn(`[update] файл ${platform} не скачался:`, (e && e.message) || e);
+      return;
+    }
+    const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+    const fileOk = updateMirror.fileVerdict({ size: bytes.length, sha256: digest, release: checked.release });
+    if (!fileOk.ok) {
+      console.warn(`[update] файл ${platform} не сошёлся с подписанным манифестом: ${fileOk.reason}`);
+      return;
+    }
+    const target = path.join(targetDir, mainName);
+    const tmp = `${target}.part`;
+    fs.writeFileSync(tmp, bytes);
+    fs.renameSync(tmp, target);
+  }
+
+  // Манифест — ПОСЛЕДНИМ: он объявляет «файлы готовы».
+  fs.writeFileSync(path.join(UPDATE_DIR, manifestName), body, 'utf8');
+  console.warn(`[update] ${platform}: раздаём ${checked.release.version} (${list.length} файлов)`);
+}
+
+async function maintainUpdateMirror() {
+  if (UPDATE_MIRROR_OFF || mirrorRunning) return;
+  mirrorRunning = true;
+  try {
+    // Только платформы, чей манифест подписан НАШИМ ключом. У настольного
+    // клиента формат чужой (Tauri, подпись minisign стоит на установщике), и
+    // проверить его этим кодом нельзя — значит и качать вслепую нельзя тоже.
+    for (const [platform, names] of Object.entries(updateFeed.RELEASES)) {
+      if (names.kind !== 'licno') continue;
+      await mirrorPlatform(platform);
+    }
+    // ВЫП-11: настольный выпуск — тоже дерево файлов (установщик, его подпись
+    // minisign и манифест Tauri). Механизм тот же, что у веб-версии: подписана
+    // свёртка списка, каждый файл сверяется со своим отпечатком.
+    await mirrorTree('desktop', 'desktop-version.json', UPDATE_DIR);
+    await mirrorTree('web', 'web-version.json', WEB_DIR, WEB_DIR);
+  } catch (e) {
+    console.warn('[update] обход зеркала не выполнен:', (e && e.message) || e);
+  } finally {
+    mirrorRunning = false;
+  }
+}
+
+if (!UPDATE_MIRROR_OFF) {
+  // Первый заход — с задержкой: при старте узла есть дела важнее, чем качать
+  // десятки мегабайт, а обновление, опоздавшее на минуту, ничем не хуже.
+  setTimeout(() => {
+    maintainUpdateMirror();
+  }, 60000).unref();
+  setInterval(maintainUpdateMirror, UPDATE_MIRROR_MS).unref();
+}
+
 // АУД-06: тела крупных конвертов пишутся вне event-loop, поэтому перед выходом
 // начатые записи надо дождаться — иначе конверт, чья запись шла в момент
 // SIGTERM, потерял бы тело, а строка очереди осталась бы. Ждём ограниченно:
@@ -3606,7 +4154,7 @@ module.exports.runtime = {
   pinnedLookup,
   httpJson,
   fetchPeerRelays,
-  pushSelfTo,
+  pushSelfTo, mirroredRelease, verifyReleaseSignature, fetchText, mirrorPlatform, mirroredTreeVersion, mirrorTree, maintainUpdateMirror,
   vapidSyncWith,
   vapidSyncOnce,
   gossipOnce,

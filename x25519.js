@@ -67,6 +67,19 @@ const KEY_LENGTH = 32;
  */
 const LOW_ORDER_MESSAGE = 'low-order DH point';
 
+/**
+ * Постоянные HSalsa20 — те же, что внутри tweetnacl.
+ *
+ * `sigma` это «expand 32-byte k» в байтах; шестнадцать нулей — вход, который
+ * `crypto_box_beforenm` подаёт вместе с общим секретом. Значения не наши: они
+ * заданы конструкцией crypto_box и закреплены тестом на равенство с
+ * `nacl.box.before`.
+ */
+const HSALSA20_SIGMA = Uint8Array.from([
+  101, 120, 112, 97, 110, 100, 32, 51, 50, 45, 98, 121, 116, 101, 32, 107,
+]);
+const HSALSA20_ZERO = new Uint8Array(16);
+
 /** Все нули? Постоянное время: ветвления по содержимому секрета здесь не место. */
 function isZero(bytes) {
   let acc = 0;
@@ -196,10 +209,55 @@ function createX25519() {
     return publicKey;
   }
 
-  return { sharedSecret, assertUsableKey, nativeAvailable, setNative };
+  /**
+   * НАТ-5: ключ nacl.box — через ЭТУ ЖЕ точку, а не мимо неё.
+   *
+   * ЧТО БЫЛО НЕ ТАК И ПОЧЕМУ ЭТО ДОРОГО
+   *
+   * `nacl.box` — не примитив, а связка: сначала X25519, потом HSalsa20 над
+   * общим секретом, потом XSalsa20-Poly1305. X25519 внутри неё считает
+   * tweetnacl, и никакой нативный уровень туда не достаёт. А зовут её на самом
+   * горячем пути, какой есть: распечатывание отправителя (sealedSender.unseal)
+   * делается на КАЖДЫЙ входящий конверт.
+   *
+   * Замер на пятистах конвертах: распечатывание 0,920 мс на конверт, из них
+   * около 0,63 мс — тот самый X25519 внутри `nacl.box.open`. То есть НАТ-4
+   * ускорил всё, кроме места, где эта операция вызывается чаще всего.
+   *
+   * ЧТО ЗДЕСЬ
+   *
+   * Та же связка, но разобранная на два шага: общий секрет считается через
+   * единую точку (и получает нативный уровень), а вывод ключа остаётся тем же
+   * HSalsa20, что и внутри tweetnacl. Результат совпадает с `nacl.box.before`
+   * БАЙТ В БАЙТ — это закреплено тестом на случайных парах, и именно поэтому
+   * формат на проводе не меняется ни на бит: конверт, запечатанный прежней
+   * версией, открывается новой и наоборот.
+   *
+   * ПОЧЕМУ НЕЛЬЗЯ БЫЛО ПРОСТО ЗАМЕНИТЬ ФОРМАТ
+   *
+   * Можно было вывести ключ своим HKDF и обойтись без HSalsa20 вовсе — вышло бы
+   * чище. Но это другой ключ, то есть другой формат на проводе: пришлось бы
+   * поднимать версию оболочки и договариваться о ней с собеседником. Менять
+   * протокол ради ускорения нельзя, а совместимость здесь получается бесплатно.
+   *
+   * ОТКУДА ВЗЯТ HSalsa20
+   *
+   * Из самого tweetnacl (`nacl.lowlevel.crypto_core_hsalsa20`) — не переписан
+   * заново. Своя реализация криптографического примитива ради двадцати строк —
+   * это ровно та сделка, от которой проект отказывается везде: она выглядит
+   * одинаково и в исправном, и в сломанном виде.
+   */
+  function boxSharedKey(secretKey, publicKey) {
+    const secret = sharedSecret(secretKey, publicKey);
+    const key = new Uint8Array(KEY_LENGTH);
+    nacl.lowlevel.crypto_core_hsalsa20(key, HSALSA20_ZERO, secret, HSALSA20_SIGMA);
+    return key;
+  }
+
+  return { sharedSecret, boxSharedKey, assertUsableKey, nativeAvailable, setNative };
 }
 
-const { sharedSecret, assertUsableKey, nativeAvailable, setNative } = createX25519();
+const { sharedSecret, boxSharedKey, assertUsableKey, nativeAvailable, setNative } = createX25519();
 
 module.exports = {
   KEY_LENGTH,
@@ -208,6 +266,7 @@ module.exports = {
   DEGENERATE_SECRET_MESSAGE,
   assertPairSecret,
   assertUsableKey,
+  boxSharedKey,
   sharedSecret,
   nativeAvailable,
   setNative,

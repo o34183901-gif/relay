@@ -25,6 +25,9 @@ const naclUtil = require('tweetnacl-util');
 // смены криптографического основания; прямых nacl.sign.detached вне обёртки
 // быть не должно, и это закреплено проверкой в scripts/verify-wired.js.
 const ed25519 = require('./ed25519');
+// НАТ-5: ключ nacl.box считается через единую точку X25519 — она же даёт
+// нативный уровень OpenSSL и одинаково отвергает вырожденную точку.
+const x25519 = require('./x25519');
 const { normalizeRelayUrl, isPrivateHost } = require('./relays');
 
 const REQUEST_PREFIX = 'licno-vapid-fleet-request-v1|';
@@ -281,7 +284,11 @@ function createVapidResponse({ config, request, bundle, senderUrl, senderRelayPu
   const nonce = crypto.randomBytes(nacl.box.nonceLength);
   const plaintext = naclUtil.decodeUTF8(JSON.stringify(bundle));
   if (plaintext.length > MAX_JSON_BYTES) throw new Error('VAPID bundle too large');
-  const ciphertext = nacl.box(plaintext, nonce, recipientBoxPub, ephemeral.secretKey);
+  const ciphertext = nacl.secretbox(
+    plaintext,
+    nonce,
+    x25519.boxSharedKey(ephemeral.secretKey, recipientBoxPub)
+  );
   const response = {
     version: 1,
     fleetId: config.fleetId,
@@ -325,7 +332,11 @@ function openVapidResponse({ config, request, response, boxSecret }) {
     const nonce = decodeB64(response.nonce, nacl.box.nonceLength);
     const ciphertext = decodeB64(response.ciphertext);
     if (!senderBoxPub || !nonce || !ciphertext || ciphertext.length > MAX_JSON_BYTES) return null;
-    const plaintext = nacl.box.open(ciphertext, nonce, senderBoxPub, boxSecret);
+    const plaintext = nacl.secretbox.open(
+      ciphertext,
+      nonce,
+      x25519.boxSharedKey(boxSecret, senderBoxPub)
+    );
     if (!plaintext || plaintext.length > MAX_JSON_BYTES) return null;
     const bundle = JSON.parse(naclUtil.encodeUTF8(plaintext));
     return verifyVapidBundle(bundle, config) ? bundle : null;
