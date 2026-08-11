@@ -1,15 +1,15 @@
 {
-  "version": "0.0.62",
+  "version": "0.0.63",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "28a09af2cf3268cd408f9f444c2b1411523ce00265ad8e58813b31e186dbf97c",
+  "sha256": "c128e89d27c20afd99f8fd2210915a37da398e115006b6826290b04513868e89",
   "platform": "web",
-  "filesHash": "f8cef140ec1df90b93026466980f500b7c2d56620acfbb853830e572bf10f150",
+  "filesHash": "288ef4c15b9ef0e4b1f18cbe92c49789b52a1a4c22e23501b59d2a037ec3e716",
   "files": [
     {
-      "path": "_expo/static/js/web/index-78297dbe2159da87347a493a88ac7877.js",
-      "size": 2897941,
-      "sha256": "cc3e923e54ee99a03f2ab186cb2a25a3d2789c4e3e32d556fbebaffbed5a4b62"
+      "path": "_expo/static/js/web/index-6dbd6e3eb6afe40cabe75016ff9afabc.js",
+      "size": 2899545,
+      "sha256": "a8843c461eba5cc7e6e96a4eac526991589d87c04d1910ecb7a3ecbc18963040"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -44,7 +44,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "28a09af2cf3268cd408f9f444c2b1411523ce00265ad8e58813b31e186dbf97c"
+      "sha256": "c128e89d27c20afd99f8fd2210915a37da398e115006b6826290b04513868e89"
     },
     {
       "path": "jsqr.bundle.js",
@@ -74,13 +74,13 @@
     {
       "path": "sw.js",
       "size": 5600,
-      "sha256": "74710694eade1e91dcf41918b8bb46df9dd4fd218ca4eb14016dc7ce8cbd51a5"
+      "sha256": "7a03f77c326018508df3a8989c01c93b67761d448825490bea68d086aa0c018f"
     },
     {
       "path": "version.json",
       "size": 73,
-      "sha256": "e2d9cd2d86a2dfc091788ec4bd03c8fa9a1518ecbf7d965d6cde19c3094606f7"
+      "sha256": "61193fe53398199f5703d4ef798364935de304ac16628d9c912b789234f6147c"
     }
   ],
-  "signature": "+W1J85kHMgGz48G6GuUUq+FXBf1uCaTiiZHtNRKfXG63ppYUyRwSwTEzKp2F/bveoBOTXmM1+Zv0rJoDlrCUCA=="
+  "signature": "ClGR4DMqLyV3gZgDmMshmZZQEAPJdZJiova5IXJSHNS2pCr1nac6FraMHIgYQU4JdJZEEuWthj59qDFX3EfiDw=="
 }
