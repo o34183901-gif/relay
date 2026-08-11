@@ -1,21 +1,21 @@
 {
-  "version": "0.1.8",
-  "url": "https://github.com/o34183901-gif/relay/releases/download/desktop-v0.1.8/licno-windows-x64-setup.exe",
-  "size": 4363646,
-  "sha256": "26aa9e62427885fe6211c7f85dc0d5de38e3d7edc10a1ef7c33dbae8f9677161",
+  "version": "0.1.9",
+  "url": "https://github.com/o34183901-gif/relay/releases/download/desktop-v0.1.9/licno-windows-x64-setup.exe",
+  "size": 4367760,
+  "sha256": "675c4c7085138d4522309b04ccd998a0ea7480ddae6aa3f15f21263c0397d275",
   "platform": "desktop",
-  "filesHash": "dc97ec4352e91638a96330bc3498c062ba41635b1240d70a0654758c08ca9c3f",
+  "filesHash": "bc8f10f5cbd14de17a1f2ca06b0c925a11e99bb0fdeeedaa6872b2b801978863",
   "files": [
     {
       "path": "desktop-latest.json",
-      "size": 814,
-      "sha256": "2ce39ecd321252a1173be403fc0911c3eeccaa7dc7bdc4daf86a6b96c35b2382"
+      "size": 839,
+      "sha256": "beddc44952dc90605c3ab85eeba94d180845bfcd2bd218c55868a8eb1d2a0655"
     },
     {
       "path": "licno-windows-x64-setup.exe.sig",
       "size": 420,
-      "sha256": "5e7c1dc9e1669ed3ae6c3b7998d57bc355bea0a45512b44cd76a74e281368c8b"
+      "sha256": "7e91b98e03cf3554c424a1183f94af7258a0d16d7d220bfe8b541e3367cc45ba"
     }
   ],
-  "signature": "QrqOI1oCqz2EMsXTqzlUlL18leF81+euyMCKNgkx2/Uthm310Xe6gqeme2wqZ3Im9ENH9m3fQPt8cpxetLA7CQ=="
+  "signature": "AYVV/D2b7AQP0FrFrmUvV/pg7RyDz1frmb6rrXeVlwcHNsdMIatz2DGGQetckTi2Fo02Z8GbYKlIyQoRCnHDBA=="
 }
