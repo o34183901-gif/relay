@@ -56,29 +56,65 @@
  */
 
 const nacl = require('tweetnacl');
+// ЗАГРУЗКА @noble/curves ОТЛОЖЕНА ДО ПЕРВОЙ ПОДПИСИ ИЛИ ПРОВЕРКИ.
+//
 // Подключение простой формой — как в pq.js: общее ядро телефона и компьютера
 // генерируется из этих файлов (scripts/sync-core.js) и понимает только её.
 // Библиотека — прямая зависимость проекта и уже присутствует в дереве
 // (её же тянет постквантовая часть), поэтому отдельного пути «сборка без
-// @noble/curves» здесь нет. Проверка ниже ловит другое: кривое разрешение
+// @noble/curves» здесь нет. Проверка `usable` ловит другое: кривое разрешение
 // модуля сборщиком, при котором импорт молча даёт undefined.
-const { ed25519 } = require('@noble/curves/ed25519.js');
+//
+// Замер: загрузка @noble/curves/ed25519.js — 28,4 мс на настольной машине
+// (Node 22, V8 с JIT); на телефоне работает Hermes без JIT, там дороже кратно.
+// Это самая дорогая загрузка на старте — дороже постквантового ML-KEM.
+//
+// Платить её на КАЖДОМ запуске незачем: подпись нужна при работе с prekey, при
+// привязке устройств и при проверке манифестов, а запуск обычно не делает
+// ничего из этого — человек открывает существующую переписку. Библиотека
+// запоминается после первой загрузки, поэтому цена платится один раз за сеанс
+// и ровно тогда, когда подпись действительно понадобилась.
+let nobleCache;
 
-function createEd25519(implementation = ed25519) {
-  const fast =
-    implementation &&
+function nobleEd25519() {
+  if (nobleCache === undefined) {
+    // eslint-disable-next-line global-require
+    nobleCache = require('@noble/curves/ed25519.js').ed25519;
+  }
+  return nobleCache;
+}
+
+function usable(implementation) {
+  return implementation &&
     typeof implementation.sign === 'function' &&
     typeof implementation.verify === 'function'
-      ? implementation
-      : null;
+    ? implementation
+    : null;
+}
+
+function createEd25519(implementation) {
+  // undefined означает «возьми обычную быструю реализацию» — и вот её-то мы и
+  // не трогаем до первого дела. Явно переданная (в том числе null, которым
+  // тесты отключают быстрый уровень) разбирается сразу: она уже в руках.
+  let fastCache = implementation === undefined ? undefined : usable(implementation);
+
+  function fast() {
+    if (fastCache === undefined) fastCache = usable(nobleEd25519());
+    return fastCache;
+  }
 
   // НАТ-1: самый быстрый уровень. Вносится снаружи и только после самопроверки
   // на известном векторе — см. шапку и src/nativeEd25519.js.
   let native = null;
 
-  /** Доступна ли быстрая реализация — для диагностики и тестов. */
+  /**
+   * Доступна ли быстрая реализация — для диагностики и тестов.
+   *
+   * Вопрос задаётся по делу, поэтому здесь библиотека и загружается: ответ
+   * «доступна» без загрузки был бы обещанием, а не фактом.
+   */
   function fastAvailable() {
-    return !!fast;
+    return !!fast();
   }
 
   /** Внесён ли уровень OpenSSL — для диагностики и тестов. */
@@ -120,7 +156,8 @@ function createEd25519(implementation = ed25519) {
    */
   function sign(message, secretKey) {
     if (native) return native.sign(message, secretKey);
-    if (fast) return fast.sign(message, secretKey.subarray(0, 32));
+    const quick = fast();
+    if (quick) return quick.sign(message, secretKey.subarray(0, 32));
     return nacl.sign.detached(message, secretKey);
   }
 
@@ -132,7 +169,8 @@ function createEd25519(implementation = ed25519) {
   function verify(message, signature, publicKey) {
     try {
       if (native) return native.verify(message, signature, publicKey);
-      if (fast) return fast.verify(signature, message, publicKey);
+      const quick = fast();
+      if (quick) return quick.verify(signature, message, publicKey);
       return nacl.sign.detached.verify(message, signature, publicKey);
     } catch (error) {
       return false;

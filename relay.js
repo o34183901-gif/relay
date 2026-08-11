@@ -1984,6 +1984,121 @@ function flushQueue(pubkey, ws, onComplete) {
   return ids.length;
 }
 
+/**
+ * ЭТП5-4: сколько конвертов отдаём по одному жетону.
+ *
+ * Пятьдесят. Сосед везёт их дальше по Bluetooth — примерно тридцать посылок на
+ * конверт, — и отдать ему всю очередь целиком значило бы занять его радио на
+ * часы и разрядить его телефон за нашу переписку. Остальное дождётся следующего
+ * жетона: очередь никуда не девается, потому что удалять её предъявитель не
+ * может.
+ */
+const GW_PULL_MAX_ITEMS = 50;
+
+/** Сколько выборок по жетонам берём с одного соседа за окно. */
+const GW_PULL_RATE = 6;
+const GW_PULL_WINDOW_MS = 60 * 1000;
+
+const gatewayTicketRule = require('./gateway-ticket');
+const gatewayTickets = gatewayTicketRule.createTicketLedger();
+const gatewayPullRate = new Map();
+
+function gatewayPullAllowed(pubkey) {
+  const at = Date.now();
+  const entry = gatewayPullRate.get(pubkey);
+  if (!entry || at - entry.startedAt > GW_PULL_WINDOW_MS) {
+    gatewayPullRate.set(pubkey, { startedAt: at, count: 1 });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= GW_PULL_RATE;
+}
+
+/**
+ * ЭТП5-4: отдать очередь владельца предъявителю жетона.
+ *
+ * Отказ всегда один и тот же на вид: подробная причина сказала бы предъявителю,
+ * чем именно его жетон не подошёл, — а по этому легко подбирать. В журнал
+ * причина всё-таки идёт: без неё разбирать жалобу «связь через соседа не
+ * работает» было бы нечем.
+ */
+function handleGatewayPull(ws, msg) {
+  if (!ws.authed || !ws.pubkey) return send(ws, { type: 'gw-pull-result', ok: false });
+  // Предъявитель обязан быть ДОКАЗАННЫМ владельцем своего адреса. Иначе жетон,
+  // выданный соседу, предъявил бы всякий, кто занял его адрес на этом релее, —
+  // ровно та дыра, которую закрывает АУД-Э1 для обычной выгрузки.
+  if (!ws.proven) return send(ws, { type: 'gw-pull-result', ok: false });
+  if (!gatewayPullAllowed(ws.pubkey)) return send(ws, { type: 'gw-pull-result', ok: false });
+  const owner = msg && msg.ticket && typeof msg.ticket.addr === 'string' ? msg.ticket.addr : '';
+  const bound = owner ? store.getIdentity(owner) : null;
+  const verdict = gatewayTicketRule.checkTicket({
+    candidate: msg && msg.ticket,
+    // Ключ владельца берём ЗАКРЕПЛЁННЫЙ на этом релее, а не из жетона: жетон
+    // подписал бы себе кто угодно, значение имеет только закрепление.
+    ownerSignKey: bound && bound.signPk,
+    presenter: { addr: ws.pubkey, signKey: ws.signPk },
+    now: Date.now(),
+    // Прямая проверка подписи, а НЕ verifySignature: та собрана под вызов
+    // соединения и приклеивает к данным свой префикс (CHALLENGE_SIG_PREFIX).
+    // Подсунь мы её сюда — подпись жетона не сошлась бы никогда, и связь через
+    // соседа просто не работала бы, без единого объяснения.
+    verify: (bytes, sig, publicKey) =>
+      ed25519.verify(bytes, naclUtil.decodeBase64(sig), naclUtil.decodeBase64(publicKey)),
+    used: (nonce) => gatewayTickets.used(nonce),
+  });
+  if (!verdict.ok) {
+    console.warn('[gw] жетон отклонён:', verdict.reason);
+    return send(ws, { type: 'gw-pull-result', ok: false });
+  }
+  // Запоминаем СРАЗУ, до выгрузки: иначе два одновременных предъявления одного
+  // жетона оба прошли бы проверку и оба получили бы очередь.
+  gatewayTickets.remember(verdict.ticket);
+  return flushQueueToAgent(verdict.ticket.addr, ws);
+}
+
+/**
+ * Выгрузка очереди ЧУЖОГО адреса предъявителю жетона.
+ *
+ * Отдельным видом кадра, а не обычным `message`, и это не косметика: свои
+ * конверты предъявитель разбирает храповиком и сохраняет у себя, а эти он
+ * обязан ТОЛЬКО ДОВЕЗТИ. Приди они обычным кадром — его клиент попытался бы их
+ * открыть, не смог и записал бы себе в переписку разрыв цепочки.
+ *
+ * Конверты НЕ удаляются и не помечаются доставленными: квитанцию принимает
+ * только доказанный владелец. Поэтому худшее, что сделает недобросовестный
+ * сосед, — не довезёт, и очередь останется на месте.
+ */
+function flushQueueToAgent(owner, ws) {
+  const ids = store.queueIdsFor(owner).slice(0, GW_PULL_MAX_ITEMS);
+  let index = 0;
+  async function pump() {
+    if (ws.readyState !== ws.OPEN) return;
+    while (index < ids.length) {
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > FLUSH_HIGH_WATER) {
+        setTimeout(start, FLUSH_RESUME_MS);
+        return;
+      }
+      const item = await store.getItemAsync(ids[index]);
+      index += 1;
+      if (ws.readyState !== ws.OPEN) return;
+      // Только сам конверт и его номер. Ни отправителя, ни сертификата
+      // устройства, ни списка устройств: всё это — социальный граф владельца, и
+      // соседу для доставки оно не нужно ни в каком виде.
+      if (item) send(ws, { type: 'gw-mail', addr: owner, id: item.id, envelope: item.envelope });
+    }
+    if (ws.readyState === ws.OPEN) {
+      send(ws, { type: 'gw-pull-result', ok: true, addr: owner, count: ids.length });
+    }
+  }
+  function start() {
+    pump().catch((error) =>
+      console.warn('[gw] выгрузка по жетону прервана:', (error && error.message) || error)
+    );
+  }
+  start();
+  return ids.length;
+}
+
 function flushBinaryQueue(pubkey, ws) {
   const ids = store.binaryQueueIdsFor(pubkey);
   let index = 0;
@@ -2858,6 +2973,10 @@ function handleFrameSafely(ws, msg) {
       // «доставлено». Актуальные клиенты всегда шлют boxProof, так что штатный
       // путь не меняется; страдает лишь недоказанный сеанс (сквоттер/старый клиент).
       ws.proven = !!boxProven;
+      // ЭТП5-4: ключ подписи, которым этот сеанс себя доказал. Нужен жетону
+      // доступа: он выдаётся конкретному соседу — и по адресу, и по ключу
+      // подписи, — а сверить второе без этого поля было бы нечем.
+      ws.signPk = ws.pendingSpk;
       ws.nonce = null;
       ws.ephSec = null;
       clearTimeout(ws.authTimer);
@@ -3240,6 +3359,22 @@ function handleFrameSafely(ws, msg) {
       // держатель (сквоттер незанятого адреса) не может удалить конверт из очереди
       // и не спровоцирует ложный `delivered` — реальный владелец потом заберёт своё.
       if (typeof msg.id === 'string' && ws.proven) ackReceived(ws.pubkey, msg.id);
+      return;
+    }
+
+    // ЭТП5-4: сосед принёс жетон и просит отдать ему очередь владельца.
+    //
+    // ЗАЧЕМ. Выход в интернет через соседа (ШЛЗ-1) работал в одну сторону:
+    // сосед мог положить наш конверт в релей, но забрать нашу очередь не мог —
+    // релей отдаёт её только доказавшему владение box-ключом адреса. Человек
+    // без интернета мог писать, но не получать, а половина связи — не связь.
+    //
+    // ЧТО ЭТО НЕ ДАЁТ. Ни прочитать (конверты запечатаны на получателя), ни
+    // удалить (квитанции по-прежнему только от `ws.proven` владельца), ни
+    // предъявить дважды, ни воспользоваться чужим жетоном. Всё это — в правиле
+    // gateway-ticket.js, общем у релея и телефона.
+    if (msg.type === 'gw-pull') {
+      handleGatewayPull(ws, msg);
       return;
     }
 

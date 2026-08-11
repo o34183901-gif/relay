@@ -1197,6 +1197,133 @@ async function main() {
       ok('ВЫС-19: HTTP-репликация ящика ограничена по частоте и это видно оператору');
     }
 
+    // --- ЭТП5-4: приём через соседа по жетону доступа ------------------------
+    //
+    // Выход в интернет через соседа (ШЛЗ-1) работал В ОДНУ СТОРОНУ: сосед мог
+    // положить наш конверт в релей, но забрать нашу очередь не мог — релей
+    // отдаёт её только доказавшему владение box-ключом адреса. Человек без
+    // интернета мог писать, но не получать.
+    //
+    // Здесь проверяется вторая половина: владелец подписывает жетон соседу, и
+    // очередь уходит соседу — но ТОЛЬКО ему, ТОЛЬКО один раз и БЕЗ права
+    // удалить её.
+    {
+      const ticketRule = require('./gateway-ticket');
+      const nacl = require('tweetnacl');
+      const { decodeBase64, encodeBase64 } = require('tweetnacl-util');
+      // Подпись — через ту же обёртку, что и весь релей: единая точка смены
+      // криптографического основания существует ровно затем, чтобы её не
+      // обходили, и проверка ЕД-1 это стережёт.
+      const serverEd25519 = require('./ed25519');
+
+      const owner = crypto.generateIdentity(); // тот, кто без интернета
+      const agent = crypto.generateIdentity(); // сосед-шлюз
+      const sender = crypto.generateIdentity(); // кто ему написал
+
+      // Владелец подключается один раз: адрес обязан быть ЗАКРЕПЛЁН за его
+      // ключом, иначе жетон проверять нечем. Это не поблажка — ровно наоборот:
+      // за незакреплённый адрес мог бы выдать жетон кто угодно.
+      const ownerConn = await client(owner, { autoAck: false });
+      await waitFor(ownerConn.inbox, 'ready');
+      ownerConn.ws.close();
+      await wait(120);
+
+      // Пока владелец офлайн, ему пишут.
+      const senderConn = await client(sender);
+      await waitFor(senderConn.inbox, 'ready');
+      senderConn.ws.send(
+        JSON.stringify({ type: 'send', to: owner.publicKey, envelope: { sealed: 'через-соседа' } })
+      );
+      await wait(200);
+
+      const agentConn = await client(agent, { autoAck: false });
+      await waitFor(agentConn.inbox, 'ready');
+
+      const issue = (overrides = {}) =>
+        ticketRule.buildTicket({
+          addr: owner.publicKey,
+          agent: agent.publicKey,
+          agentSign: agent.signPublicKey,
+          now: Date.now(),
+          nonce: encodeBase64(nacl.randomBytes(ticketRule.NONCE_BYTES)),
+          sign: (bytes) => encodeBase64(serverEd25519.sign(bytes, decodeBase64(owner.signSecretKey))),
+          ...overrides,
+        });
+
+      const ticket = issue();
+      agentConn.ws.send(JSON.stringify({ type: 'gw-pull', ticket }));
+      const result = await waitFor(agentConn.inbox, 'gw-pull-result');
+      assert.strictEqual(result.ok, true, 'жетон владельца обязан приниматься');
+      const mail = agentConn.inbox.filter((m) => m.type === 'gw-mail');
+      assert.strictEqual(mail.length, 1, 'очередь владельца обязана уехать соседу');
+      assert.strictEqual(mail[0].addr, owner.publicKey);
+      assert.deepStrictEqual(mail[0].envelope, { sealed: 'через-соседа' }, 'конверт дошёл целым');
+      // Ни отправителя, ни сертификата устройства, ни списка устройств: соседу
+      // для доставки это не нужно, а вместе оно и есть социальный граф.
+      assert.strictEqual(mail[0].from, undefined, 'соседу не отдаётся отправитель');
+      assert.strictEqual(mail[0].deviceRoster, undefined, 'соседу не отдаётся список устройств');
+      ok('ЭТП5-4: очередь уезжает соседу по жетону владельца');
+
+      // Повтор того же жетона не проходит: иначе потерянный телефон соседа
+      // оставался бы ключом к очереди до конца срока.
+      agentConn.inbox.length = 0;
+      agentConn.ws.send(JSON.stringify({ type: 'gw-pull', ticket }));
+      const again = await waitFor(agentConn.inbox, 'gw-pull-result');
+      assert.strictEqual(again.ok, false, 'жетон обязан быть одноразовым');
+      assert.strictEqual(
+        agentConn.inbox.filter((m) => m.type === 'gw-mail').length,
+        0,
+        'по повторному жетону не должно уехать ни одного конверта'
+      );
+      ok('ЭТП5-4: жетон одноразовый');
+
+      // Жетон, выданный другому, не работает у перехватившего. Ровно это и
+      // позволяет везти жетон открыто по сети знакомств.
+      const stranger = crypto.generateIdentity();
+      const strangerConn = await client(stranger, { autoAck: false });
+      await waitFor(strangerConn.inbox, 'ready');
+      strangerConn.ws.send(JSON.stringify({ type: 'gw-pull', ticket: issue() }));
+      const stolen = await waitFor(strangerConn.inbox, 'gw-pull-result');
+      assert.strictEqual(stolen.ok, false, 'перехваченный жетон обязан быть бесполезен');
+      assert.strictEqual(strangerConn.inbox.filter((m) => m.type === 'gw-mail').length, 0);
+      ok('ЭТП5-4: перехваченный жетон бесполезен другому предъявителю');
+
+      // Подпись чужим ключом не проходит: подписать «разрешение на чужую
+      // очередь» может кто угодно, значение имеет только закрепление на релее.
+      agentConn.inbox.length = 0;
+      agentConn.ws.send(
+        JSON.stringify({
+          type: 'gw-pull',
+          ticket: issue({
+            sign: (bytes) =>
+              encodeBase64(serverEd25519.sign(bytes, decodeBase64(stranger.signSecretKey))),
+          }),
+        })
+      );
+      const forged = await waitFor(agentConn.inbox, 'gw-pull-result');
+      assert.strictEqual(forged.ok, false, 'жетон с чужой подписью обязан отвергаться');
+      ok('ЭТП5-4: жетон обязан быть подписан владельцем адреса');
+
+      // ГЛАВНОЕ: очередь на месте. Предъявитель жетона не может её удалить —
+      // квитанцию принимает только доказанный владелец, — поэтому худшее, что
+      // сделает недобросовестный сосед, это не довезёт.
+      agentConn.ws.send(JSON.stringify({ type: 'received', id: mail[0].id }));
+      await wait(150);
+      const back = await client(owner);
+      const delivered = await waitFor(back.inbox, 'message');
+      assert.deepStrictEqual(
+        delivered.envelope,
+        { sealed: 'через-соседа' },
+        'конверт обязан остаться в очереди: сосед не имеет права его стереть'
+      );
+      ok('ЭТП5-4: сосед не может стереть чужую очередь');
+
+      agentConn.ws.close();
+      strangerConn.ws.close();
+      senderConn.ws.close();
+      back.ws.close();
+    }
+
     a.ws.close();
     b3.ws.close();
     c.ws.close();
