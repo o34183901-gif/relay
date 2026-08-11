@@ -2,14 +2,14 @@
   "version": "0.0.62",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "e852ec605dfdeba84b2e42923f014d632f5d02700a2b0049b8aa3bf0e397c0fc",
+  "sha256": "28a09af2cf3268cd408f9f444c2b1411523ce00265ad8e58813b31e186dbf97c",
   "platform": "web",
-  "filesHash": "c0e889e8794086a7f1962daf61c43c8c08865ae87cf52be75097ff1ef2dabc9c",
+  "filesHash": "f8cef140ec1df90b93026466980f500b7c2d56620acfbb853830e572bf10f150",
   "files": [
     {
-      "path": "_expo/static/js/web/index-590c00fb39e7513f0152b4257b5b8e38.js",
-      "size": 2896221,
-      "sha256": "a9d32509951988ac4e192577af437451e751a4aee64c717d7ef8aeb86a801145"
+      "path": "_expo/static/js/web/index-78297dbe2159da87347a493a88ac7877.js",
+      "size": 2897941,
+      "sha256": "cc3e923e54ee99a03f2ab186cb2a25a3d2789c4e3e32d556fbebaffbed5a4b62"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -44,7 +44,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "e852ec605dfdeba84b2e42923f014d632f5d02700a2b0049b8aa3bf0e397c0fc"
+      "sha256": "28a09af2cf3268cd408f9f444c2b1411523ce00265ad8e58813b31e186dbf97c"
     },
     {
       "path": "jsqr.bundle.js",
@@ -74,13 +74,13 @@
     {
       "path": "sw.js",
       "size": 5600,
-      "sha256": "76c3687f79eeba534dc971c0ad5d4ab76a698d145d20f6805a6093d82b9f0eb8"
+      "sha256": "74710694eade1e91dcf41918b8bb46df9dd4fd218ca4eb14016dc7ce8cbd51a5"
     },
     {
       "path": "version.json",
       "size": 73,
-      "sha256": "a252e622e35d0f14e324e7b0939dfb586f532728f2bc9bb788ea0c2bc6174b4d"
+      "sha256": "e2d9cd2d86a2dfc091788ec4bd03c8fa9a1518ecbf7d965d6cde19c3094606f7"
     }
   ],
-  "signature": "Ilp+uWw1xwTDXjST+m1e+IjkQo7RXtxY1BJkgiJQgihrZ9opaiwBl0zsLQtTyNAndxx6B0ADe9AfNBPJ+i2+AA=="
+  "signature": "+W1J85kHMgGz48G6GuUUq+FXBf1uCaTiiZHtNRKfXG63ppYUyRwSwTEzKp2F/bveoBOTXmM1+Zv0rJoDlrCUCA=="
 }
