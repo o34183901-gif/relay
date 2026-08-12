@@ -30,7 +30,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 # образе нет — он создаётся genesis и раздаётся разрешённым узлам по NaCl-box.
 COPY binary-frame.js ed25519.js envelopeFrame.js gateway-ticket.js httpRateLimit.js landing.js \
   linked-devices.js mailboxEvict.js mailboxGcs.js mbx.js nativeEd25519.js nativeX25519.js notifications.js \
-  push.js queueAdmission.js relay.js relays.js releaseKey.js store.js updateFeed.js \
+  push.js queueAdmission.js relay.js relays.js releaseKey.js reports.js store.js updateFeed.js \
   updateManifest.js updateMirror.js vapid-fleet.js vapid-fleet.json vapid-identity.js \
   verification-code.js webApp.js x25519.js ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
