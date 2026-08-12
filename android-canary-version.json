@@ -1,9 +1,9 @@
 {
-  "version": "0.0.76",
-  "url": "https://github.com/o34183901-gif/relay/releases/download/app-v0.0.76/licno-android.apk",
-  "size": 183834063,
-  "sha256": "11893b986b8ac83f308bbb61bba5a4e448b782726142f76756c3248eae12fd2f",
+  "version": "0.0.77",
+  "url": "https://github.com/o34183901-gif/relay/releases/download/app-v0.0.77/licno-android.apk",
+  "size": 183863123,
+  "sha256": "f51d0ad78cfd8fc38a995c29fb4e7fdf137310f8633d6d864e85515716e7190a",
   "platform": "android",
   "channel": "canary",
-  "signature": "MXZ42GUuDRhFFDadyMPMtfonkLKTb9Dlv+OZ6Nf1OMVWYpSEkUvuAI4pTr84Rd/MvhSgBdUjQ/5J797LxNsIBg=="
+  "signature": "QhmLxlVNmbDNCEB/PJ3R1eMrAW3G98XaGheA6JXqI0uDLC/Qsh5uUf1/BDYNUBO+sN8fJ7Kox+suHyQMhcuQCA=="
 }
