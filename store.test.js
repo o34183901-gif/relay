@@ -1086,6 +1086,52 @@ test('linked devices: повреждённый roster в БД не выходи�
   s.close();
 });
 
+// --- ОТЧ-1: отчёты о неполадках --------------------------------------------
+//
+// Узел хранит запечатанные байты и не может их прочитать. Значит от хранилища
+// нужны ровно три свойства, и каждое из них — про потерю данных человека:
+// повтор доставки не должен множить записи, забранное должно исчезать, а
+// невостребованное — уходить по сроку, а не лежать вечно.
+
+test('отчёты: повтор той же посылки не создаёт вторую запись', () => {
+  const s = fresh();
+  s.addReport('id-1', 1000, '{"v":1}');
+  s.addReport('id-1', 2000, '{"v":1}');
+  assert.strictEqual(s.reportsCount(), 1, 'повтор доставки — не второй отчёт');
+  const page = s.reportsPage(10);
+  assert.strictEqual(page.length, 1);
+  assert.strictEqual(page[0].at, 1000, 'осталась первая запись, время не переписано');
+  s.close();
+});
+
+test('отчёты: страница отдаёт самые старые вперёд и не больше запрошенного', () => {
+  const s = fresh();
+  s.addReport('c', 3000, '{"v":1,"n":3}');
+  s.addReport('a', 1000, '{"v":1,"n":1}');
+  s.addReport('b', 2000, '{"v":1,"n":2}');
+  assert.deepStrictEqual(s.reportsPage(2).map((r) => r.id), ['a', 'b']);
+  s.close();
+});
+
+test('отчёты: подтверждённые удаляются, остальные остаются', () => {
+  const s = fresh();
+  s.addReport('a', 1000, '{}');
+  s.addReport('b', 2000, '{}');
+  assert.strictEqual(s.deleteReports(['a', 'нет-такого']), 1, 'считаются только реально удалённые');
+  assert.deepStrictEqual(s.reportsPage(10).map((r) => r.id), ['b']);
+  assert.strictEqual(s.deleteReports([]), 0);
+  s.close();
+});
+
+test('отчёты: невостребованные уходят по сроку', () => {
+  const s = fresh();
+  s.addReport('старый', 1000, '{}');
+  s.addReport('свежий', 9000, '{}');
+  assert.strictEqual(s.sweepReports(5000), 1);
+  assert.deepStrictEqual(s.reportsPage(10).map((r) => r.id), ['свежий']);
+  s.close();
+});
+
 chain
   .then(() => {
     console.log('\n' + passed + ' passed');

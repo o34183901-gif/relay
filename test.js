@@ -20,6 +20,17 @@ const VAPID_FILE = TMP('vapid');
 const BLOB_DIR = path.join(os.tmpdir(), `licno-blobs-${process.pid}`);
 const BLOB_THRESHOLD = 1024; // маленький порог, чтобы тестовое «вложение» ушло на диск
 
+// ОТЧ-1: пара владельца отчётов для проверок. Настоящая половина ключа выпуска
+// живёт в секретах сборки, поэтому узел в тесте проверяет подписи этой.
+const nacl = require('tweetnacl');
+const naclUtil = require('tweetnacl-util');
+const reportsRule = require('./reports');
+const reportsOwner = nacl.sign.keyPair();
+const REPORTS_OWNER_PUB = naclUtil.encodeBase64(reportsOwner.publicKey);
+const REPORTS_OWNER_SEC = naclUtil.encodeBase64(reportsOwner.secretKey);
+const signReports = (domain, ts) =>
+  reportsRule.signOwnerRequest({ domain, ts, secretKey: REPORTS_OWNER_SEC });
+
 function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -196,6 +207,9 @@ async function main() {
       RELAY_VAPID_KEY_FILE: VAPID_FILE,
       RELAY_BLOB_DIR: BLOB_DIR,
       RELAY_BLOB_THRESHOLD: String(BLOB_THRESHOLD),
+      // ОТЧ-1: чем узел проверяет право забрать отчёты. В бою это ключ выпуска,
+      // секретной половины которого у проверок нет и быть не должно.
+      RELAY_REPORTS_KEY: REPORTS_OWNER_PUB,
     },
     stdio: 'ignore',
   });
@@ -1322,6 +1336,75 @@ async function main() {
       strangerConn.ws.close();
       senderConn.ws.close();
       back.ws.close();
+    }
+
+    // --- ОТЧ-1: отчёты о неполадках -----------------------------------------
+    //
+    // Приём открыт намеренно: отчёт нужен ровно тогда, когда у человека
+    // сломалось всё, включая аутентификацию. Поэтому проверяется, что открытым
+    // остался ТОЛЬКО приём: забрать накопленное можно лишь подписью владельца,
+    // стереть — лишь ОТДЕЛЬНОЙ подписью, а поток посылок упирается в потолок.
+    {
+      const sealed = { v: 1, ek: 'ZWs=', nonce: 'bm9uY2U=', cipher: 'Y2lwaGVy' };
+      const post = (path, body) =>
+        fetch(`http://127.0.0.1:${PORT}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+      const accepted = await post('/report', sealed);
+      assert.strictEqual(accepted.status, 200, 'отчёт принимается без аутентификации');
+      const acceptedBody = await accepted.json();
+      assert.strictEqual(acceptedBody.ok, true);
+      ok('ОТЧ-1: узел принимает запечатанный отчёт');
+
+      const junk = await post('/report', { v: 1, ek: '', nonce: '', cipher: '' });
+      assert.strictEqual(junk.status, 400, 'посылка не той формы отвергается');
+      await junk.arrayBuffer();
+
+      // Третья посылка с того же адреса за сутки — уже за потолком.
+      const flooded = await post('/report', sealed);
+      assert.strictEqual(flooded.status, 429, 'поток посылок упирается в суточный потолок');
+      await flooded.arrayBuffer();
+      ok('ОТЧ-1: диск узла нельзя залить отчётами с одного адреса');
+
+      const anonymous = await fetch(`http://127.0.0.1:${PORT}/reports`);
+      assert.strictEqual(anonymous.status, 403, 'без подписи выдачи нет');
+      await anonymous.arrayBuffer();
+
+      const ts = Date.now();
+      const fetchSig = signReports(reportsRule.FETCH_DOMAIN, ts);
+      const listed = await fetch(
+        `http://127.0.0.1:${PORT}/reports?ts=${ts}&sig=${encodeURIComponent(fetchSig)}`
+      );
+      assert.strictEqual(listed.status, 200);
+      const page = await listed.json();
+      assert.strictEqual(page.reports.length, 1, 'принятый отчёт лежит и отдаётся владельцу');
+      assert.deepStrictEqual(JSON.parse(page.reports[0].body), sealed, 'байты те же, что принесли');
+      ok('ОТЧ-1: забрать отчёты может только владелец — по подписи');
+
+      // Подпись ЧТЕНИЯ не должна ничего стирать, даже если её повторить слово
+      // в слово: у выдачи и удаления разные домены подписи.
+      const wrongDomain = await post('/reports/ack', {
+        ts,
+        sig: fetchSig,
+        ids: [page.reports[0].id],
+      });
+      assert.strictEqual(wrongDomain.status, 403, 'подпись чтения не стирает отчёты');
+      await wrongDomain.arrayBuffer();
+
+      const ackTs = Date.now();
+      const removed = await post('/reports/ack', {
+        ts: ackTs,
+        sig: signReports(reportsRule.DELETE_DOMAIN, ackTs),
+        ids: [page.reports[0].id],
+      });
+      assert.strictEqual(removed.status, 200);
+      const removedBody = await removed.json();
+      assert.strictEqual(removedBody.removed, 1);
+      assert.strictEqual(removedBody.left, 0, 'забранное на узле не остаётся');
+      ok('ОТЧ-1: подтверждение получения стирает отчёт с узла');
     }
 
     a.ws.close();

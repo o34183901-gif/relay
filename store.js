@@ -195,6 +195,19 @@ function createStore(dbPath, opts = {}) {
       PRIMARY KEY (key, vh)
     );
     CREATE INDEX IF NOT EXISTS idx_mbx_seq ON mbx(seq);
+    -- ОТЧ-1: отчёты о неполадках, оставленные приложениями.
+    --
+    -- Тело запечатано на публичный ключ владельца приложения: узел его не
+    -- читает и прочитать не может — у него нет секретной половины. Здесь
+    -- лежат только непрозрачные байты и время приёма, по которому отчёт
+    -- уходит по сроку, если владелец за ним не пришёл. Ни адреса отправителя,
+    -- ни чего-либо, что связало бы отчёт с человеком, таблица не хранит.
+    CREATE TABLE IF NOT EXISTS reports (
+      id   TEXT PRIMARY KEY,
+      at   INTEGER NOT NULL,
+      body TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_at ON reports(at);
     CREATE TABLE IF NOT EXISTS identities  (pk TEXT PRIMARY KEY, sign_pk TEXT NOT NULL, proven INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS push_tokens (pk TEXT PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS directory   (url TEXT PRIMARY KEY, last_seen INTEGER);
@@ -886,6 +899,17 @@ function createStore(dbPath, opts = {}) {
   };
   // ПЯЩ-1: общий ящик записок. Ни одного запроса «по владельцу» здесь нет и быть
   // не может — владельца в таблице не существует.
+  // ОТЧ-1: отчёты о неполадках. Запросы простые до скуки — и это правильно:
+  // всё, что узел умеет с отчётом, — принять байты, отдать их владельцу по
+  // подписи и забыть по сроку.
+  const rep = {
+    put: db.prepare('INSERT OR IGNORE INTO reports (id,at,body) VALUES (?,?,?)'),
+    page: db.prepare('SELECT id,at,body FROM reports ORDER BY at LIMIT ?'),
+    del: db.prepare('DELETE FROM reports WHERE id = ?'),
+    expire: db.prepare('DELETE FROM reports WHERE at < ?'),
+    count: db.prepare('SELECT count(*) c FROM reports'),
+  };
+
   const mbxq = {
     put: db.prepare('INSERT OR IGNORE INTO mbx (key,vh,val,mac,slot,seq,ord) VALUES (?,?,?,?,?,?,?)'),
     // Сводка строится по ВСЕМ ключам сразу: она одинакова для всех и не зависит
@@ -1724,6 +1748,34 @@ function createStore(dbPath, opts = {}) {
         dir.trim.run(RELAY_DIR_MAX);
       });
       tx(urls);
+    },
+
+    // --- ОТЧ-1: отчёты о неполадках ------------------------------------------
+    /** Принять отчёт. Повтор того же id молча игнорируется — это не ошибка. */
+    addReport(id, at, body) {
+      rep.put.run(String(id), Number(at) || 0, String(body));
+    },
+    /** Страница отчётов, самые старые вперёд: выгрузка идёт по кругу до пустой. */
+    reportsPage(limit) {
+      return rep.page.all(Math.max(1, Number(limit) || 1));
+    },
+    /** Удалить забранные отчёты. Возвращает, сколько записей реально ушло. */
+    deleteReports(ids) {
+      const list = (Array.isArray(ids) ? ids : []).map((id) => String(id));
+      if (!list.length) return 0;
+      let removed = 0;
+      const tx = db.transaction((items) => {
+        for (const id of items) removed += rep.del.run(id).changes;
+      });
+      tx(list);
+      return removed;
+    },
+    /** Уборка по сроку: отчёт, за которым не пришли, не лежит вечно. */
+    sweepReports(cutoff) {
+      return rep.expire.run(Number(cutoff) || 0).changes;
+    },
+    reportsCount() {
+      return rep.count.get().c;
     },
 
     // --- stats / lifecycle --------------------------------------------------

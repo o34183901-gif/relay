@@ -89,6 +89,16 @@ const ed25519 = require('./ed25519');
 // шапке, а не рядом с обработчиком: имя возможности из него попадает в список,
 // который релей объявляет каждому подключению, а список собирается выше.
 const gatewayTicketRule = require('./gateway-ticket');
+// ОТЧ-1: правила приёма и выдачи отчётов о неполадках. Узел их не читает —
+// тело запечатано на ключ владельца, — поэтому от модуля нужны только форма
+// посылки, сроки и проверка права владельца забрать накопленное.
+const reportsRule = require('./reports');
+// Чем узел проверяет право владельца забрать отчёты. По умолчанию — ключ
+// выпуска: владелец у сборки и у отчётов один, и второй ключ в узле означал бы
+// второе место, где он расходится сам с собой. Переопределяется только для
+// проверок (server/test.js): доступ этим ключом даёт ровно то, что у оператора
+// узла и так есть на диске, поэтому знобить безопасность здесь нечему.
+const REPORTS_OWNER_KEY = process.env.RELAY_REPORTS_KEY || RELEASE_PUBLIC_KEY;
 // НАТ-1: третий уровень той же обёртки — подпись через OpenSSL, который у Node
 // уже есть. Замер с честным разбором ключа на каждый вызов: проверка подписи
 // 1,61 мс через @noble/curves против 0,12 мс через OpenSSL — ×13. Для релея это
@@ -216,6 +226,11 @@ const RELAY_CAPABILITIES = Object.freeze([
   // поехал. Имя берётся из общего правила — своя строка здесь однажды разошлась
   // бы с клиентской.
   gatewayTicketRule.PULL_CAPABILITY,
+  // ОТЧ-1: узел принимает запечатанный отчёт о неполадках (POST /report) и
+  // отдаёт накопленное владельцу по подписи ключа выпуска. Объявление нужно
+  // клиенту: узел прежней версии ответит на этот адрес отказом, и отличить
+  // «не умеет» от «отказал» по коду ответа было бы нечем.
+  'reports-v1',
 ]);
 // Встроенное хранилище на SQLite (queue/identities/tokens/directory) — вместо
 // in-memory Map + перезаписи JSON. Файл лежит в volume контейнера.
@@ -440,6 +455,15 @@ const MBX_FETCH_MAX_PER_MIN = Number(process.env.RELAY_MBX_FETCH_PER_MIN) || 30;
 const MBX_HTTP_MAX_PER_MIN = Number(process.env.RELAY_MBX_HTTP_PER_MIN) || 12;
 const MBX_HTTP_PAGE = Math.min(mbx.SYNC_LIMIT, Number(process.env.RELAY_MBX_HTTP_PAGE) || 512);
 const mbxHttpRate = createHttpRateLimit({ max: MBX_HTTP_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+// ОТЧ-1: сколько отчётов о неполадках принимаем с одного адреса за сутки.
+// Отчёт человек отправляет руками, кнопкой, и делает это раз в несколько дней —
+// потолок здесь не про удобство, а про то, чтобы диск узла нельзя было залить
+// «отчётами» с одного адреса. Счётчик в памяти: перезапуск узла его обнуляет, и
+// это приемлемо — сам потолок хранения (TTL и уборка) от него не зависит.
+const reportHttpRate = createHttpRateLimit({
+  max: reportsRule.PER_IP_PER_DAY,
+  windowMs: reportsRule.DAY_MS,
+});
 const ROSTER_PUT_MAX_PER_MIN = Number(process.env.RELAY_ROSTER_PUT_PER_MIN) || 10;
 
 // ОБН-2: раздача обновлений приложения.
@@ -516,6 +540,10 @@ const counters = {
   // ВЫС-19: отказов HTTP-репликации ящика по частоте. Рост числа — узел дёргают
   // как усилитель, а не реплицируют.
   mbxHttpLimited: 0,
+  // ОТЧ-1: отчёты о неполадках. Принятые и отвергнутые считаются раздельно:
+  // рост отказов при нулевом приёме означает не поток жалоб, а поток мусора.
+  reportsIn: 0,
+  reportsRefused: 0,
   // ОБН-2: раздача обновлений. Оператору это единственный способ увидеть, во
   // что ему обходится включённая раздача: манифест — байты, файл — десятки
   // мегабайт за штуку.
@@ -961,6 +989,40 @@ function clientIp(req) {
     }
   }
   return remote;
+}
+
+/**
+ * ОТЧ-1: прочитать JSON-тело запроса с потолком и без исключений наружу.
+ *
+ * Обработчик зовётся ровно один раз и только на годном теле: обрыв клиента,
+ * превышение потолка и мусор вместо JSON заканчиваются ответом здесь же.
+ * Отдельная функция нужна потому, что тело приходит от кого угодно из сети —
+ * а значит каждая из этих трёх бед случится, и не по одному разу.
+ */
+function readJsonBody(req, maxBytes, onBody) {
+  let body = '';
+  let aborted = false;
+  req.on('error', () => {
+    aborted = true;
+  });
+  req.on('data', (chunk) => {
+    if (aborted) return;
+    body += chunk;
+    if (body.length > maxBytes) {
+      aborted = true;
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (aborted) return;
+    let parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch (e) {
+      parsed = null;
+    }
+    onBody(parsed, Buffer.byteLength(body));
+  });
 }
 
 let seq = 0;
@@ -1702,6 +1764,124 @@ const server = http.createServer((req, res) => {
         slots: rows.map((row) => row.slot),
       })
     );
+    return;
+  }
+
+  // ОТЧ-1: отчёты о неполадках.
+  //
+  // ЧТО ЗДЕСЬ ПРОИСХОДИТ. Приложение оставляет запечатанный отчёт (POST), а
+  // владелец приложения забирает накопленное (GET) и подтверждает получение
+  // (POST /reports/ack), после чего узел его стирает. Узел содержимого не
+  // видит: тело зашифровано на публичный ключ владельца одноразовой парой
+  // отправителя, и секретной половины на узле нет и быть не должно.
+  //
+  // ПОЧЕМУ ПРИЁМ БЕЗ АУТЕНТИФИКАЦИИ. Отчёт нужен ровно тогда, когда у человека
+  // всё сломалось, — в том числе когда сломалась сама аутентификация. Просить
+  // подписанный кадр у того, у кого не поднимается соединение, значило бы
+  // получать отчёты только от тех, у кого и так всё хорошо. Взамен работают
+  // потолок размера, суточная частота на адрес и срок хранения.
+  if (req.url === '/report' || req.url.startsWith('/report?')) {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, reason: 'method' }));
+      return;
+    }
+    if (!reportHttpRate.allow(clientIp(req), Date.now())) {
+      counters.reportsRefused += 1;
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600' });
+      res.end(JSON.stringify({ ok: false, reason: 'rate' }));
+      return;
+    }
+    readJsonBody(req, reportsRule.MAX_REPORT_BYTES, (body, bytes) => {
+      const verdict = reportsRule.validReport(body, bytes);
+      if (!verdict.ok) {
+        counters.reportsRefused += 1;
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: verdict.reason }));
+        return;
+      }
+      // Имя записи — отпечаток самого тела. Двух одинаковых отчётов не бывает
+      // (внутри время и одноразовый ключ), а повтор доставки от клиента, не
+      // дождавшегося ответа, не превращается во вторую запись.
+      const id = crypto
+        .createHash('sha256')
+        .update(String(body.ek) + '|' + String(body.nonce) + '|' + String(body.cipher))
+        .digest('hex')
+        .slice(0, 32);
+      try {
+        store.addReport(id, Date.now(), JSON.stringify({ v: 1, ek: body.ek, nonce: body.nonce, cipher: body.cipher }));
+        counters.reportsIn += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, id }));
+      } catch (e) {
+        counters.reportsRefused += 1;
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: 'store' }));
+      }
+    });
+    return;
+  }
+  // Выдача накопленного владельцу. Право доказывается подписью ключа выпуска —
+  // того же, которым подписан манифест обновлений; открытая половина вшита в
+  // узел. Подпись покрывает время запроса, поэтому подсмотренная в логе прокси
+  // ссылка перестаёт работать через пять минут.
+  if (req.url === '/reports' || req.url.startsWith('/reports?')) {
+    const parsed = new URL(req.url, 'http://x');
+    if (req.method === 'GET') {
+      const verdict = reportsRule.verifyOwnerRequest({
+        domain: reportsRule.FETCH_DOMAIN,
+        ts: parsed.searchParams.get('ts'),
+        signature: parsed.searchParams.get('sig'),
+        publicKey: REPORTS_OWNER_KEY,
+        now: Date.now(),
+      });
+      if (!verdict.ok) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: verdict.reason }));
+        return;
+      }
+      const rows = store.reportsPage(reportsRule.FETCH_PAGE);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          left: store.reportsCount(),
+          reports: rows.map((row) => ({ id: row.id, at: row.at, body: row.body })),
+        })
+      );
+      return;
+    }
+    res.writeHead(405, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, reason: 'method' }));
+    return;
+  }
+  // Подтверждение получения: отчёты стираются ТОЛЬКО по отдельной подписи и
+  // только поимённо. Отдельный домен подписи не случаен — подпись на чтение не
+  // должна ничего стирать, даже если её кто-то повторит.
+  if (req.url === '/reports/ack') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, reason: 'method' }));
+      return;
+    }
+    readJsonBody(req, 256 * 1024, (body) => {
+      const verdict = reportsRule.verifyOwnerRequest({
+        domain: reportsRule.DELETE_DOMAIN,
+        ts: body && body.ts,
+        signature: body && body.sig,
+        publicKey: REPORTS_OWNER_KEY,
+        now: Date.now(),
+      });
+      if (!verdict.ok) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: verdict.reason }));
+        return;
+      }
+      const ids = Array.isArray(body.ids) ? body.ids.slice(0, reportsRule.FETCH_PAGE) : [];
+      const removed = store.deleteReports(ids);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, removed, left: store.reportsCount() }));
+    });
     return;
   }
 
@@ -3741,6 +3921,11 @@ function expireQueuedEnvelopes(now = Date.now(), queueStore = store, { onFatal =
     // раньше они лежали в account_devices открытым текстом и НАВСЕГДА.
     const redacted = store.redactRevokedDevices(Date.now());
     if (redacted) console.log(`[ttl] redacted ${redacted} revoked device record(s)`);
+    // ОТЧ-1: и отчёты о неполадках, за которыми владелец не пришёл. Лежать
+    // вечно они не должны: это данные человека, отданные ради починки, а не
+    // архив узла.
+    const staleReports = store.sweepReports(now - reportsRule.REPORT_TTL_MS);
+    if (staleReports) console.log(`[ttl] dropped ${staleReports} stale report(s)`);
     return removed;
   } catch (e) {
     // Т-4: фатальный сбой БД здесь НЕ глушим.
