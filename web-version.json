@@ -1,10 +1,10 @@
 {
-  "version": "0.0.69",
+  "version": "0.0.70",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "4ca6ccf4ed5a9a21942b5be780976618e8dd69b868adb03f175e144ee192c38b",
+  "sha256": "e0a1548e900f2d94598a7eb473d6502dad5ca1a58a3bad4602acfb55e36dde5e",
   "platform": "web",
-  "filesHash": "c45e9f3e77ad0dee59d2915bda716b55425802214f4bc4ae527f121a72c9499b",
+  "filesHash": "5dd48d0901207547c3a18d4dc75c96a979f793c7581710dd13928e35384efcf8",
   "files": [
     {
       "path": "_expo/static/js/web/ChatScreen-8d7cb9fa5f5d82e69f8881c0aa637730.js",
@@ -52,9 +52,9 @@
       "sha256": "2b58a2b196d652c7a7da99f2cda031c925156c52d22780ee6bace36fb1bc4cf9"
     },
     {
-      "path": "_expo/static/js/web/index-1511437010130f297c3e8b14ee58fb7e.js",
-      "size": 2485438,
-      "sha256": "f9794f1a07b106bd1f25144e8762e0ed584bd509820763dae42e7e90cc1745a8"
+      "path": "_expo/static/js/web/index-6f09a9a0672bc920cb2901b6791d5bb8.js",
+      "size": 2485480,
+      "sha256": "ad28495ea655f86666220c83da4cba92b0db412eaf56ae07972e9047b978b662"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -89,7 +89,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "4ca6ccf4ed5a9a21942b5be780976618e8dd69b868adb03f175e144ee192c38b"
+      "sha256": "e0a1548e900f2d94598a7eb473d6502dad5ca1a58a3bad4602acfb55e36dde5e"
     },
     {
       "path": "jsqr.bundle.js",
@@ -119,13 +119,13 @@
     {
       "path": "sw.js",
       "size": 5601,
-      "sha256": "0af6f44cc7108242352824946d575cbe5f9cf46819eaf6d43d771414e53e51fa"
+      "sha256": "db209e8f84d28181c2fe3fc2b157b81d5c1aacec73b19f120f371cb3786037e8"
     },
     {
       "path": "version.json",
       "size": 74,
-      "sha256": "376128249711363dda4f2d958cc5278c8e9c5cc17ba727f26f3f05c743af9091"
+      "sha256": "c7a115773ffaa4593ec9b228196129eb94fddf7978a913dc78740ca83ff7e603"
     }
   ],
-  "signature": "Zo9lGKyeZD9Ko6JpzUfpGzWXMk4CzNWtqsiPusmi7bGBHFva+ggDlU88KBWn1Ngl9YPHy2fdMi+0ZNrd6qiCAA=="
+  "signature": "WKnnp8IIsB4mT71bypdzEoL6xw1m65pS6cbIfIRHebpyFsKVOj/XWPNhoTTfuZTvXIAANfq0a1d/LNyCwBpnDg=="
 }
