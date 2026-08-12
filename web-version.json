@@ -1,10 +1,10 @@
 {
-  "version": "0.0.72",
+  "version": "0.0.73",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "87290e209627fe2aaf32a84fc2009a6835c839c1c1141849169976c0e32a34aa",
+  "sha256": "0e4549906a07e74da83684a05195c2b37346ac899b68286c87493836e921d13f",
   "platform": "web",
-  "filesHash": "be8dba2ac108c5a6e474b7e44dc2aa5c70b9cfcfd6f44b29bc8c27103a902cb6",
+  "filesHash": "2b8da51b60b1dba7891cf7280fa4b5b1b333cbaff0e0ef6c0c16bbbd0cbf4a91",
   "files": [
     {
       "path": "_expo/static/js/web/ChatScreen-8d7cb9fa5f5d82e69f8881c0aa637730.js",
@@ -42,9 +42,9 @@
       "sha256": "50ba66a5a000bb474e021fd21340fee298d5dfa6f294c7cbc5443a7ba9c9190d"
     },
     {
-      "path": "_expo/static/js/web/ProfileScreen-d9b43791f5fbb2ae4fd54462bb921e92.js",
-      "size": 130550,
-      "sha256": "847fec45a0369e9660f67a962b6d8100262399cbb5859077851eb81d5a383356"
+      "path": "_expo/static/js/web/ProfileScreen-6fde1b3c7c89e94ac2bac1a7e9e36336.js",
+      "size": 130683,
+      "sha256": "99f50c8112a0c127cc2fc3042fcaec5f610f27451aaf179501e5a7c4aa87c478"
     },
     {
       "path": "_expo/static/js/web/ScanScreen-ae608f70942509a8db795191b9ad40e4.js",
@@ -52,9 +52,9 @@
       "sha256": "2b58a2b196d652c7a7da99f2cda031c925156c52d22780ee6bace36fb1bc4cf9"
     },
     {
-      "path": "_expo/static/js/web/index-8b9ce4dbd7f90d2f492f6b079d8421dc.js",
-      "size": 2487174,
-      "sha256": "f43785821940ce225f12ebf7199c713b706b743c26a8e7d04dc78ae6721962fc"
+      "path": "_expo/static/js/web/index-c5c1da04f202f914890aac1e15394eae.js",
+      "size": 2487578,
+      "sha256": "74c940340efcdd19439c2b725d5c4ceda6f742caef2bb6a94035f718b7b72e47"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -89,7 +89,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "87290e209627fe2aaf32a84fc2009a6835c839c1c1141849169976c0e32a34aa"
+      "sha256": "0e4549906a07e74da83684a05195c2b37346ac899b68286c87493836e921d13f"
     },
     {
       "path": "jsqr.bundle.js",
@@ -119,13 +119,13 @@
     {
       "path": "sw.js",
       "size": 5601,
-      "sha256": "034d35b07f2a7f2bf5a4aafe0c91bdf3d9a79c53255f93d0e88847cfef46b67f"
+      "sha256": "e0ef9931a063cbe7bb38d6662781d2672565896aed611c429faec9254b9e241c"
     },
     {
       "path": "version.json",
       "size": 74,
-      "sha256": "910b021d015c2774e348409f371c37cb41d72c6e2d1297fc9d20e511a8a9dc62"
+      "sha256": "843185ac4b757ffc0a982d928144d56904bec40d375881f8a974442a0c03f72d"
     }
   ],
-  "signature": "BopejwyJ4/jAFZdCPbY4MZjQQNEJUcKZc2Xq0JFdbzbzaTuXmXBVKllo0M1NHbJA92K8bnJfGM/r4zpZpoeFCw=="
+  "signature": "1j1psHOmhswmphWZLn1j5M6jhL3zLzErgg0CVzGCYlS9UXZf7GWLAKLoOQJTF20W+eBcctAirb7hPG6djp6eDg=="
 }
