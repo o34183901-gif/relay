@@ -1693,6 +1693,9 @@ const server = http.createServer((req, res) => {
     const verdict = updateFeed.manifestResponse({
       dir: UPDATE_DIR,
       platform,
+      // КАН-1: тестовый канал спрашивают явно; без параметра — проверенный,
+      // ровно как все сборки до появления каналов.
+      channel: parsed.searchParams.get('channel') || '',
       selfUrl,
       read: (target) => fs.readFileSync(target, 'utf8'),
     });
@@ -4059,6 +4062,48 @@ async function mirrorPlatform(platform) {
   console.warn(`[update] ${platform}: раздаём ${checked.release.version} (${bytes.length} байт)`);
 }
 
+/**
+ * КАН-1: зеркало манифеста ТЕСТОВОГО канала — только манифест, без файла.
+ *
+ * Тестовых телефонов единицы, и держать ради них второй APK на каждом узле —
+ * двойной диск впустую. Файл тестовый клиент качает по подписанному адресу из
+ * манифеста; узел раздаёт лишь крошечный JSON, и то после проверки подписи —
+ * той же, что у стабильного.
+ */
+function mirroredCanaryVersion() {
+  try {
+    const name = updateFeed.RELEASES.android.canaryManifest;
+    const parsed = JSON.parse(fs.readFileSync(path.join(UPDATE_DIR, name), 'utf8'));
+    return String(parsed.version || '');
+  } catch (e) {
+    return ''; // тестового выпуска ещё не было — это норма
+  }
+}
+
+async function mirrorCanaryManifest() {
+  const url = updateMirror.manifestUrl(UPDATE_SOURCE, 'android', 'canary');
+  if (!url) return;
+  const body = await fetchText(url, updateMirror.MAX_MANIFEST_BYTES);
+  if (!body) return;
+  const checked = updateMirror.checkedManifest({
+    body,
+    platform: 'android',
+    publicKey: RELEASE_PUBLIC_KEY,
+    verifySignature: verifyReleaseSignature,
+    currentVersion: '0.0.0',
+    channel: 'canary',
+  });
+  if (!checked.ok) {
+    console.warn(`[update] тестовый манифест отвергнут: ${checked.reason}`);
+    return;
+  }
+  const have = mirroredCanaryVersion();
+  if (have === checked.release.version) return;
+  fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  fs.writeFileSync(path.join(UPDATE_DIR, updateFeed.RELEASES.android.canaryManifest), body, 'utf8');
+  console.warn(`[update] тестовый канал: раздаём манифест ${checked.release.version}`);
+}
+
 
 // --- ВЫП-9: веб-версия на узле ----------------------------------------------
 //
@@ -4233,6 +4278,8 @@ async function maintainUpdateMirror() {
       if (names.kind !== 'licno') continue;
       await mirrorPlatform(platform);
     }
+    // КАН-1: манифест тестового канала — тем же проходом, но без файла.
+    await mirrorCanaryManifest();
     // ВЫП-11: настольный выпуск — тоже дерево файлов (установщик, его подпись
     // minisign и манифест Tauri). Механизм тот же, что у веб-версии: подписана
     // свёртка списка, каждый файл сверяется со своим отпечатком.

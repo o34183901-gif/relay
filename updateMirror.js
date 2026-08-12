@@ -65,9 +65,13 @@ const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
 /** Адрес манифеста платформы в репозитории раздачи. */
-function manifestUrl(source, platform) {
+function manifestUrl(source, platform, channel) {
   const base = String(source || '').trim().replace(/\/+$/, '');
   if (!base) return '';
+  // КАН-1: тестовый канал есть только у android — второй манифест рядом со
+  // стабильным. Файл выпуска для него узел не зеркалит (см. relay.js).
+  if (platform === 'android' && channel === 'canary') return `${base}/android-canary-version.json`;
+  if (channel === 'canary') return '';
   if (platform === 'android') return `${base}/android-version.json`;
   // ВЫП-11: для настольного клиента у нас ДВА манифеста, и это не дублирование.
   //
@@ -85,7 +89,7 @@ function manifestUrl(source, platform) {
  * Разобрать и ПРОВЕРИТЬ манифест. Всё, что ниже по течению, работает уже с
  * проверенными данными.
  */
-function checkedManifest({ body, platform, publicKey, verifySignature, currentVersion }) {
+function checkedManifest({ body, platform, publicKey, verifySignature, currentVersion, channel }) {
   if (typeof body !== 'string' || !body || body.length > MAX_MANIFEST_BYTES) {
     return { ok: false, reason: 'манифест не получен или неправдоподобно велик' };
   }
@@ -103,6 +107,9 @@ function checkedManifest({ body, platform, publicKey, verifySignature, currentVe
     platform,
     publicKey,
     verifySignature,
+    // КАН-1: манифест тестового канала проверяется правилом тестового клиента —
+    // иначе он падал бы здесь как «обновление другого канала».
+    channel: channel === 'canary' ? 'canary' : 'stable',
   });
   if (!verdict.ok) return { ok: false, reason: verdict.reason };
   return { ok: true, reason: '', release: verdict.release };

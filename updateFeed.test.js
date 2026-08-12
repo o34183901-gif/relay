@@ -22,6 +22,7 @@ const {
   RELEASES,
   MAX_MANIFEST_BYTES,
   askedPlatform,
+  askedChannel,
   releasePath,
   manifestResponse,
   fileResponse,
@@ -335,6 +336,57 @@ test('ОБН-5: у десктопа свой файл и своё имя, чуж
     read: readOf({ [DESKTOP_MANIFEST]: SIGNED }),
   });
   assert.strictEqual(wrong.status, 404, 'манифест android отдан как десктопный');
+});
+
+test('КАН-1: тестовый канал отдаёт свой манифест, не трогая проверенный', () => {
+  const CANARY = JSON.stringify({
+    version: '2.1.0',
+    url: 'https://github.com/o34183901-gif/relay/releases/download/app-v2.1.0/licno-android.apk',
+    size: 1000,
+    sha256: 'b'.repeat(64),
+    platform: 'android',
+    channel: 'canary',
+    signature: 'подпись',
+  });
+  const read = readOf({
+    [path.join(DIR, 'android-version.json')]: SIGNED,
+    [path.join(DIR, 'android-canary-version.json')]: CANARY,
+  });
+  const canary = manifestResponse({ dir: DIR, platform: 'android', channel: 'canary', read });
+  assert.strictEqual(canary.status, 200, canary.reason);
+  assert.strictEqual(canary.manifest.version, '2.1.0');
+  assert.strictEqual(canary.manifest.channel, 'canary');
+  // Без канала — прежний путь: старые сборки спрашивают без параметра и обязаны
+  // получать ровно то, что получали до появления каналов.
+  const stable = manifestResponse({ dir: DIR, platform: 'android', read });
+  assert.strictEqual(stable.status, 200, stable.reason);
+  assert.strictEqual(stable.manifest.version, '2.0.0');
+  assert.strictEqual(stable.manifest.channel, undefined, 'в проверенный манифест пролез канал');
+});
+
+test('КАН-1: незнакомый канал и платформа без тестового канала — отказ, а не «отдам проверенный»', () => {
+  assert.strictEqual(askedChannel(''), 'stable');
+  assert.strictEqual(askedChannel(undefined), 'stable');
+  assert.strictEqual(askedChannel('canary'), 'canary');
+  assert.strictEqual(askedChannel('nightly'), null);
+  assert.strictEqual(askedChannel(42), null);
+  const read = readOf({
+    [path.join(DIR, 'android-version.json')]: SIGNED,
+    [path.join(DIR, 'android-canary-version.json')]: SIGNED,
+  });
+  const unknown = manifestResponse({ dir: DIR, platform: 'android', channel: 'nightly', read });
+  assert.strictEqual(unknown.status, 404, 'незнакомый канал получил ответ');
+  // У десктопа тестового канала нет: спросивший его клиент ждёт не наш ответ.
+  const desktop = manifestResponse({ dir: DIR, platform: 'desktop', channel: 'canary', read });
+  assert.strictEqual(desktop.status, 404, 'десктопу отдан несуществующий тестовый канал');
+});
+
+test('КАН-1: тестового манифеста нет на диске — 404, проверенный при этом жив', () => {
+  const read = readOf({ [path.join(DIR, 'android-version.json')]: SIGNED });
+  const canary = manifestResponse({ dir: DIR, platform: 'android', channel: 'canary', read });
+  assert.strictEqual(canary.status, 404, 'отдан манифест, которого нет');
+  const stable = manifestResponse({ dir: DIR, platform: 'android', channel: 'stable', read });
+  assert.strictEqual(stable.status, 200, stable.reason);
 });
 
 console.log(`раздача обновлений: ${passed} проверок пройдено`);

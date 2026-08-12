@@ -64,6 +64,11 @@ const path = require('path');
 const RELEASES = {
   android: {
     manifest: 'android-version.json',
+    // КАН-1: манифест ТЕСТОВОГО канала. Лежит рядом со стабильным, но сам файл
+    // выпуска для него узел НЕ хранит и не раздаёт: тестовых телефонов единицы,
+    // и держать ради них второй APK на каждом узле — двойной диск впустую.
+    // Тестовый клиент качает файл по подписанному адресу из манифеста.
+    canaryManifest: 'android-canary-version.json',
     file: 'licno-android.apk',
     type: 'application/vnd.android.package-archive',
     kind: 'licno',
@@ -104,11 +109,28 @@ function askedPlatform(value) {
  * одно сравнение, а цена ошибки — отдача произвольного файла с релея, на
  * котором лежат ключи.
  */
+/**
+ * КАН-1: какой канал спрашивают. Пусто — «проверенный», как все сборки до
+ * появления каналов. Неизвестное значение — null, а не «отдам проверенный»:
+ * клиент, спросивший незнакомый канал, ждёт не наш ответ.
+ */
+function askedChannel(value) {
+  if (value === undefined || value === null || value === '') return 'stable';
+  if (value === 'stable' || value === 'canary') return value;
+  return null;
+}
+
 function releasePath(dir, platform, kind) {
   if (!dir || typeof dir !== 'string') return null;
   const release = RELEASES[platform];
   if (!release) return null;
-  const name = kind === 'file' ? release.file : release.manifest;
+  const name =
+    kind === 'file'
+      ? release.file
+      : kind === 'canary'
+        ? release.canaryManifest
+        : release.manifest;
+  if (!name) return null;
   const full = path.resolve(dir, name);
   const root = path.resolve(dir);
   if (full !== path.join(root, name)) return null;
@@ -127,10 +149,17 @@ function releasePath(dir, platform, kind) {
  * через секунду здесь будет целый манифест.
  */
 function manifestResponse(input) {
-  const { dir, platform, read } = input && typeof input === 'object' ? input : {};
+  const { dir, platform, read, channel } = input && typeof input === 'object' ? input : {};
   const asked = askedPlatform(platform);
   if (!asked) return { status: 404, reason: 'неизвестная платформа' };
-  const target = releasePath(dir, asked, 'manifest');
+  // КАН-1: тестовый канал есть только там, где объявлен его манифест. Прочим
+  // платформам канал не знаком — для них это прежний путь без изменений.
+  const wantedChannel = askedChannel(channel);
+  if (!wantedChannel) return { status: 404, reason: 'неизвестный канал' };
+  if (wantedChannel === 'canary' && !RELEASES[asked].canaryManifest) {
+    return { status: 404, reason: 'у платформы нет тестового канала' };
+  }
+  const target = releasePath(dir, asked, wantedChannel === 'canary' ? 'canary' : 'manifest');
   if (!target) return { status: 404, reason: 'раздача обновлений не настроена' };
   let text = null;
   try {
@@ -252,6 +281,7 @@ function fileResponse(input) {
 }
 
 module.exports = {
+  askedChannel,
   RELEASES,
   MAX_MANIFEST_BYTES,
   RELEASE_FILE_PATH,

@@ -62,7 +62,36 @@
 // списков. Поэтому подписывается КОРОТКАЯ СВЁРТКА списка, а список едет рядом и
 // сверяется с ней. Новое поле в конце — прежние манифесты (у них его нет)
 // подписываются ровно как раньше: отсутствующие поля пропускаются.
-const SIGNED_FIELDS = ['version', 'url', 'size', 'sha256', 'platform', 'notes', 'filesHash'];
+// КАН-1: `channel` — канал выпуска в подписи. Порядок совместим в обе стороны:
+// signedPayload пропускает отсутствующие поля, поэтому прежний манифест без
+// канала проверяется как раньше, а манифест ТЕСТОВОГО канала прежняя сборка
+// отвергнет сама — она не включит незнакомое поле в подпись, и та не сойдётся.
+// Лучшего поведения для старых установок не придумать: тестовые выпуски до них
+// не доезжают даже через недобросовестный узел.
+const SIGNED_FIELDS = ['version', 'url', 'size', 'sha256', 'platform', 'channel', 'notes', 'filesHash'];
+
+/**
+ * КАН-1: канал манифеста. Отсутствие поля — «проверенный»: так подписаны все
+ * выпуски до появления каналов, и переобъявлять их задним числом нельзя.
+ */
+function manifestChannel(manifest) {
+  const value = manifest && manifest.channel;
+  return typeof value === 'string' && value ? value : 'stable';
+}
+
+/**
+ * КАН-1: годится ли манифест этого канала человеку с такой настройкой.
+ *
+ * Правило одностороннее намеренно. «Проверенный» принимает ТОЛЬКО проверенное:
+ * это обещание, ради которого каналы и заводятся, — тестовые сборки не доходят
+ * до обычных людей, даже если узел подсунет тестовый манифест. «Тестовый»
+ * принимает оба: тестовый телефон обязан видеть и продвинутые проверенные
+ * выпуски — иначе он застрял бы на последней тестовой сборке навсегда.
+ */
+function channelAccepts(expected, actual) {
+  if (expected === 'canary') return actual === 'canary' || actual === 'stable';
+  return actual === 'stable';
+}
 
 /** Разбор номера версии: «1.2.3», «v1.2.3», «1.2.3-4» — всё это числа по точкам. */
 function versionParts(value) {
@@ -151,6 +180,9 @@ function verifyUpdateManifest(input) {
     platform,
     publicKey,
     verifySignature,
+    // КАН-1: канал, который выбрал человек. По умолчанию «проверенный» — ровно
+    // как ведут себя все сборки до появления каналов.
+    channel = 'stable',
   } = input && typeof input === 'object' ? input : {};
 
   if (!manifest || typeof manifest !== 'object') return { ok: false, reason: 'манифест не разобран' };
@@ -172,6 +204,11 @@ function verifyUpdateManifest(input) {
 
   if (platform && manifest.platform && manifest.platform !== platform) {
     return { ok: false, reason: 'обновление для другой платформы' };
+  }
+  // КАН-1: канал сверяется ПОСЛЕ подписи — поле подписано, и узел не может
+  // выдать тестовый выпуск за проверенный, не сломав подпись.
+  if (!channelAccepts(channel, manifestChannel(manifest))) {
+    return { ok: false, reason: 'обновление другого канала' };
   }
   if (typeof manifest.version !== 'string' || !manifest.version) {
     return { ok: false, reason: 'в манифесте нет версии' };
@@ -246,4 +283,6 @@ module.exports = {
   isNewerVersion,
   verifyUpdateManifest,
   fileMatchesRelease,
+  manifestChannel,
+  channelAccepts,
 };
