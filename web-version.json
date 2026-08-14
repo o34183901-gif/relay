@@ -1,60 +1,60 @@
 {
-  "version": "0.0.79",
+  "version": "0.0.80",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "17910bf3890d2e854cad0a2d09db4a638de5ed10dae3ad9ba77095c2ba71db2b",
+  "sha256": "30cc294d7249f8a53b411b76a50a8f2b213cc1ba0bfde0117fdb648b9f7f780b",
   "platform": "web",
-  "filesHash": "83eaf9c8a9b4627d872399f8b5400348f9e2be7501afd77c319d717318900242",
+  "filesHash": "a6c309694e5ccb3b6584da7f52b28ca1acf4369ed515870c66ae677a7437506a",
   "files": [
     {
-      "path": "_expo/static/js/web/ChatScreen-8d785abf86b633a325b8e33fb61f9adb.js",
+      "path": "_expo/static/js/web/ChatScreen-0525c19b3cf7e79523d95ad3be3a2a1f.js",
       "size": 159979,
-      "sha256": "23ed3d728f0629b006092fa21d5bd59e439aec1ed70eb7d55bc4e78e5fdbc47b"
+      "sha256": "def445e4805358f39ca30c36ddbfac48c011436bbfdfdf1ada6ce7ddbceabca3"
     },
     {
-      "path": "_expo/static/js/web/GroupChatScreen-191c7966b5ae6bd8b05d606a7168fe30.js",
+      "path": "_expo/static/js/web/GroupChatScreen-690bb3471d68ebf4f735649afc630e69.js",
       "size": 46113,
-      "sha256": "0d8dda69493e38a56bbd8b136767c0877be76cd45b5e0bec72d909242ab27593"
+      "sha256": "e8347f666d92f0ef76f91bdd89ba07311ef543387898b3ba019a03b342244ded"
     },
     {
-      "path": "_expo/static/js/web/GroupEditScreen-ab8b78c0f0d08ace0da57e6bf89166d5.js",
+      "path": "_expo/static/js/web/GroupEditScreen-edb01f03ad9c36a540487dd7d8d40dde.js",
       "size": 9276,
-      "sha256": "dc7489cd1559ee18fff62f30fd560091a03d6e789a8dc7e37670ca127cdc02bb"
+      "sha256": "9014bd45b573d3f874aa93d97fa54265b070685b54bdf32cf85590b4ae21e95c"
     },
     {
-      "path": "_expo/static/js/web/GroupMembersScreen-2f94089cac8e1953e8fbe3b4fe22947f.js",
+      "path": "_expo/static/js/web/GroupMembersScreen-18d472cd3092ec1804a745918b6be560.js",
       "size": 6733,
-      "sha256": "c603a6a22858ae009e31074b5dec21d700ca759e1fbb123200593b4529f684ae"
+      "sha256": "c4c3bf5a9d443f888a0155a796eb29a224b9bc4ad09a2b2b36c826ca9e5dee13"
     },
     {
-      "path": "_expo/static/js/web/LinkedDevicesScreen-7361eb5312c305471a02b850324274c7.js",
+      "path": "_expo/static/js/web/LinkedDevicesScreen-c58840ffb127b20da82f8b07e2ed8ef4.js",
       "size": 56057,
-      "sha256": "35003e25cbc2522b369fe8993ab8bea43efc16f2ebf1cbe1aad60292a4359f22"
+      "sha256": "319c5bae164d29a0ebbf73c0de7892e8bf8ebf0d83e6600e9eecae0fe764b810"
     },
     {
-      "path": "_expo/static/js/web/MyCodeScreen-e13538429d3a774421916220714738ba.js",
+      "path": "_expo/static/js/web/MyCodeScreen-5970cce950605db0b87d0ff942a3daf7.js",
       "size": 16631,
-      "sha256": "01c4dda303f4fe7c25a63793eb9a84832b9b2c1d7f357116af80f08f403cca86"
+      "sha256": "975a68c8fa0b3d8853095fabcfdec1e7e0f3c4b36013635bdd62fb96f1ad58af"
     },
     {
-      "path": "_expo/static/js/web/OfflineSetupScreen-2bdc13181c1c46fd53332601dd9a0bcd.js",
+      "path": "_expo/static/js/web/OfflineSetupScreen-380f950c73865767cc8df29b311f9d81.js",
       "size": 18418,
-      "sha256": "ae9dcf7a475603985a49b538e7f36bb4d2d357add317df6304e0a29423cc4a9e"
+      "sha256": "ecacd8ee72fb1e62a45606ba87396ba5684f4c92736376aa7880c2435c800e04"
     },
     {
-      "path": "_expo/static/js/web/ProfileScreen-9f5223fabf45006c715599c4ee680fd9.js",
-      "size": 132526,
-      "sha256": "7c7756e3091cd64a76415bfc7c92c75e2a0ee11cfba7b2bb029cbd2ef6889790"
+      "path": "_expo/static/js/web/ProfileScreen-ee9a6a3e01047908f8e41d70d90bd24a.js",
+      "size": 132766,
+      "sha256": "c73c4aa4fddae79b7b88b1a8937d2e760727c389ca3dab28baf797c41d4d2d86"
     },
     {
-      "path": "_expo/static/js/web/ScanScreen-c052fc8a0e5467f4de7556d1cd181a88.js",
+      "path": "_expo/static/js/web/ScanScreen-6507e535d10adbe9e2e7c53ec40169a2.js",
       "size": 12147,
-      "sha256": "7e2bfd29f62dc287e1bfc2ae4bae8b0a2a13b3d7842f108f06f8f444eeccaa8e"
+      "sha256": "e1c280af3f217cf74e167f1da35b6633bc9418a74003a4e8f1bf95a186f75dcd"
     },
     {
-      "path": "_expo/static/js/web/index-65fb87c33e5d21374bda1152c101a1d2.js",
-      "size": 2555837,
-      "sha256": "6748297f21aca45cef9a22121069fdfbd95e839d25eea1bffa4d89d0caddb1a3"
+      "path": "_expo/static/js/web/index-960aaa1ba2c4f9981a4db6045f27f45c.js",
+      "size": 2579813,
+      "sha256": "e7d83d62ed5d26e23bdf59a9f2fb02932d1d0754a69d4053ffbbf63b149ac572"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -89,7 +89,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "17910bf3890d2e854cad0a2d09db4a638de5ed10dae3ad9ba77095c2ba71db2b"
+      "sha256": "30cc294d7249f8a53b411b76a50a8f2b213cc1ba0bfde0117fdb648b9f7f780b"
     },
     {
       "path": "jsqr.bundle.js",
@@ -119,13 +119,13 @@
     {
       "path": "sw.js",
       "size": 5601,
-      "sha256": "2fefe3195e0b77e1904de6647648a707162f2b98dc464518c09b14cd690c83bb"
+      "sha256": "fa289847121ac4c2cb0c055303c74e3f7dcdf835b6353f431a88f5ea196d0b89"
     },
     {
       "path": "version.json",
       "size": 74,
-      "sha256": "1142b87a48a2a022b3de2c9d62c8ab4478607788637d0368c7d9b710d10b602b"
+      "sha256": "d01d80e9360ba92ec4ff0b15179f8f9745b5acbe66f6fee7911430c0aafd6b18"
     }
   ],
-  "signature": "JbVUg6ePFFy5iI1M87icDXrFMhfMLTSxI6TLhzv6F8cvBF2J5aYvHDKOpXqHCd8/5cAV76tUzAgdvJFXEYZGAA=="
+  "signature": "Xitr2HokqIcB4Fm4bMwqi3apSSrQVMtY6ZlaV/I0taCGFCMtK9HZpeqyM90uTMRLaTcPGtt5WXwVaFaxT1kBBw=="
 }

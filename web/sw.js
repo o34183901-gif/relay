@@ -1,4 +1,4 @@
-const BUILD_ID = '20260813182407-65ab0327';
+const BUILD_ID = '20260814145614-93be104a';
 const CACHE_NAME = `licno-pwa-${BUILD_ID}`;
 const APP_ROOT = '/app/';
 const SHELL = [
