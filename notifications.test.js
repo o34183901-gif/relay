@@ -1,28 +1,15 @@
-/**
- * notifications.test.js — wake-up уведомления (ПРФ-4).
- *
- * Дефект, который тесты закрывают: троттлинг считался на ПОЛУЧАТЕЛЯ целиком,
- * поэтому сообщения из разных чатов в одном 20-секундном окне давали один пуш —
- * остальные чаты устройство не будили вовсе.
- */
 const assert = require('assert');
 const { chatNotificationTag, createPushGate } = require('./notifications');
-
 let passed = 0;
 function test(name, fn) {
   fn();
   passed++;
   console.log('  ✓ ' + name);
 }
-
 console.log('уведомления (ПРФ-4)');
-
 const NOW = 1_800_000_000_000;
 const ALICE = 'YWxpY2UtcHVibGljLWtleQ==';
 const BOB = 'Ym9iLXB1YmxpYy1rZXk=';
-
-// --- признак чата -----------------------------------------------------------
-
 test('признак чата не содержит адреса отправителя', () => {
   const tag = chatNotificationTag(ALICE);
   assert.ok(tag.length > 0);
@@ -44,8 +31,6 @@ test('пустой адрес даёт пустой признак (старый
   assert.strictEqual(chatNotificationTag(null), '');
 });
 
-// --- окна троттлинга --------------------------------------------------------
-
 test('второе сообщение из ТОГО ЖЕ чата в окне не будит повторно', () => {
   const gate = createPushGate({ windowMs: 20000 });
   assert.strictEqual(gate.allow('вова', 'чат-А', NOW), true);
@@ -58,42 +43,35 @@ test('сообщение из ДРУГОГО чата в том же окне б
   assert.strictEqual(gate.allow('вова', 'чат-Б', NOW + 1000), true);
   assert.strictEqual(gate.allow('вова', 'чат-В', NOW + 2000), true);
 });
-
 test('после окна тот же чат снова будит', () => {
   const gate = createPushGate({ windowMs: 20000 });
   gate.allow('вова', 'чат-А', NOW);
   assert.strictEqual(gate.allow('вова', 'чат-А', NOW + 20000), true);
 });
-
 test('потолок на получателя не даёт превратить это в усилитель флуда', () => {
   const gate = createPushGate({ windowMs: 20000, maxPerRecipient: 3 });
   assert.strictEqual(gate.allow('жертва', 'спам-1', NOW), true);
   assert.strictEqual(gate.allow('жертва', 'спам-2', NOW + 100), true);
   assert.strictEqual(gate.allow('жертва', 'спам-3', NOW + 200), true);
-  // Четвёртый отправитель в том же окне уже не будит.
   assert.strictEqual(gate.allow('жертва', 'спам-4', NOW + 300), false);
 });
-
 test('потолок считается на получателя, а не глобально', () => {
   const gate = createPushGate({ windowMs: 20000, maxPerRecipient: 1 });
   assert.strictEqual(gate.allow('первый', 'чат-А', NOW), true);
   assert.strictEqual(gate.allow('второй', 'чат-А', NOW), true);
   assert.strictEqual(gate.allow('первый', 'чат-Б', NOW), false);
 });
-
 test('окно потолка сдвигается вместе со временем', () => {
   const gate = createPushGate({ windowMs: 20000, maxPerRecipient: 1 });
   assert.strictEqual(gate.allow('вова', 'чат-А', NOW), true);
   assert.strictEqual(gate.allow('вова', 'чат-Б', NOW + 100), false);
   assert.strictEqual(gate.allow('вова', 'чат-Б', NOW + 20000), true);
 });
-
 test('пустой получатель не будит и состояние не копит', () => {
   const gate = createPushGate();
   assert.strictEqual(gate.allow('', 'чат-А', NOW), false);
   assert.strictEqual(gate.size(), 0);
 });
-
 test('чистка убирает протухшие окна', () => {
   const gate = createPushGate({ windowMs: 20000 });
   gate.allow('вова', 'чат-А', NOW);
@@ -101,5 +79,4 @@ test('чистка убирает протухшие окна', () => {
   gate.sweep(NOW + 10 * 20000 + 1);
   assert.strictEqual(gate.size(), 0);
 });
-
 console.log('\nуведомления: ' + passed + ' passed');

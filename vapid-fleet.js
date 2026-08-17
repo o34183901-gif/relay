@@ -1,41 +1,17 @@
-/**
- * vapid-fleet.js — безопасная P2P-раздача одной VAPID-пары между релеями
- * оператора.
- *
- * В публичном образе лежит только список разрешённых URL и публичных Ed25519-
- * ключей релеев. Начальный (genesis) релей создаёт VAPID один раз, подписывает
- * весь bundle своим долговременным relay-sign.key и передаёт его остальным
- * разрешённым узлам в NaCl-box, зашифрованном на одноразовый ключ получателя.
- *
- * Приватный VAPID никогда не попадает в GitHub/образ/логи. Узел из открытого
- * gossip-каталога не получает ключ: URL должен быть в vapid-fleet.json, подпись
- * запроса должна сходиться, а сетевой источник — совпадать с публичным IP этого
- * URL. Для будущего сервера можно заранее добавить URL с allowDynamicKey=true:
- * его первый relay-sign.key привязывается к владению этим IP без входа по SSH.
- */
-
 const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
-// ВЫС-10: подпись и проверка — только через обёртку (server/ed25519.js —
-// сгенерированная копия src/ed25519.js). Быстрая реализация и единая точка
-// смены криптографического основания; прямых nacl.sign.detached вне обёртки
-// быть не должно, и это закреплено проверкой в scripts/verify-wired.js.
 const ed25519 = require('./ed25519');
-// НАТ-5: ключ nacl.box считается через единую точку X25519 — она же даёт
-// нативный уровень OpenSSL и одинаково отвергает вырожденную точку.
 const x25519 = require('./x25519');
 const { normalizeRelayUrl, isPrivateHost } = require('./relays');
-
 const REQUEST_PREFIX = 'licno-vapid-fleet-request-v1|';
 const RESPONSE_PREFIX = 'licno-vapid-fleet-response-v1|';
 const BUNDLE_PREFIX = 'licno-vapid-fleet-bundle-v1|';
 const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const MAX_JSON_BYTES = 32 * 1024;
-
 function decodeB64(value, expectedLength) {
   try {
     const out = naclUtil.decodeBase64(String(value || ''));
@@ -86,7 +62,6 @@ function loadFleetConfig(filePath, { allowPrivate = false } = {}) {
   if (!Array.isArray(raw.relays) || !raw.relays.length || raw.relays.length > 500) {
     throw new Error('vapid-fleet.json: invalid relays');
   }
-
   const seenUrls = new Set();
   const seenKeys = new Set();
   const relays = raw.relays.map((entry) => {
@@ -95,7 +70,6 @@ function loadFleetConfig(filePath, { allowPrivate = false } = {}) {
     const urlKey = url.toLowerCase();
     if (seenUrls.has(urlKey)) throw new Error(`vapid-fleet.json: duplicate URL ${url}`);
     seenUrls.add(urlKey);
-
     const relayPub = entry && typeof entry.relayPub === 'string' ? entry.relayPub : null;
     const allowDynamicKey = !!(entry && entry.allowDynamicKey);
     if (relayPub && !validRelayPublicKey(relayPub)) {
@@ -110,7 +84,6 @@ function loadFleetConfig(filePath, { allowPrivate = false } = {}) {
     }
     return { url, relayPub, allowDynamicKey };
   });
-
   const genesis = parseRelayUrl(raw.genesis, allowPrivate);
   const genesisMember = relays.find((x) => x.url.toLowerCase() === String(genesis || '').toLowerCase());
   if (!genesisMember || !genesisMember.relayPub || genesisMember.allowDynamicKey) {
@@ -124,17 +97,14 @@ function loadFleetConfig(filePath, { allowPrivate = false } = {}) {
     relays,
   };
 }
-
 function memberFor(config, rawUrl) {
   const url = normalizeRelayUrl(rawUrl);
   if (!config || !url) return null;
   return config.relays.find((x) => x.url.toLowerCase() === url.toLowerCase()) || null;
 }
-
 function memberAcceptsKey(member, relayPub) {
   return !!member && validRelayPublicKey(relayPub) && (!member.relayPub || member.relayPub === relayPub);
 }
-
 function bundlePayload(bundle) {
   return (
     BUNDLE_PREFIX +
@@ -149,7 +119,6 @@ function bundlePayload(bundle) {
     ].join('|')
   );
 }
-
 function signVapidBundle({ publicKey, privateKey }, config, genesisRelaySecret, issuedAt = Date.now()) {
   if (!validVapidPair(publicKey, privateKey)) throw new Error('invalid VAPID pair');
   const secret = genesisRelaySecret instanceof Uint8Array ? genesisRelaySecret : decodeB64(genesisRelaySecret);
@@ -170,7 +139,6 @@ function signVapidBundle({ publicKey, privateKey }, config, genesisRelaySecret, 
   );
   return bundle;
 }
-
 function verifyVapidBundle(bundle, config) {
   try {
     if (!bundle || bundle.version !== 1 || bundle.fleetId !== config.fleetId || bundle.epoch !== config.epoch) {
@@ -192,7 +160,6 @@ function verifyVapidBundle(bundle, config) {
     return false;
   }
 }
-
 function requestPayload(request) {
   return (
     REQUEST_PREFIX +
@@ -207,7 +174,6 @@ function requestPayload(request) {
     ].join('|')
   );
 }
-
 function createVapidRequest({ config, relayUrl, relayPub, relaySecret, now = Date.now() }) {
   const member = memberFor(config, relayUrl);
   if (!memberAcceptsKey(member, relayPub)) throw new Error('relay is not an allowed fleet member');
@@ -229,7 +195,6 @@ function createVapidRequest({ config, relayUrl, relayPub, relaySecret, now = Dat
   );
   return { request, boxSecret: box.secretKey };
 }
-
 function verifyVapidRequest(request, config, now = Date.now()) {
   try {
     if (
@@ -254,7 +219,6 @@ function verifyVapidRequest(request, config, now = Date.now()) {
     return null;
   }
 }
-
 function responsePayload(response) {
   return (
     RESPONSE_PREFIX +
@@ -270,7 +234,6 @@ function responsePayload(response) {
     ].join('|')
   );
 }
-
 function createVapidResponse({ config, request, bundle, senderUrl, senderRelayPub, senderRelaySecret }) {
   if (!verifyVapidBundle(bundle, config)) throw new Error('refusing to serve an invalid VAPID bundle');
   const sender = memberFor(config, senderUrl);
@@ -305,7 +268,6 @@ function createVapidResponse({ config, request, bundle, senderUrl, senderRelayPu
   );
   return response;
 }
-
 function openVapidResponse({ config, request, response, boxSecret }) {
   try {
     if (
@@ -344,7 +306,6 @@ function openVapidResponse({ config, request, response, boxSecret }) {
     return null;
   }
 }
-
 function normalizeIp(value) {
   let ip = String(value || '').trim().toLowerCase();
   if (ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7))) ip = ip.slice(7);
@@ -352,13 +313,11 @@ function normalizeIp(value) {
   if (zone !== -1) ip = ip.slice(0, zone);
   return net.isIP(ip) ? ip : null;
 }
-
 function sourceMatchesResolved(sourceIp, resolved) {
   const source = normalizeIp(sourceIp);
   if (!source || !Array.isArray(resolved)) return false;
   return resolved.some((entry) => normalizeIp(entry && entry.address) === source);
 }
-
 function readJsonFile(filePath) {
   try {
     const text = fs.readFileSync(filePath, 'utf8');
@@ -368,7 +327,6 @@ function readJsonFile(filePath) {
     return null;
   }
 }
-
 function writeJsonAtomic(filePath, value) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -382,20 +340,14 @@ function writeJsonAtomic(filePath, value) {
     try {
       fs.chmodSync(filePath, 0o600);
     } catch (e) {
-      // Временный файл уже создан с режимом 0600, и rename его сохраняет. Этот
-      // chmod — подстраховка для файловых систем, где это не так; отказ на них
-      // означает лишь, что подстраховка не понадобилась или невозможна.
     }
   } finally {
     try {
       fs.unlinkSync(temp);
     } catch (e) {
-      // Уборка в finally: при удачном rename временного файла уже нет, и это
-      // самый частый путь сюда. Ошибку самой записи мы не заслоняем.
     }
   }
 }
-
 module.exports = {
   MAX_CLOCK_SKEW_MS,
   MAX_JSON_BYTES,

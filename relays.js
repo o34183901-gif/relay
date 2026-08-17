@@ -1,18 +1,6 @@
-/**
- * relays.js — ЧИСТАЯ логика реплицированного каталога релеев (gossip).
- *
- * Каталог держит не один «главный» релей, а КАЖДЫЙ: список известных релеев
- * реплицируется между узлами эпидемически (каждый периодически тянет /relays у
- * пиров и сливает). Клиент может спросить список у любого релея — падение одного
- * ничего не ломает. Здесь только чистые функции (нормализация/валидация/слияние),
- * чтобы их можно было тестировать без сети (см. server/test.js).
- */
-
 const net = require('net');
 
-const MAX_RELAYS = 500; // потолок каталога: защита от «отравления» списка мусором
-
-/** Привести URL релея к канону: обрезать пробелы и хвостовые слэши. */
+const MAX_RELAYS = 500;
 function normalizeRelayUrl(url) {
   if (typeof url !== 'string') return null;
   const u = url.trim().replace(/\/+$/, '');
@@ -20,35 +8,20 @@ function normalizeRelayUrl(url) {
   return u;
 }
 
-// M-1 (SSRF, defence-in-depth): литеральные приватные/loopback/link-local и
-// метаданные-адреса в каталоге недопустимы — иначе анонсированный релей
-// вида ws://169.254.169.254 или ws://127.0.0.1 заставлял бы узел ходить к
-// внутренним сервисам (gossip делает исходящие запросы к адресам каталога).
-// Хостнеймы, резолвящиеся в приватные IP, дополнительно отсекаются перед
-// самим запросом (см. relay.js: SSRF-guard в fetchPeerRelays/pushSelfTo).
-// Приватен ли IPv4-октет-квартет: loopback / private / link-local (+ метаданные
-// 169.254.169.254) / CGNAT / multicast+reserved. Fail-closed: любой невалидный
-// или зарезервированный октет считаем приватным (не ходим).
 function isPrivateIPv4(a, b, c, d) {
   if ([a, b, c, d].some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  if (a === 0 || a === 10 || a === 127) return true; // this-network / private / loopback
-  if (a === 169 && b === 254) return true; // link-local + метаданные облака 169.254.169.254
-  if (a === 172 && b >= 16 && b <= 31) return true; // private
-  if (a === 192 && b === 168) return true; // private
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  if (a >= 224) return true; // multicast / зарезервировано
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a >= 224) return true;
   return false;
 }
 
-// Развернуть IPv6-строку в 8 групп (числа). Поддерживает сжатие "::" и встроенный
-// IPv4 в хвосте (mapped/compat). null — если это не валидный IPv6. C-3: раньше
-// IPv6 проверялся хрупкими регэкспами, из-за чего IPv4-mapped (`::ffff:127.0.0.1`,
-// `::ffff:169.254.169.254`) и развёрнутый loopback (`0:0:0:0:0:0:0:1`) считались
-// «публичными» и обходили SSRF-фильтр. Теперь адрес нормализуется целиком.
 function ipv6Groups(h) {
   if (!net.isIPv6(h)) return null;
   let s = h;
-  // Встроенный точечный IPv4 в хвосте -> две hex-группы.
   const m = s.match(/^(.*:)((?:\d{1,3}\.){3}\d{1,3})$/);
   if (m) {
     const p = m[2].split('.').map((x) => parseInt(x, 10));
@@ -70,68 +43,45 @@ function ipv6Groups(h) {
   if (groups.length !== 8) return null;
   return groups.map((x) => parseInt(x || '0', 16));
 }
-
 function isPrivateHost(host) {
   let h = String(host == null ? '' : host).trim().toLowerCase();
-  // Снять скобки IPv6 и хвостовой :port БЕЗОПАСНО — не откусывая часть самого
-  // IPv6-адреса (напр. завершающую группу у `0:0:...:1`).
   const br = h.match(/^\[([^\]]+)\](?::\d+)?$/);
   if (br) h = br[1];
-  else if (!net.isIP(h)) h = h.replace(/:\d+$/, ''); // hostname / IPv4 с портом
+  else if (!net.isIP(h)) h = h.replace(/:\d+$/, '');
   if (!h) return true;
-
-  // Имена
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return true;
-
-  // IPv4-литерал (точечный)
   const m4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (m4) return isPrivateIPv4(Number(m4[1]), Number(m4[2]), Number(m4[3]), Number(m4[4]));
-
-  // IPv4 одним десятичным числом (классический обход: `ws://2130706433`).
   if (/^\d+$/.test(h)) {
     const n = Number(h);
     if (Number.isFinite(n) && n >= 0 && n <= 0xffffffff) {
       return isPrivateIPv4((n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
     }
-    return true; // подозрительный число-хост — не ходим
+    return true;
   }
-
-  // IPv6 (сжатый/развёрнутый, IPv4-mapped/compat)
   const g = ipv6Groups(h);
   if (g) {
-    if (g.every((x) => x === 0)) return true; // :: (unspecified)
-    // ::1 loopback
+    if (g.every((x) => x === 0)) return true;
     if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0 && g[6] === 0 && g[7] === 1)
       return true;
-    // IPv4-mapped ::ffff:a.b.c.d и IPv4-compat ::a.b.c.d -> проверить вложенный IPv4
     if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && (g[5] === 0xffff || g[5] === 0)) {
       return isPrivateIPv4((g[6] >> 8) & 255, g[6] & 255, (g[7] >> 8) & 255, g[7] & 255);
     }
-    if ((g[0] & 0xfe00) === 0xfc00) return true; // ULA fc00::/7
-    if ((g[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+    if ((g[0] & 0xfe00) === 0xfc00) return true;
+    if ((g[0] & 0xffc0) === 0xfe80) return true;
     return false;
   }
   return false;
 }
-
-/** Валиден ли URL релея: только ws:// или wss://, разумной длины, публичный хост. */
 function isValidRelayUrl(url) {
   const u = normalizeRelayUrl(url);
   if (!u || u.length > 256) return false;
   if (!/^wss?:\/\//i.test(u)) return false;
   const host = u.replace(/^wss?:\/\//i, '').replace(/[/?#].*$/, '');
-  // хост непустой и без пробельных символов (переносы/табы/пробелы = инъекция).
-  // Дефисы и точки в хостах допустимы.
   if (!host || /\s/.test(host)) return false;
   if (isPrivateHost(host)) return false;
   return true;
 }
-
-/**
- * Слить входящий список в текущий каталог. Возвращает НОВЫЙ массив уникальных
- * валидных URL (нормализованных), с сохранением порядка «сначала старые», и
- * усечением до MAX_RELAYS. Невалидные записи молча отбрасываются.
- */
 function mergeRelays(current, incoming) {
   const seen = new Set();
   const out = [];
@@ -147,26 +97,18 @@ function mergeRelays(current, incoming) {
   for (const u of Array.isArray(incoming) ? incoming : []) add(u);
   return out.slice(0, MAX_RELAYS);
 }
-
-// H-2/M-4: конфиг coturn генерирует САМ релей (он владелец секрета) и пишет его в
-// data-том с правами 0600 — секрета больше нет ни в аргументах процесса
-// (ps/`docker inspect`), ни в переменных окружения, ни в world-readable файлах.
-// Здесь — чистый билдер строки конфига (запись файла — в relay.js). Диапазоны
-// denied-peer-ip закрывают ретрансляцию TURN во внутреннюю сеть и к облачным
-// метаданным (open-relay / SSRF-плацдарм — M-4).
 const COTURN_DENIED_RANGES = [
   '0.0.0.0-0.255.255.255',
   '10.0.0.0-10.255.255.255',
-  '100.64.0.0-100.127.255.255', // CGNAT
+  '100.64.0.0-100.127.255.255',
   '127.0.0.0-127.255.255.255',
-  '169.254.0.0-169.254.255.255', // link-local + метаданые облака
+  '169.254.0.0-169.254.255.255',
   '172.16.0.0-172.31.255.255',
   '192.168.0.0-192.168.255.255',
   '::1',
-  'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // ULA
-  'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // link-local
+  'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+  'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
 ];
-
 function coturnConfigText(secret, { turnHost, pidfile, userdb } = {}) {
   const lines = [
     'listening-port=3478',
@@ -180,60 +122,22 @@ function coturnConfigText(secret, { turnHost, pidfile, userdb } = {}) {
     'no-multicast-peers',
     'min-port=49160',
     'max-port=49200',
-    // ДПЛ-5: релей (и его дочерний coturn) работает под non-root, поэтому coturn
-    // НЕ может писать в root-only /var/run и /var/log. Лог направляем в stdout
-    // (виден в `docker logs`), pid — в переданный writable путь (data-том, который
-    // entrypoint chown'ит под пользователя релея). Без этого под non-root coturn
-    // ругался «Cannot create pid file: /var/run/turnserver.pid: Permission denied».
     'log-file=stdout',
   ];
   if (pidfile) lines.push(`pidfile=${pidfile}`);
-  // ДПЛ-5: coturn открывает SQLite-базу пользователей при старте даже когда
-  // аутентификация идёт через use-auth-secret (REST/эфемерные креды) и БД не нужна.
-  // Дефолт /var/lib/turn/turndb — root-only, под non-root даёт «unable to open
-  // database file». Уводим в writable data-том (пустая БД, для auth не используется).
   if (userdb) lines.push(`userdb=${userdb}`);
   if (turnHost) lines.push(`external-ip=${turnHost}`);
   for (const r of COTURN_DENIED_RANGES) lines.push(`denied-peer-ip=${r}`);
   lines.push('');
   return lines.join('\n');
 }
-
-// Скользящее окно-счётчик (чистый, для троттлингов). state = { start, count } | null.
-// Возвращает { allow, state }: allow=false, когда в текущем окне уже >= max событий.
-// Инкремент счётчика — на стороне вызывающего (чтобы считать только реальные события).
 function rateGate(state, now, windowMs, max) {
   const s = !state || now - state.start > windowMs ? { start: now, count: 0 } : state;
   return { allow: s.count < max, state: s };
 }
-
-/**
- * БЕЗ-5: скользящее окно по БАЙТАМ (в дополнение к rateGate, считающему кадры).
- *
- * Кадровый лимит сам по себе дыряв: 80 кадров в секунду по 300 КБ — это 24 МБ/с
- * с одного сокета, не превысив ни одного лимита. Хуже того, если получатель
- * онлайн, конверты не ложатся в очередь и квоты хранения (на пользователя, на
- * отправителя, на общий объём) вообще не срабатывают. Один клиент насыщал канал
- * и однопоточный event-loop релея, а страдали все остальные.
- *
- * Реакция на превышение здесь — НЕ отказ и НЕ разрыв. Отклонённый кадр означает
- * потерянный чанк вложения, то есть битый файл у легитимного пользователя,
- * который просто быстро подключён. Вызывающий вместо этого перестаёт читать
- * сокет на pauseMs (TCP-окно закрывается, отправитель притормаживает сам), а
- * уже принятый кадр обрабатывает как обычно — ничего не теряется.
- *
- * Разрыв остаётся только для настоящего абуза: `abusive` выставляется, когда
- * лимит превышен maxStrikes окон подряд. Страйк начисляется РАЗ ЗА ОКНО, а не
- * за кадр, иначе пачка кадров сожгла бы всю серию мгновенно.
- *
- *   state = { start, bytes, strikes } | null
- *   -> { state, pauseMs, abusive }
- */
 function byteGate(state, now, bytes, windowMs, maxBytes, maxStrikes) {
   let s = state;
   if (!s || now - s.start >= windowMs) {
-    // Окно закрылось. Серию обнуляем, только если оно прошло БЕЗ превышения:
-    // иначе непрерывный флуд сбрасывал бы себе счётчик каждым новым окном.
     s = { start: now, bytes: 0, strikes: s && s.bytes > maxBytes ? s.strikes : 0 };
   }
   const wasOver = s.bytes > maxBytes;
@@ -246,29 +150,8 @@ function byteGate(state, now, bytes, windowMs, maxBytes, maxStrikes) {
     abusive: nowOver && strikes >= maxStrikes,
   };
 }
-
-// Порт coturn: и STUN, и TURN на одном порту (см. coturnConfigText).
 const TURN_PORT = 3478;
-// Срок жизни эфемерных REST-учёток coturn.
 const TURN_TTL_SEC = 3600;
-
-/**
- * БЕЗ-1: список ICE, который релей отдаёт клиенту. Чистая функция — без сети,
- * без process.env, без Date.now(): всё приходит параметрами, чтобы результат
- * можно было проверить тестом.
- *
- *   buildIceServers({ turnSecret, turnHost, publicStun, now, hmac })
- *
- * Свой coturn настроен -> отдаём свой STUN и свой TURN с эфемерной учёткой
- * (долгоживущего пароля в приложении нет). Не настроен -> отдаём РОВНО то, что
- * оператор разрешил явно через RELAY_PUBLIC_STUN, а по умолчанию — ничего.
- *
- * Раньше на месте последней ветки был зашитый stun.l.google.com: при каждом
- * звонке обе стороны сообщали Google свой реальный IP и точное время. Медиа
- * шифруется, но факт разговора, его время и география — нет; для продукта,
- * обещающего отсутствие слежки, это противоречие. Молчаливого отката на чужой
- * сервер больше не существует ни при какой конфигурации.
- */
 function buildIceServers(opts) {
   const o = opts || {};
   const turnHost = o.turnHost;
@@ -285,20 +168,14 @@ function buildIceServers(opts) {
       },
     ];
   }
-  // Пустой список означает, что звонок соберётся лишь по прямым кандидатам;
-  // клиент это видит и предупреждает пользователя (ЗВ-1), а не выдаёт
-  // отсутствие ретранслятора за норму.
   return (Array.isArray(o.publicStun) ? o.publicStun : []).map((urls) => ({ urls }));
 }
-
-/** Разбор RELAY_PUBLIC_STUN: только stun:/stuns:, остальное молча отбрасываем. */
 function parsePublicStun(value) {
   return String(value || '')
     .split(',')
     .map((item) => item.trim())
     .filter((item) => /^stuns?:/i.test(item));
 }
-
 module.exports = {
   MAX_RELAYS,
   normalizeRelayUrl,

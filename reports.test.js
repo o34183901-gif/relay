@@ -1,32 +1,17 @@
-/**
- * reports.test.js — правила приёма и выдачи отчётов о неполадках (ОТЧ-1).
- *
- * ЧТО ЗДЕСЬ ВАЖНО
- *
- * Узел принимает отчёты БЕЗ аутентификации — иначе их не пришлёт как раз тот, у
- * кого сломалась аутентификация. Значит вся защита держится на трёх правилах:
- * форма посылки, потолок размера и доказанное право владельца забрать
- * накопленное. Ошибка в третьем означает, что отчёты пользователей может
- * скачать кто угодно; ошибка в первых двух — что диск узла заливают чем попало.
- */
 const assert = require('assert');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const reports = require('./reports');
-
 let passed = 0;
 function test(name, fn) {
   fn();
   console.log('  ✓ ' + name);
   passed++;
 }
-
 const owner = nacl.sign.keyPair();
 const OWNER_PUB = naclUtil.encodeBase64(owner.publicKey);
 const OWNER_SEC = naclUtil.encodeBase64(owner.secretKey);
-
 const goodBody = { v: 1, ek: 'ZWs=', nonce: 'bm9uY2U=', cipher: 'Y2lwaGVy' };
-
 test('годная посылка принимается', () => {
   assert.deepStrictEqual(reports.validReport(goodBody, 128), { ok: true });
 });
@@ -76,10 +61,7 @@ test('чужая подпись не открывает ничего', () => {
   assert.strictEqual(verdict.ok, false);
   assert.strictEqual(verdict.reason, 'signature');
 });
-
 test('подпись на ЧТЕНИЕ не стирает отчёты', () => {
-  // Домены разные намеренно: подсмотренная ссылка выдачи не должна работать
-  // как удаление, даже если её повторить слово в слово.
   const ts = 1770000000000;
   const fetchSig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC });
   const verdict = reports.verifyOwnerRequest({
@@ -91,7 +73,6 @@ test('подпись на ЧТЕНИЕ не стирает отчёты', () => 
   });
   assert.strictEqual(verdict.ok, false, 'подпись чтения на удалении не годится');
 });
-
 test('просроченная подпись не работает — и из будущего тоже', () => {
   const ts = 1770000000000;
   const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC });
@@ -112,7 +93,6 @@ test('просроченная подпись не работает — и из 
   });
   assert.strictEqual(future.reason, 'stale', 'окно двустороннее — часы узлов расходятся');
 });
-
 test('битые входные данные не роняют проверку', () => {
   assert.strictEqual(reports.verifyOwnerRequest({ domain: 'x', ts: 'вчера', now: 1 }).reason, 'ts');
   assert.strictEqual(
@@ -124,5 +104,4 @@ test('битые входные данные не роняют проверку'
     'key'
   );
 });
-
 console.log(`\nreports (ОТЧ-1): ${passed} passed`);

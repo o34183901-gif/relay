@@ -1,8 +1,3 @@
-/**
- * Integration: start two real relay processes on loopback. Genesis creates the
- * bundle, follower obtains it through POST /vapid-fleet and persists the same
- * signed VAPID without any filesystem sharing.
- */
 const assert = require('assert');
 const fs = require('fs');
 const http = require('http');
@@ -12,26 +7,11 @@ const net = require('net');
 const { spawn } = require('child_process');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
-
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-vapid-p2p-'));
 const genesisKeys = nacl.sign.keyPair();
 const followerKeys = nacl.sign.keyPair();
 const b64 = (bytes) => naclUtil.encodeBase64(bytes);
 const configPath = path.join(tmp, 'fleet.json');
-
-/**
- * Свободные порты от ядра, а не выдуманные.
- *
- * ПОЧЕМУ НЕ ЧИСЛО В КОДЕ. Раньше здесь стояло `8811 + (process.pid % 100)`, и
- * это тот же класс ловушки, что стоил дня разбирательств в throttle.test.js:
- * релей поднимается отдельным процессом, а `health(port)` спрашивает ПОРТ, то
- * есть кого угодно, кто на нём сидит. Совпади остаток от pid с прошлым прогоном
- * (или останься живым релей от прерванного) — новый молча падает с EADDRINUSE, а
- * тест разговаривает с чужим сервером и падает по таймауту, ничего не объясняя.
- *
- * Порты берутся ПАРОЙ и одновременно: закрой мы первый сокет до открытия
- * второго, ядро могло бы выдать тот же номер дважды.
- */
 function freePorts(count) {
   const servers = [];
   const open = (index) =>
@@ -52,7 +32,6 @@ function freePorts(count) {
   );
 }
 
-/** Конфигурация флота: порты входят в неё, поэтому пишется она после их выдачи. */
 function writeFleetConfig(genesisUrl, followerUrl) {
   fs.writeFileSync(
     configPath,
@@ -70,7 +49,6 @@ function writeFleetConfig(genesisUrl, followerUrl) {
 }
 
 const running = new Set();
-
 function startRelay(name, port, selfUrl, keys) {
   const dir = path.join(tmp, name);
   fs.mkdirSync(dir, { recursive: true });
@@ -89,8 +67,6 @@ function startRelay(name, port, selfUrl, keys) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  // Смерть процесса запоминаем: без этого ожидание упиралось бы в двадцать
-  // секунд таймаута и сообщало «timeout» вместо «релей упал на старте».
   child.exitReason = null;
   child.on('exit', (code, signal) => {
     child.exitReason = signal ? `сигнал ${signal}` : `код ${code}`;
@@ -99,19 +75,14 @@ function startRelay(name, port, selfUrl, keys) {
   running.add(child);
   return child;
 }
-
-// Подстраховка на случай падения самого теста: релей — отдельный процесс и с
-// родителем не умирает. Оставшийся жить, он и делал фиксированные порты миной.
 process.on('exit', () => {
   for (const child of running) {
     try {
       child.kill('SIGKILL');
     } catch (e) {
-      // Процесс уже мёртв — цель достигнута.
     }
   }
 });
-
 function stopRelay(child) {
   return new Promise((resolve) => {
     if (!child || child.exitCode !== null) return resolve();
@@ -133,7 +104,6 @@ function stopRelay(child) {
     }
   });
 }
-
 function health(port) {
   return new Promise((resolve) => {
     const req = http.get({ host: '127.0.0.1', port, path: '/health', timeout: 1000 }, (res) => {
@@ -151,7 +121,6 @@ function health(port) {
     req.on('timeout', () => req.destroy());
   });
 }
-
 async function waitFor(check, timeoutMs = 20000, describe = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -161,8 +130,6 @@ async function waitFor(check, timeoutMs = 20000, describe = null) {
   }
   throw new Error(describe ? `timeout: ${describe()}` : 'timeout');
 }
-
-/** Ждать /health именно СВОЕГО процесса — и сразу узнать, если он умер. */
 function waitForRelay(child, port, accept, what) {
   return waitFor(
     async () => {
@@ -170,9 +137,6 @@ function waitForRelay(child, port, accept, what) {
         throw new Error(`${what}: релей не запустился (${child.exitReason}) — порт ${port} занят?`);
       }
       const value = await health(port);
-      // Наш релей всегда член флота: ему передан RELAY_VAPID_FLEET_FILE. Ответ
-      // без этого признака означает чужой процесс на том же порту, и принимать
-      // его за свой — ровно та ошибка, из-за которой тест переписан.
       if (!value || !value.vapidFleetMember) return null;
       return accept(value) ? value : null;
     },
@@ -180,25 +144,21 @@ function waitForRelay(child, port, accept, what) {
     () => `${what} (порт ${port})`
   );
 }
-
 async function main() {
   const [genesisPort, followerPort] = await freePorts(2);
   const genesisUrl = `ws://127.0.0.1:${genesisPort}`;
   const followerUrl = `ws://127.0.0.1:${followerPort}`;
   writeFleetConfig(genesisUrl, followerUrl);
-
   const follower = startRelay('follower', followerPort, followerUrl, followerKeys);
   let genesis = null;
   let logs = '';
   follower.stdout.on('data', (x) => (logs += `[follower] ${x}`));
   follower.stderr.on('data', (x) => (logs += `[follower:err] ${x}`));
-
   try {
     const waiting = await waitForRelay(follower, followerPort, () => true, 'follower поднялся');
     assert.strictEqual(waiting.vapid, false);
     assert.strictEqual(fs.existsSync(path.join(tmp, 'follower', 'vapid.json')), false);
     console.log('  ✓ follower waits without generating a conflicting local VAPID');
-
     genesis = startRelay('genesis', genesisPort, genesisUrl, genesisKeys);
     genesis.stdout.on('data', (x) => (logs += `[genesis] ${x}`));
     genesis.stderr.on('data', (x) => (logs += `[genesis:err] ${x}`));
@@ -223,11 +183,6 @@ async function main() {
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
-
-// КРИТ-15: набор обязан печатать итог. Без него прогонщик не может отличить
-// «отработал до конца» от «оборвался на середине»: код возврата при висящем
-// промисе всё равно нулевой. Этот набор итога не печатал вовсе и был единственным
-// из девяти серверных, который прогонщик объявлял оборвавшимся.
 main()
   .then(() => {
     console.log('\nvapid fleet integration: 2 проверок пройдено');

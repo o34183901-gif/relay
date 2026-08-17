@@ -1,19 +1,10 @@
-/**
- * Minimal client-side crypto used only by server integration tests.
- *
- * The public relay repository intentionally has no ../src client tree. Keeping
- * these protocol primitives beside test.js makes `npm test` reproducible after
- * messege/server is synchronized into that standalone repository.
- */
 const nacl = require('tweetnacl');
 const util = require('tweetnacl-util');
-
 const { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } = util;
 const CHALLENGE_SIG_PREFIX = 'licno-relay-challenge-v1|';
 const BOX_PROOF_PREFIX = 'licno-box-proof-v1|';
 const RELAY_AUTH_PREFIX = 'licno-relay-auth-v1|';
 const SPK_SIG_PREFIX = 'licno-spk-v1|';
-
 function concatBytes(a, b) {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
@@ -38,7 +29,6 @@ function hmacSha512(key, data) {
   }
   return nacl.hash(concatBytes(opad, nacl.hash(concatBytes(ipad, data))));
 }
-
 function generateIdentity() {
   const box = nacl.box.keyPair();
   const sign = nacl.sign.keyPair();
@@ -49,7 +39,6 @@ function generateIdentity() {
     signSecretKey: encodeBase64(sign.secretKey),
   };
 }
-
 function signChallenge({ nonce, signSecretKey }) {
   return encodeBase64(
     nacl.sign.detached(
@@ -58,7 +47,6 @@ function signChallenge({ nonce, signSecretKey }) {
     )
   );
 }
-
 function proveBoxOwnership({ nonce, mySecretKey, serverEphPublicKey }) {
   const shared = nacl.scalarMult(decodeBase64(mySecretKey), decodeBase64(serverEphPublicKey));
   const mac = hmacSha512(
@@ -67,7 +55,6 @@ function proveBoxOwnership({ nonce, mySecretKey, serverEphPublicKey }) {
   );
   return encodeBase64(mac.slice(0, 32));
 }
-
 function verifyRelayAuth({ cnonce, relaySig, relayPublicKey }) {
   try {
     return nacl.sign.detached.verify(
@@ -79,15 +66,12 @@ function verifyRelayAuth({ cnonce, relaySig, relayPublicKey }) {
     return false;
   }
 }
-
 function prekeyId() {
   return encodeBase64(nacl.randomBytes(9));
 }
-
 function spkMessage(id, pub) {
   return decodeUTF8(SPK_SIG_PREFIX + id + '|' + pub);
 }
-
 function generateSignedPrekey({ signSecretKey }) {
   const pair = nacl.box.keyPair();
   const id = prekeyId();
@@ -102,7 +86,6 @@ function generateSignedPrekey({ signSecretKey }) {
     createdAt: Date.now(),
   };
 }
-
 function verifySignedPrekey({ spk, signPublicKey }) {
   try {
     return nacl.sign.detached.verify(
@@ -114,7 +97,6 @@ function verifySignedPrekey({ spk, signPublicKey }) {
     return false;
   }
 }
-
 function generateOneTimePrekeys(count) {
   const out = [];
   for (let i = 0; i < count; i++) {
@@ -128,7 +110,6 @@ function generateOneTimePrekeys(count) {
   }
   return out;
 }
-
 function encryptMessage({ plaintext, mySecretKey, theirPublicKey, myPublicKey }) {
   const nonce = nacl.randomBytes(nacl.box.nonceLength);
   const content = decodeUTF8(JSON.stringify({ kind: 'text', text: plaintext }));
@@ -145,7 +126,6 @@ function encryptMessage({ plaintext, mySecretKey, theirPublicKey, myPublicKey })
     cipher: encodeBase64(cipher),
   };
 }
-
 function decryptMessage({ envelope, mySecretKey, senderPublicKey }) {
   try {
     const opened = nacl.box.open(
@@ -161,7 +141,6 @@ function decryptMessage({ envelope, mySecretKey, senderPublicKey }) {
     return null;
   }
 }
-
 module.exports = {
   generateIdentity,
   signChallenge,

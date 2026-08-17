@@ -1,17 +1,4 @@
-/**
- * relayModules.test.js — список файлов релея считается, а не ведётся (ВЫС-16).
- *
- * Ручной RELAY_MODULES в install.sh отстал: relay.js требовал mbx.js,
- * mailboxGcs.js и envelopeFrame.js, а установщик их не копировал. Страж ловил
- * это честным отказом — но документированная установка на голое железо не
- * работала вовсе. Здесь проверяется и само замыкание, и главный анкер: файлы,
- * которых недоставало, из настоящего графа relay.js достижимы.
- *
- * Запуск: node server/relayModules.test.js
- */
-
 'use strict';
-
 const assert = require('assert');
 const path = require('path');
 const {
@@ -21,7 +8,6 @@ const {
   moduleClosure,
   relayFileList,
 } = require('./relayModules');
-
 let passed = 0;
 function test(name, fn) {
   fn();
@@ -31,8 +17,6 @@ function test(name, fn) {
 console.log('список файлов релея (ВЫС-16)');
 
 test('локальные require вычитываются, чужие и закомментированные — нет', () => {
-  // Строки собираются конкатенацией, иначе замыкание «--with-tests», читая ЭТОТ
-  // файл, приняло бы выдуманные имена за настоящие зависимости.
   const req = (name) => "require('" + './' + name + "')";
   const source = [
     'const a = ' + req('store') + ';',
@@ -66,43 +50,33 @@ test('замыкание идёт вглубь: зависимость зави�
     'store.js',
   ]);
 });
-
 test('недостижимая зависимость — ошибка с именем виновника, а не молчание', () => {
-  // Молча пропущенный модуль и был исходной поломкой: сервис падал с
-  // MODULE_NOT_FOUND через три секунды после старта и уходил в рестарт-цикл.
   const req = (name) => "require('" + './' + name + "')";
   const io = { readFile: () => req('lost-module'), exists: (n) => n === 'relay.js' };
   assert.throws(() => moduleClosure(['relay.js'], io), /relay\.js требует \.\/lost-module/);
 });
-
 test('цикл require не зацикливает замыкание', () => {
   const req = (name) => "require('" + './' + name + "')";
   const files = { 'a.js': req('b'), 'b.js': req('a') };
   const io = { readFile: (n) => files[n], exists: (n) => n in files };
   assert.deepStrictEqual(moduleClosure(['a.js'], io), ['a.js', 'b.js']);
 });
-
 test('главный анкер: недостававшие модули достижимы из настоящего relay.js', () => {
-  // Ровно те файлы, которых RELAY_MODULES не знал: установка без них падает.
   const list = relayFileList(path.join(__dirname));
   for (const must of ['mbx.js', 'mailboxGcs.js', 'envelopeFrame.js', 'queueAdmission.js']) {
     assert.ok(list.includes(must), `${must} обязан быть в списке — relay.js без него не стартует`);
   }
   assert.ok(list.includes('relay.js'));
-  // Имена названы буквально, а не через константу: опустевшая константа
-  // сделала бы этот цикл пустым, и проверка перестала бы проверять.
   for (const extra of ['package.json', 'vapid-fleet.json']) {
     assert.ok(list.includes(extra), `${extra} — ручное дополнение, но обязан быть в списке`);
   }
   assert.deepStrictEqual([...EXTRA_RUNTIME].sort(), ['package.json', 'vapid-fleet.json']);
   assert.ok(!list.some((name) => name.endsWith('.test.js')), 'тесты в запуск не входят');
 });
-
 test('со «--with-tests» приходят наборы и их помощники', () => {
   const list = relayFileList(path.join(__dirname), { withTests: true });
   for (const must of ['store.test.js', 'test.js', 'test-crypto.js', 'queueAdmission.test.js']) {
     assert.ok(list.includes(must), `${must} нужен прогону тестов в репозитории релея`);
   }
 });
-
 console.log(`\nсписок файлов релея: ${passed} проверок пройдено`);

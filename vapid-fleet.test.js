@@ -1,7 +1,3 @@
-/**
- * Unit tests for the fleet VAPID protocol. No network calls: exercise the
- * signed bundle, member authorization and end-to-end NaCl-box exchange.
- */
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -24,7 +20,6 @@ const {
   readJsonFile,
   writeJsonAtomic,
 } = require('./vapid-fleet');
-
 let passed = 0;
 function test(name, fn) {
   fn();
@@ -33,7 +28,6 @@ function test(name, fn) {
 }
 
 console.log('vapid fleet (signed P2P bootstrap)');
-
 const genesisKeys = nacl.sign.keyPair();
 const followerKeys = nacl.sign.keyPair();
 const dynamicKeys = nacl.sign.keyPair();
@@ -41,7 +35,6 @@ const b64 = (bytes) => naclUtil.encodeBase64(bytes);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-vapid-fleet-'));
 const configPath = path.join(tmp, 'vapid-fleet.json');
 const bundlePath = path.join(tmp, 'vapid.json');
-
 fs.writeFileSync(
   configPath,
   JSON.stringify({
@@ -57,20 +50,17 @@ fs.writeFileSync(
   })
 );
 const config = loadFleetConfig(configPath);
-
 function configFile(name, value) {
   const filename = path.join(tmp, name);
   fs.writeFileSync(filename, JSON.stringify(value));
   return filename;
 }
-
 try {
   test('fleet config loads pinned genesis and dynamic future member', () => {
     assert.strictEqual(config.genesis, 'wss://genesis.example.com');
     assert.strictEqual(memberFor(config, 'wss://FOLLOWER.example.com/').relayPub, b64(followerKeys.publicKey));
     assert.strictEqual(memberFor(config, 'wss://new.example.com').allowDynamicKey, true);
   });
-
   test('fleet config rejects every malformed trust boundary', () => {
     const base = {
       version: 1,
@@ -94,7 +84,6 @@ try {
     assert.strictEqual(memberAcceptsKey({ relayPub: null }, throwingString), false);
     assert.strictEqual(validVapidPair(throwingString, 'x'), false);
   });
-
   const vapid = generateVapidKeys();
   let bundle;
   test('genesis signs a valid VAPID pair and tampering is rejected', () => {
@@ -105,7 +94,6 @@ try {
     assert.strictEqual(verifyVapidBundle({ ...bundle, epoch: 2 }, config), false);
     assert.strictEqual(verifyVapidBundle(bundle, { ...config, relays: [] }), false);
   });
-
   test('allowed follower performs signed request and decrypts the exact genesis bundle', () => {
     const pending = createVapidRequest({
       config,
@@ -159,7 +147,6 @@ try {
       null
     );
   });
-
   test('unknown identity is rejected, pre-authorized dynamic server is accepted', () => {
     const stranger = nacl.sign.keyPair();
     assert.throws(() =>
@@ -178,19 +165,16 @@ try {
     });
     assert.ok(verifyVapidRequest(dynamic.request, config));
   });
-
   test('source IP comparison handles IPv4-mapped IPv6 and rejects another host', () => {
     assert.strictEqual(sourceMatchesResolved('::ffff:203.0.113.7', [{ address: '203.0.113.7' }]), true);
     assert.strictEqual(sourceMatchesResolved('203.0.113.8', [{ address: '203.0.113.7' }]), false);
   });
-
   test('bundle persistence is atomic and readable', () => {
     writeJsonAtomic(bundlePath, bundle);
     assert.deepStrictEqual(readJsonFile(bundlePath), bundle);
     assert.strictEqual(verifyVapidBundle(readJsonFile(bundlePath), config), true);
     assert.strictEqual(readJsonFile(path.join(tmp, 'missing.json')), null);
   });
-
   console.log(`\nvapid fleet: ${passed} passed`);
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
