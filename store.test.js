@@ -628,7 +628,7 @@ function deviceCertificate(accountPk, rootSignPk, id, pk, signPk, issuedAt = 100
     devicePublicKey: pk,
     deviceSignPublicKey: signPk,
     name: id === 'phone' ? 'Телефон Android' : 'Второе устройство',
-    platform: id === 'phone' ? 'android' : 'windows',
+    platform: id === 'phone' ? 'android' : 'web',
     issuedAt,
     capabilities: ['files', 'history-sync', 'messages', 'notifications', 'voice'],
     rootSignature: 'signed-' + id,

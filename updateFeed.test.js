@@ -228,4 +228,40 @@ test('КАН-1: тестового манифеста нет на диске —
   const stable = manifestResponse({ dir: DIR, platform: 'android', channel: 'stable', read });
   assert.strictEqual(stable.status, 200, stable.reason);
 });
+test('КАН-2: файл тестового канала отдаётся отдельным именем и не подменяет проверенный', () => {
+  const files = {
+    [path.join(DIR, 'licno-android.apk')]: 111,
+    [path.join(DIR, 'licno-android-canary.apk')]: 222,
+  };
+  const stat = (target) => {
+    if (!Object.prototype.hasOwnProperty.call(files, target)) throw new Error('нет файла');
+    return { size: files[target] };
+  };
+  const stable = fileResponse({ dir: DIR, platform: 'android', stat });
+  assert.strictEqual(stable.status, 200, stable.reason);
+  assert.strictEqual(stable.size, 111);
+  assert.strictEqual(stable.filename, 'licno-android.apk');
+  const canary = fileResponse({ dir: DIR, platform: 'android', channel: 'canary', stat });
+  assert.strictEqual(canary.status, 200, canary.reason);
+  assert.strictEqual(canary.size, 222, 'тестовый канал отдал проверенный файл');
+  assert.strictEqual(canary.filename, 'licno-android-canary.apk');
+  assert.notStrictEqual(stable.path, canary.path, 'оба канала показывают на один файл');
+  assert.strictEqual(
+    fileResponse({ dir: DIR, platform: 'android', channel: 'nightly', stat }).status,
+    404,
+    'незнакомый канал получил файл'
+  );
+});
+test('КАН-2: тестового файла нет на диске — 404, проверенный при этом жив', () => {
+  const stat = (target) => {
+    if (target !== path.join(DIR, 'licno-android.apk')) throw new Error('нет файла');
+    return { size: 111 };
+  };
+  assert.strictEqual(
+    fileResponse({ dir: DIR, platform: 'android', channel: 'canary', stat }).status,
+    404,
+    'отдан тестовый файл, которого нет'
+  );
+  assert.strictEqual(fileResponse({ dir: DIR, platform: 'android', stat }).status, 200);
+});
 console.log(`раздача обновлений: ${passed} проверок пройдено`);

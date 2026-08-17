@@ -1,56 +1,24 @@
-# Релей «Лично» одной командой:  docker compose up -d
-#
-# Перед запуском скопируйте .env.example -> .env и заполните его. Caddy сам
-# получит TLS-сертификат Let's Encrypt для RELAY_HOST, так что приложение сразу
-# видит рабочий wss://. Звонки (TURN) включены по умолчанию — coturn поднимается
-# вместе с релеем.
-#
-# Все сервисы имеют restart: unless-stopped и поднимаются автоматически после
-# перезагрузки. watchtower авто-обновляет релей при выходе новой версии образа —
-# вручную обновлять каждый сервер не нужно (см. README, раздел «Авто-обновление»).
-
 services:
   relay:
-    # Флот следит за каналом :stable. Обновление применяет верифицированный
-    # апдейтер на хосте (deploy/licno-update.sh): он ПРОВЕРЯЕТ cosign-подпись
-    # образа перед тем как поднять его (H-1). Никакого контейнера с docker.sock.
     image: ghcr.io/o34183901-gif/relay:${LICNO_CHANNEL:-stable}
-    # Локальная сборка вместо готового образа (тогда авто-обновление не работает):
-    # build: .
     restart: unless-stopped
     environment:
       RELAY_SELF_URL: ${RELAY_SELF_URL}
       RELAY_PEERS: ${RELAY_PEERS:-}
-      # За Caddy реальный IP клиента приходит в конце X-Forwarded-For (один хоп) —
-      # чтобы per-IP лимиты считались по клиенту, а не по адресу Caddy.
       RELAY_TRUST_PROXY: "1"
-      # Опционально (безопасность/эксплуатация). Пусто/дефолт — мягкий режим:
-      #   RELAY_GOSSIP_TOKEN   — общий токен HTTP-gossip между вашими релеями
-      #   RELAY_METRICS_TOKEN  — токен для /metrics (без него endpoint открыт)
-      #   RELAY_MAX_QUEUE_BYTES— байтовый потолок очереди (по умолчанию 8 ГБ)
       RELAY_GOSSIP_TOKEN: ${RELAY_GOSSIP_TOKEN:-}
       RELAY_METRICS_TOKEN: ${RELAY_METRICS_TOKEN:-}
       RELAY_MAX_QUEUE_BYTES: ${RELAY_MAX_QUEUE_BYTES:-8589934592}
-      # H-2: TURN_SECRET релею больше НЕ передаётся — он сам генерирует секрет и
-      # хранит его в data-томе (0600), сам пишет конфиг coturn. RELAY_EMBED_COTURN=1
-      # включает встроенный coturn (turnserver дочерним процессом ЭТОГО контейнера)
-      # — отдельный сервис coturn не нужен, весь TURN едет в образе (автономно).
       TURN_HOST: ${TURN_HOST}
       RELAY_EMBED_COTURN: "1"
     volumes:
       - relay-data:/data
     expose:
       - "8787"
-    # Порты TURN для звонков: сигналинг/STUN (3478) и диапазон медиа-ретрансляции.
-    # Публичный IP клиентам сообщается через external-ip=TURN_HOST в конфиге coturn.
-    # Открыть в firewall: 3478/tcp, 3478/udp, 49160-49200/udp.
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49160-49200:49160-49200/udp"
-    # M-3/M-7: харденинг и ресурсные лимиты — RCE/утечка в контейнере не должна
-    # повышать права или положить хост памятью/форк-бомбой. Значения tunable под
-    # нагрузку (RELAY_MEM_LIMIT/RELAY_PIDS_LIMIT в .env); дефолты — с запасом.
     security_opt:
       - no-new-privileges:true
     mem_limit: ${RELAY_MEM_LIMIT:-2g}
@@ -69,11 +37,6 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    # C-6: харденинг Caddy — сбрасываем ВСЕ Linux-capabilities, оставляя только
-    # NET_BIND_SERVICE (нужен для привязки к 80/443), и делаем корень контейнера
-    # read-only. Caddy пишет только в тома /data (сертификаты) и /config и в /tmp
-    # (tmpfs ниже) — этого достаточно. Сужает поверхность при компрометации Caddy.
-    # ВАЖНО: проверить на канареечном сервере перед раскаткой на флот.
     cap_drop:
       - ALL
     cap_add:
@@ -85,17 +48,6 @@ services:
       - no-new-privileges:true
     mem_limit: 256m
     pids_limit: 256
-
-  # TURN-сервер для звонков теперь ВСТРОЕН в контейнер relay (RELAY_EMBED_COTURN):
-  # релей сам запускает turnserver дочерним процессом и владеет секретом/конфигом.
-  # Отдельного сервиса coturn больше нет — его удаление применяется командой
-  # `docker compose up -d --remove-orphans`.
-
-  # Авто-обновление БОЛЬШЕ НЕ через watchtower (H-1): его заменил верифицированный
-  # апдейтер на хосте — systemd-таймер, который проверяет cosign-подпись образа
-  # :stable ПЕРЕД применением и не монтирует docker.sock в контейнер. Установка
-  # разово: `sudo bash deploy/install-updater.sh` (см. deploy/ и README).
-  # Старый сервис watchtower удаляется командой `docker compose up -d --remove-orphans`.
 
 volumes:
   relay-data:

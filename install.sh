@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-#
-# Установщик релея «Лично» для Ubuntu 22.04 / 24.04.
-#
-# Использование (от root или через sudo):
-#
-#   # Вариант A — с настоящим TLS через бесплатный sslip.io (РЕКОМЕНДУЕТСЯ):
-#   #   HOST = <IP-с-точками>.sslip.io, напр. 203.0.113.7.sslip.io
-#   sudo bash install.sh 203.0.113.7.sslip.io
-#
-#   # Вариант B — свой домен (A-запись уже указывает на сервер):
-#   sudo bash install.sh relay.example.com
-#
-#   # Вариант C — без TLS, чистый ws:// на порту 8787 (быстрый тест):
-#   sudo bash install.sh --plain
-#
-# В приложении «Лично» затем указываете адрес сервера:
-#   Вариант A/B ->  wss://<HOST>
-#   Вариант C   ->  ws://<IP>:8787
-#
 set -euo pipefail
 
 MODE="tls"
@@ -42,10 +23,7 @@ apt-get update -y
 apt-get install -y curl ca-certificates gnupg ufw
 
 log "Установка Node.js 20 (если нужно)"
-# ДПЛ-7: корректно извлекаем МАЖОРНУЮ версию. Прежнее `cut -c2-3` на однозначном
-# мажоре (`v8.x` -> "8.") давало нечисловое сравнение и ломало ветку установки.
-NODE_MAJOR="$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')"
-if ! command -v node >/dev/null || [ "${NODE_MAJOR:-0}" -lt 18 ]; then
+if ! command -v node >/dev/null || [[ "$(node -v | cut -c2-3)" -lt 18 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 fi
@@ -53,41 +31,42 @@ node -v
 
 log "Копирование релея в ${APP_DIR}"
 mkdir -p "$APP_DIR"
-# скрипт лежит рядом с relay.js/package.json — копируем их
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp \
-  "$SRC_DIR/relay.js" "$SRC_DIR/relays.js" "$SRC_DIR/store.js" "$SRC_DIR/push.js" \
-  "$SRC_DIR/vapid-fleet.js" "$SRC_DIR/vapid-fleet.json" \
-  "$SRC_DIR/package.json" \
-  "$APP_DIR/"
-# C-4: тащим и lockfile — установка должна быть воспроизводимой (как npm ci в Docker).
+if [[ ! -f "$SRC_DIR/relayModules.js" ]]; then
+  echo "ОШИБКА: рядом с установщиком нет relayModules.js. Копируйте каталог server/ целиком." >&2
+  exit 1
+fi
+if ! RELAY_MODULES="$(node "$SRC_DIR/relayModules.js" "$SRC_DIR")"; then
+  echo "ОШИБКА: не удалось собрать список модулей релея. Копируйте каталог server/ целиком." >&2
+  exit 1
+fi
+while IFS= read -r module; do
+  [[ -n "$module" ]] || continue
+  if [[ ! -f "$SRC_DIR/$module" ]]; then
+    echo "ОШИБКА: рядом с установщиком нет ${module}. Копируйте каталог server/ целиком." >&2
+    exit 1
+  fi
+  cp "$SRC_DIR/$module" "$APP_DIR/"
+done <<< "$RELAY_MODULES"
 [[ -f "$SRC_DIR/package-lock.json" ]] && cp "$SRC_DIR/package-lock.json" "$APP_DIR/"
+
+missing=""
+for file in "$APP_DIR"/*.js; do
+  while read -r dep; do
+    [[ -f "$APP_DIR/${dep}.js" || -f "$APP_DIR/${dep}.json" || -f "$APP_DIR/${dep}" ]] || missing="${missing} ${dep}"
+  done < <(grep -oE "require\('\./[a-zA-Z0-9_.-]+'\)" "$file" | sed "s/require('\.\///; s/')//")
+done
+if [[ -n "$missing" ]]; then
+  echo "ОШИБКА: не скопированы модули релея:${missing}" >&2
+  echo "Это расхождение relayModules.js со стражем — почините сбор списка." >&2
+  exit 1
+fi
+
 cd "$APP_DIR"
-# build-tools нужны для нативного модуля better-sqlite3 (встроенное хранилище)
-apt-get install -y --no-install-recommends python3 make g++ || true
-# C-4: при наличии лока ставим строго по нему (npm ci) — фиксированные версии на
-# security-critical узле (typosquat/сдвиг версии не подъедет). Без лока — деградируем
-# до npm install с явным предупреждением.
 if [[ -f "$APP_DIR/package-lock.json" ]]; then
   npm ci --omit=dev
 else
-  echo "WARN: package-lock.json отсутствует — установка без фиксации версий (npm install)" >&2
   npm install --omit=dev
-fi
-
-# Optional FCM push: if a Firebase service-account JSON is present next to the
-# installer, wire it in so offline users get wake-up notifications. Project id
-# is read from the file itself.
-FCM_ENV=""
-if [[ -f "$SRC_DIR/service-account.json" ]]; then
-  cp "$SRC_DIR/service-account.json" "$APP_DIR/service-account.json"
-  chmod 600 "$APP_DIR/service-account.json"
-  FCM_PROJECT_ID="$(node -e "console.log(require('$APP_DIR/service-account.json').project_id)")"
-  FCM_ENV="Environment=GOOGLE_APPLICATION_CREDENTIALS=${APP_DIR}/service-account.json
-Environment=FCM_PROJECT_ID=${FCM_PROJECT_ID}"
-  log "FCM настроен для проекта ${FCM_PROJECT_ID}"
-else
-  log "service-account.json не найден — пуши при закрытом приложении отключены (релей работает)"
 fi
 
 log "Установка и настройка TURN-сервера (coturn) для звонков"
@@ -99,8 +78,8 @@ if [[ -f "$TURN_SECRET_FILE" ]]; then
 else
   TURN_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   echo -n "$TURN_SECRET" > "$TURN_SECRET_FILE"
-  chmod 600 "$TURN_SECRET_FILE"
 fi
+chmod 600 "$TURN_SECRET_FILE"
 
 cat >/etc/turnserver.conf <<TURN
 listening-port=3478
@@ -111,13 +90,11 @@ realm=licno
 no-tls
 no-dtls
 no-cli
+no-multicast-peers
 min-port=49160
 max-port=49200
 external-ip=${PUBIP}
 simple-log
-# M-4: не ретранслировать во внутренние сети/облачные метаданные/loopback/multicast
-# (иначе coturn становится open-relay и SSRF-плацдармом во внутреннюю сеть).
-no-multicast-peers
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255
 denied-peer-ip=100.64.0.0-100.127.255.255
@@ -125,20 +102,13 @@ denied-peer-ip=127.0.0.0-127.255.255.255
 denied-peer-ip=169.254.0.0-169.254.255.255
 denied-peer-ip=172.16.0.0-172.31.255.255
 denied-peer-ip=192.168.0.0-192.168.255.255
-# C-3: IPv6-диапазоны (dual-stack VPS обычно имеет публичный IPv6). Без них
-# coturn ретранслировал бы на внутренний IPv6 / IPv6 облачных метаданных —
-# неполный M-4 на bare-metal. Совпадает с COTURN_DENIED_RANGES в relays.js.
 denied-peer-ip=::1
 denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 TURN
-# C-2: конфиг содержит static-auth-secret — закрываем от чтения другими локальными
-# пользователями (раньше создавался с umask по умолчанию, 0644 = мир мог прочитать
-# TURN-секрет и минтить валидные эфемерные креды). Владелец — пользователь coturn.
-chmod 600 /etc/turnserver.conf
-chown turnserver:turnserver /etc/turnserver.conf 2>/dev/null || true
+chmod 640 /etc/turnserver.conf
+chown root:turnserver /etc/turnserver.conf 2>/dev/null || true
 
-# enable the coturn systemd service
 sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null || true
 grep -q '^TURNSERVER_ENABLED=1' /etc/default/coturn 2>/dev/null || echo 'TURNSERVER_ENABLED=1' >> /etc/default/coturn
 systemctl enable coturn || true
@@ -148,24 +118,19 @@ ufw allow 3478/udp || true
 ufw allow 49160:49200/udp || true
 log "TURN готов на ${PUBIP}:3478"
 
-# C-1: НЕ прокидываем сам секрет в systemd-юнит (юнит пишется 0644 — мир прочёл бы
-# TURN_SECRET через файл юнита или `systemctl show -p Environment`). Передаём ПУТЬ к
-# файлу-секрету (0600, владелец licno) — relay.js читает его через resolveTurnSecret.
-TURN_ENV="Environment=TURN_SECRET_FILE=${TURN_SECRET_FILE}
-Environment=TURN_HOST=${PUBIP}"
+RELAY_ENV_FILE="${APP_DIR}/relay.env"
+cat > "$RELAY_ENV_FILE" <<ENVFILE
+TURN_SECRET=${TURN_SECRET}
+TURN_HOST=${PUBIP}
+ENVFILE
+chmod 600 "$RELAY_ENV_FILE"
+TURN_ENV="EnvironmentFile=${RELAY_ENV_FILE}"
 
-# --- каталог релеев (gossip): анонсируем себя и стартовых соседей ------------
-# RELAY_SELF_URL — публичный адрес ЭТОГО релея, кладётся в общий каталог, чтобы
-# другие узнали о нём. RELAY_PEERS — стартовые соседи (через запятую), из чьих
-# каталогов мы подтянем остальную сеть. Задать соседей можно так:
-#   sudo RELAY_PEERS="wss://relay-a.example.com,wss://relay-b.example.com" bash install.sh <HOST>
 if [[ "$MODE" == "tls" ]]; then
   SELF_URL="wss://${HOST}"
 else
   SELF_URL="ws://${PUBIP:-$(curl -fsSL https://api.ipify.org || echo 127.0.0.1)}:8787"
 fi
-# L-8: RELAY_DIR удалён — relay.js его не читает (мёртвая настройка). Каталог
-# релеев живёт в SQLite-БД (RELAY_DB), отдельный путь не нужен.
 DIR_ENV="Environment=RELAY_SELF_URL=${SELF_URL}"
 if [[ -n "${RELAY_PEERS:-}" ]]; then
   DIR_ENV="${DIR_ENV}
@@ -174,24 +139,19 @@ Environment=RELAY_PEERS=${RELAY_PEERS}"
 fi
 log "Этот релей анонсирует себя как: ${SELF_URL}"
 
-log "Создание systemd-сервиса ${SERVICE}"
-# M-2: за Caddy (TLS-режим) реальный IP клиента приходит в X-Forwarded-For —
-# доверяем одному прокси, чтобы per-IP лимиты считались по клиенту, а не по адресу
-# Caddy. В plain-режиме прокси нет, поэтому XFF НЕ доверяем (его можно подделать).
+RELAY_USER="licno"
+if ! id -u "$RELAY_USER" >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$RELAY_USER"
+fi
+mkdir -p "$APP_DIR/blobs"
+chown -R "$RELAY_USER":"$RELAY_USER" "$APP_DIR"
+
+TRUST_ENV=""
 if [[ "$MODE" == "tls" ]]; then
-  PROXY_ENV="Environment=RELAY_TRUST_PROXY=1"
-else
-  PROXY_ENV=""
+  TRUST_ENV="Environment=RELAY_TRUST_PROXY=1"
 fi
 
-# ДПЛ-2: выделенный непривилегированный пользователь. Сетевой сервис с недоверенным
-# вводом не должен работать от root — RCE/повреждение памяти иначе даёт root на всей
-# машине. Создаём пользователя и передаём ему рабочий каталог (БД/blobs/секреты).
-if ! id -u licno >/dev/null 2>&1; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin licno
-fi
-chown -R licno:licno "${APP_DIR}"
-
+log "Создание systemd-сервиса ${SERVICE}"
 cat >/etc/systemd/system/${SERVICE}.service <<UNIT
 [Unit]
 Description=Licno relay (encrypted store-and-forward)
@@ -203,21 +163,19 @@ WorkingDirectory=${APP_DIR}
 ExecStart=/usr/bin/node ${APP_DIR}/relay.js
 Environment=PORT=8787
 Environment=RELAY_DB=${APP_DIR}/relay.db
+Environment=RELAY_BLOB_DIR=${APP_DIR}/blobs
+${TRUST_ENV}
 ${DIR_ENV}
-${FCM_ENV}
 ${TURN_ENV}
-${PROXY_ENV}
 Restart=always
 RestartSec=3
-# ДПЛ-2: под выделенным пользователем + ProtectSystem=strict (вся ФС read-only,
-# кроме ReadWritePaths). RCE в релее не даёт ни root, ни записи вне рабочего каталога.
-User=licno
-Group=licno
-NoNewPrivileges=yes
+User=${RELAY_USER}
+Group=${RELAY_USER}
+NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 ReadWritePaths=${APP_DIR}
-ProtectHome=yes
-PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -225,7 +183,6 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable ${SERVICE}
-# restart (not just --now) so an already-running service picks up new code
 systemctl restart ${SERVICE}
 
 log "Настройка firewall (ufw)"

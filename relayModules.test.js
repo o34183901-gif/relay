@@ -7,6 +7,7 @@ const {
   resolveDependency,
   moduleClosure,
   relayFileList,
+  APP_ONLY_TESTS,
 } = require('./relayModules');
 let passed = 0;
 function test(name, fn) {
@@ -75,8 +76,19 @@ test('главный анкер: недостававшие модули дос�
 });
 test('со «--with-tests» приходят наборы и их помощники', () => {
   const list = relayFileList(path.join(__dirname), { withTests: true });
-  for (const must of ['store.test.js', 'test.js', 'test-crypto.js', 'queueAdmission.test.js']) {
+  for (const must of ['store.test.js', 'test.js', 'test-crypto.js', 'queueAdmission.test.js', 'ntfy.test.js']) {
     assert.ok(list.includes(must), `${must} нужен прогону тестов в репозитории релея`);
   }
+});
+test('наборы про сборку остаются в мессенджере и в раздачу не уезжают', () => {
+  const list = relayFileList(path.join(__dirname), { withTests: true });
+  for (const appOnly of APP_ONLY_TESTS) {
+    assert.ok(
+      !list.includes(appOnly),
+      `${appOnly} уедет в repo relay и упадёт там: он проверяет дерево мессенджера, которого в раздаче нет`
+    );
+  }
+  assert.ok(!list.includes('relayInfra.js'), 'модуль списка инфраструктуры в раздаче не нужен');
+  assert.ok(APP_ONLY_TESTS.has('relayInfra.test.js'), 'набор инфраструктуры выпал из исключений');
 });
 console.log(`\nсписок файлов релея: ${passed} проверок пройдено`);

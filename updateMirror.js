@@ -4,7 +4,7 @@ const crypto = require('crypto');
 
 const { verifyUpdateManifest, isNewerVersion, filesPayload } = require('./updateManifest');
 const DEFAULT_SOURCE = 'https://raw.githubusercontent.com/o34183901-gif/relay/main';
-const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
+const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
@@ -14,6 +14,7 @@ function manifestUrl(source, platform, channel) {
   if (platform === 'android' && channel === 'canary') return `${base}/android-canary-version.json`;
   if (channel === 'canary') return '';
   if (platform === 'android') return `${base}/android-version.json`;
+  if (platform === 'distributor') return `${base}/distributor-version.json`;
   if (platform === 'web') return `${base}/web-version.json`;
   return '';
 }

@@ -1,5 +1,3 @@
-const fs = require('fs');
-const path = require('path');
 const dns = require('dns').promises;
 const https = require('https');
 const webpush = require('web-push');
@@ -10,92 +8,6 @@ function pinnedLookup(pinned) {
     if (options && options.all) return cb(null, pinned);
     cb(null, pinned[0].address, pinned[0].family);
   };
-}
-
-function loadGoogleAuth(load = require) {
-  try {
-    return load('google-auth-library').GoogleAuth || null;
-  } catch (e) {
-    return null;
-  }
-}
-const GoogleAuth = loadGoogleAuth();
-function autoDetectCredentials() {
-  const candidates = [
-    process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    path.join(path.dirname(process.env.RELAY_DB || path.join(__dirname, 'relay.db')), 'service-account.json'),
-    path.join(__dirname, 'service-account.json'),
-  ].filter(Boolean);
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch (e) {
-    }
-  }
-  return null;
-}
-
-const CREDENTIALS_FILE = autoDetectCredentials();
-function applyCredentialsFile(credentialsFile, env = process.env) {
-  if (credentialsFile && !env.GOOGLE_APPLICATION_CREDENTIALS) {
-    env.GOOGLE_APPLICATION_CREDENTIALS = credentialsFile;
-  }
-}
-applyCredentialsFile(CREDENTIALS_FILE);
-function detectProjectId(credentialsFile = CREDENTIALS_FILE, env = process.env, readFile = fs.readFileSync) {
-  if (env.FCM_PROJECT_ID) return env.FCM_PROJECT_ID;
-  if (!credentialsFile) return null;
-  try {
-    return JSON.parse(readFile(credentialsFile, 'utf8')).project_id || null;
-  } catch (e) {
-    return null;
-  }
-}
-const PROJECT_ID = detectProjectId();
-let auth = null;
-let warned = false;
-function ready(options = {}) {
-  const {
-    projectId = PROJECT_ID,
-    env = process.env,
-    googleAuth = GoogleAuth,
-    log = console.log,
-  } = options || {};
-  if (projectId && env.GOOGLE_APPLICATION_CREDENTIALS && googleAuth) return true;
-  if (!warned) {
-    log('[push] FCM not configured — skipping wake-up pushes');
-    warned = true;
-  }
-  return false;
-}
-async function accessToken() {
-  if (!auth) {
-    auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/firebase.messaging'] });
-  }
-  const client = await auth.getClient();
-  const t = await client.getAccessToken();
-  return t.token;
-}
-async function fcmSend(message) {
-  if (!ready()) return false;
-  try {
-    const at = await accessToken();
-    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${at}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.log('[push] FCM error', res.status, text.slice(0, 200));
-      if (res.status === 404 || res.status === 400) return 'invalid';
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.log('[push] send failed:', e.message);
-    return false;
-  }
 }
 const UP_MAX_ENDPOINT_LEN = 512;
 const UP_MAX_SUB_LEN = 1024;
@@ -204,95 +116,64 @@ async function unifiedPushSend(sub, notification, address) {
 async function sendPush(token, messageId, chatTag, address) {
   if (!token) return false;
   const sub = parseSubscription(token);
+  if (!sub) return 'invalid';
   const safeMessageId = typeof messageId === 'string' ? messageId.slice(0, 160) : '';
   const safeChatTag =
     typeof chatTag === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(chatTag) ? chatTag : '';
-  if (sub) {
-    return unifiedPushSend(
-      sub,
-      {
-        id: MESSAGE_NOTIFICATION_ID,
-        title: 'Лично',
-        body: 'Новое зашифрованное сообщение',
-        type: 'message',
-        messageId: safeMessageId,
-        chatTag: safeChatTag,
-        data: { type: 'message', messageId: safeMessageId, chatTag: safeChatTag },
-      },
-      address
-    );
-  }
-  return fcmSend(messageFcmPayload(token));
-}
-function messageFcmPayload(token) {
-  return {
-    token,
-    notification: { title: 'Лично', body: 'Новое зашифрованное сообщение' },
-    android: { priority: 'HIGH', notification: { channel_id: 'messages', tag: 'new-message' } },
-    data: { type: 'message' },
-  };
+  return unifiedPushSend(
+    sub,
+    {
+      id: MESSAGE_NOTIFICATION_ID,
+      title: 'Лично',
+      body: 'Новое зашифрованное сообщение',
+      type: 'message',
+      messageId: safeMessageId,
+      chatTag: safeChatTag,
+      data: { type: 'message', messageId: safeMessageId, chatTag: safeChatTag },
+    },
+    address
+  );
 }
 async function sendCallPush(token, address) {
   if (!token) return false;
   const sub = parseSubscription(token);
-  if (sub) {
-    return unifiedPushSend(
-      sub,
-      {
-        id: CALL_NOTIFICATION_ID,
-        title: 'Входящий звонок',
-        body: 'Нажмите, чтобы ответить',
-        type: 'call',
-        data: { type: 'call' },
-      },
-      address
-    );
-  }
-  return fcmSend({
-    token,
-    notification: { title: 'Входящий звонок', body: 'Нажмите, чтобы ответить' },
-    android: {
-      priority: 'HIGH',
-      notification: { channel_id: 'calls', sound: 'default', tag: 'incoming-call' },
+  if (!sub) return 'invalid';
+  return unifiedPushSend(
+    sub,
+    {
+      id: CALL_NOTIFICATION_ID,
+      title: 'Входящий звонок',
+      body: 'Нажмите, чтобы ответить',
+      type: 'call',
+      data: { type: 'call' },
     },
-    data: { type: 'call' },
-  });
+    address
+  );
 }
 async function sendTestPush(token, testId, channel = 'message', address) {
   if (!token || typeof testId !== 'string' || !testId) return false;
-  const isCall = channel === 'call';
-  const notification = {
-    title: 'Лично · проверка уведомлений',
-    body: isCall ? 'Проверка канала аудио- и видеозвонков' : 'Проверка канала сообщений',
-    type: 'push-test',
-    testId,
-    channel: isCall ? 'call' : 'message',
-  };
   const sub = parseSubscription(token);
-  if (sub) return unifiedPushSend(sub, notification, address);
-  return fcmSend({
-    token,
-    notification: { title: notification.title, body: notification.body },
-    android: {
-      priority: 'HIGH',
-      notification: {
-        channel_id: isCall ? 'calls' : 'messages',
-        tag: `push-test-${isCall ? 'call' : 'message'}`,
-        sound: isCall ? 'default' : undefined,
-      },
+  if (!sub) return 'invalid';
+  const isCall = channel === 'call';
+  return unifiedPushSend(
+    sub,
+    {
+      title: 'Лично · проверка уведомлений',
+      body: isCall ? 'Проверка канала аудио- и видеозвонков' : 'Проверка канала сообщений',
+      type: 'push-test',
+      testId,
+      channel: isCall ? 'call' : 'message',
     },
-    data: { type: 'push-test', testId, channel: notification.channel },
-  });
+    address
+  );
 }
 function generateVapidKeys() {
   return webpush.generateVAPIDKeys();
 }
 module.exports = {
   sendPush,
-  messageFcmPayload,
   sendCallPush,
   sendTestPush,
-  pushReady: ready,
   setVapidKeys,
   vapidPublicKey,
   vapidPublicKeyFor,
@@ -300,7 +181,4 @@ module.exports = {
   isUnifiedPushEndpoint,
   validUnifiedPushEndpoint,
   parseSubscription,
-  loadGoogleAuth,
-  applyCredentialsFile,
-  detectProjectId,
 };

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const EXTRA_RUNTIME = ['package.json', 'vapid-fleet.json'];
+const APP_ONLY_TESTS = new Set(['relayInfra.test.js']);
 function localRequires(source) {
   const out = new Set();
   const pattern = /require\('\.\/([a-zA-Z0-9_.-]+)'\)/g;
@@ -49,7 +50,7 @@ function relayFileList(dir, { withTests = false } = {}) {
   const entries = ['relay.js', ...EXTRA_RUNTIME];
   if (withTests) {
     for (const file of fs.readdirSync(dir)) {
-      if (file.endsWith('.test.js')) entries.push(file);
+      if (file.endsWith('.test.js') && !APP_ONLY_TESTS.has(file)) entries.push(file);
     }
     if (io.exists('test.js')) entries.push('test.js');
     if (io.exists('package-lock.json')) entries.push('package-lock.json');
@@ -58,6 +59,7 @@ function relayFileList(dir, { withTests = false } = {}) {
 }
 module.exports = {
   EXTRA_RUNTIME,
+  APP_ONLY_TESTS,
   localRequires,
   resolveDependency,
   moduleClosure,

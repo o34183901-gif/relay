@@ -11,7 +11,6 @@ const {
   sendPush,
   sendCallPush,
   sendTestPush,
-  pushReady,
   setVapidKeys,
   vapidPublicKey,
   vapidPublicKeyFor,
@@ -24,6 +23,7 @@ const mbx = require('./mbx');
 const { createHttpRateLimit } = require('./httpRateLimit');
 
 const updateFeed = require('./updateFeed');
+const ntfy = require('./ntfy');
 const updateMirror = require('./updateMirror');
 const webApp = require('./webApp');
 const landing = require('./landing');
@@ -212,6 +212,8 @@ const counters = {
   updateManifestServed: 0,
   updateFileServed: 0,
   updateHttpLimited: 0,
+  ntfyProxied: 0,
+  ntfyProxyErrors: 0,
 };
 const EVENT_LOOP_PROBE_MS = 500;
 const LAG_WINDOW = 120;
@@ -361,6 +363,18 @@ function renderMetrics() {
     'counter',
     'Отказов раздачи обновлений по частоте (ОБН-2). Рост — узел качают как файлопомойку.',
     counters.updateHttpLimited
+  );
+  metric(
+    'licno_ntfy_proxied_total',
+    'counter',
+    'Запросов, переданных встроенному серверу уведомлений (УВД-4). Ноль при живом флоте — уведомления не доходят.',
+    counters.ntfyProxied
+  );
+  metric(
+    'licno_ntfy_proxy_errors_total',
+    'counter',
+    'Сбоев передачи встроенному серверу уведомлений (УВД-4). Рост — процесс ntfy упал или не слушает порт.',
+    counters.ntfyProxyErrors
   );
   return lines.join('\n') + '\n';
 }
@@ -863,6 +877,151 @@ function stopEmbeddedCoturn() {
     coturnChild = null;
   }
 }
+const NTFY_ON = ntfy.ntfyEnabled(process.env);
+const NTFY_PORT = ntfy.ntfyPort(process.env);
+const NTFY_DIR = process.env.RELAY_NTFY_DIR || path.join(path.dirname(DB_FILE), 'ntfy');
+const NTFY_CONF_FILE = path.join(NTFY_DIR, 'server.yml');
+const NTFY_BIN = process.env.RELAY_NTFY_BIN || 'ntfy';
+let ntfyChild = null;
+let ntfyStopped = false;
+function writeNtfyConfig() {
+  fs.mkdirSync(NTFY_DIR, { recursive: true });
+  fs.writeFileSync(
+    NTFY_CONF_FILE,
+    ntfy.ntfyConfigText({
+      baseUrl: ntfy.ntfyBaseUrl(SELF_URL),
+      port: NTFY_PORT,
+      cacheFile: path.join(NTFY_DIR, 'cache.db'),
+    }),
+    { mode: 0o600 }
+  );
+}
+function startEmbeddedNtfy() {
+  if (ntfyChild || ntfyStopped) return;
+  const { spawn } = require('child_process');
+  try {
+    ntfyChild = spawn(NTFY_BIN, ['serve', '--config', NTFY_CONF_FILE], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+  } catch (e) {
+    console.warn('[ntfy] встроенный сервер уведомлений не запустился:', e && e.message);
+    ntfyChild = null;
+    return;
+  }
+  ntfyChild.on('error', (e) => console.warn('[ntfy]', e && e.message));
+  ntfyChild.on('exit', (code, sig) => {
+    ntfyChild = null;
+    if (ntfyStopped) return;
+    console.warn(`[ntfy] сервер уведомлений завершился (code=${code} sig=${sig}) — перезапуск через 3с`);
+    setTimeout(startEmbeddedNtfy, 3000).unref();
+  });
+  console.log(`[ntfy] встроенный сервер уведомлений запущен на 127.0.0.1:${NTFY_PORT}, путь ${ntfy.NTFY_PREFIX}`);
+}
+function stopEmbeddedNtfy() {
+  ntfyStopped = true;
+  if (ntfyChild) {
+    try {
+      ntfyChild.kill('SIGTERM');
+    } catch (e) {
+    }
+    ntfyChild = null;
+  }
+}
+function ntfyStatus() {
+  if (!NTFY_ON) return 'off';
+  return ntfyChild ? 'running' : 'starting';
+}
+function proxyToNtfy(req, res) {
+  const target = ntfy.ntfyTarget(req.url);
+  if (!target) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+    return;
+  }
+  if (!NTFY_ON) {
+    res.writeHead(503, { 'content-type': 'text/plain' });
+    res.end('ntfy disabled');
+    return;
+  }
+  const upstream = http.request(
+    {
+      host: '127.0.0.1',
+      port: NTFY_PORT,
+      method: req.method,
+      path: target,
+      headers: ntfy.ntfyProxyHeaders(req.headers, {
+        host: (req.headers && req.headers.host) || '',
+        clientIp: clientIp(req),
+      }),
+    },
+    (answer) => {
+      res.writeHead(answer.statusCode || 502, answer.headers);
+      answer.pipe(res);
+    }
+  );
+  upstream.on('error', () => {
+    counters.ntfyProxyErrors += 1;
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'text/plain' });
+      res.end('ntfy unavailable');
+      return;
+    }
+    res.destroy();
+  });
+  res.on('close', () => upstream.destroy());
+  req.pipe(upstream);
+}
+function proxyNtfyUpgrade(req, socket, head) {
+  const target = ntfy.ntfyTarget(req.url);
+  if (!target || !NTFY_ON) {
+    socket.destroy();
+    return;
+  }
+  const upstream = http.request({
+    host: '127.0.0.1',
+    port: NTFY_PORT,
+    method: req.method,
+    path: target,
+    headers: {
+      ...ntfy.ntfyProxyHeaders(req.headers, {
+        host: (req.headers && req.headers.host) || '',
+        clientIp: clientIp(req),
+      }),
+      connection: 'Upgrade',
+      upgrade: (req.headers && req.headers.upgrade) || 'websocket',
+    },
+  });
+  upstream.on('upgrade', (answer, upstreamSocket, upstreamHead) => {
+    const lines = [`HTTP/1.1 ${answer.statusCode} ${answer.statusMessage || 'Switching Protocols'}`];
+    for (const [name, value] of Object.entries(answer.headers || {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) lines.push(`${name}: ${item}`);
+      } else {
+        lines.push(`${name}: ${value}`);
+      }
+    }
+    socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+    if (upstreamHead && upstreamHead.length) socket.write(upstreamHead);
+    if (head && head.length) upstreamSocket.write(head);
+    const drop = () => {
+      upstreamSocket.destroy();
+      socket.destroy();
+    };
+    upstreamSocket.on('error', drop);
+    socket.on('error', drop);
+    upstreamSocket.pipe(socket);
+    socket.pipe(upstreamSocket);
+  });
+  upstream.on('response', (answer) => {
+    answer.resume();
+    socket.destroy();
+  });
+  upstream.on('error', () => {
+    counters.ntfyProxyErrors += 1;
+    socket.destroy();
+  });
+  upstream.end();
+}
 if (TURN_HOST) {
   turnSecret = resolveTurnSecret();
   try {
@@ -890,6 +1049,17 @@ if (TURN_HOST) {
         '       задаётся явно: RELAY_PUBLIC_STUN=stun:stun.example.org:3478'
     );
   }
+}
+if (NTFY_ON) {
+  try {
+    writeNtfyConfig();
+    console.log(`[ntfy] config -> ${NTFY_CONF_FILE}`);
+  } catch (e) {
+    console.warn('[ntfy] не удалось записать конфиг:', e && e.message);
+  }
+  startEmbeddedNtfy();
+} else {
+  console.log('[ntfy] встроенный сервер уведомлений выключен (RELAY_EMBED_NTFY не задан)');
 }
 const SPK_SIG_PREFIX = 'licno-spk-v1|';
 const SPK_PQ_SIG_PREFIX = 'licno-spk-v2|';
@@ -938,8 +1108,14 @@ const server = http.createServer((req, res) => {
         vapidPublicKey: vapidPublicKey(),
         vapidSource: vapidKeySource,
         vapidFleetMember: !!VAPID_MEMBER,
+        ntfy: ntfyStatus(),
       })
     );
+    return;
+  }
+  if (ntfy.ntfyTarget(req.url)) {
+    counters.ntfyProxied += 1;
+    proxyToNtfy(req, res);
     return;
   }
   if (req.method === 'POST' && req.url === '/vapid-fleet') {
@@ -1036,6 +1212,7 @@ const server = http.createServer((req, res) => {
       const verdict = updateFeed.fileResponse({
         dir: UPDATE_DIR,
         platform,
+        channel: parsed.searchParams.get('channel') || '',
         stat: (target) => fs.statSync(target),
       });
       if (verdict.status !== 200) {
@@ -1248,7 +1425,17 @@ const server = http.createServer((req, res) => {
   res.writeHead(426);
   res.end('Upgrade Required: connect via WebSocket');
 });
-const wss = new WebSocketServer({ server, maxPayload: MAX_ENVELOPE_BYTES + 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_ENVELOPE_BYTES + 1024 * 1024 });
+server.on('upgrade', (req, socket, head) => {
+  if (ntfy.ntfyTarget(req.url)) {
+    counters.ntfyProxied += 1;
+    proxyNtfyUpgrade(req, socket, head);
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
 const BATCHABLE_SERVER_FRAMES = new Set([
   'message',
   'ack',
@@ -2699,16 +2886,18 @@ async function mirrorPlatform(platform) {
   fs.writeFileSync(path.join(UPDATE_DIR, names.manifest), body, 'utf8');
   console.warn(`[update] ${platform}: раздаём ${checked.release.version} (${bytes.length} байт)`);
 }
-function mirroredCanaryVersion() {
+function mirroredCanaryRelease() {
   try {
     const name = updateFeed.RELEASES.android.canaryManifest;
     const parsed = JSON.parse(fs.readFileSync(path.join(UPDATE_DIR, name), 'utf8'));
-    return String(parsed.version || '');
+    const version = String(parsed.version || '');
+    if (!version) return null;
+    return { version, sha256: String(parsed.sha256 || '') };
   } catch (e) {
-    return '';
+    return null;
   }
 }
-async function mirrorCanaryManifest() {
+async function mirrorCanary() {
   const url = updateMirror.manifestUrl(UPDATE_SOURCE, 'android', 'canary');
   if (!url) return;
   const body = await fetchText(url, updateMirror.MAX_MANIFEST_BYTES);
@@ -2725,11 +2914,42 @@ async function mirrorCanaryManifest() {
     console.warn(`[update] тестовый манифест отвергнут: ${checked.reason}`);
     return;
   }
-  const have = mirroredCanaryVersion();
-  if (have === checked.release.version) return;
+  const names = updateFeed.RELEASES.android;
+  const filePath = path.join(UPDATE_DIR, names.canaryFile);
+  const have = mirroredCanaryRelease();
+  if (have && !updateMirror.needsFetch({ have, release: checked.release }) && fs.existsSync(filePath)) {
+    return;
+  }
+  const fileUrl = updateMirror.usableFileUrl(checked.release.url);
+  if (!fileUrl) {
+    console.warn('[update] адрес тестового файла не годится: нужен https');
+    return;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 300000);
+  let bytes = null;
+  try {
+    const response = await fetch(fileUrl, { signal: controller.signal, redirect: 'follow' });
+    if (!response.ok) return;
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (e) {
+    console.warn('[update] тестовый файл не скачался:', (e && e.message) || e);
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const verdict = updateMirror.fileVerdict({ size: bytes.length, sha256, release: checked.release });
+  if (!verdict.ok) {
+    console.warn(`[update] тестовый файл не сошёлся с подписанным манифестом: ${verdict.reason}`);
+    return;
+  }
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
-  fs.writeFileSync(path.join(UPDATE_DIR, updateFeed.RELEASES.android.canaryManifest), body, 'utf8');
-  console.warn(`[update] тестовый канал: раздаём манифест ${checked.release.version}`);
+  const tmpPath = `${filePath}.part`;
+  fs.writeFileSync(tmpPath, bytes);
+  fs.renameSync(tmpPath, filePath);
+  fs.writeFileSync(path.join(UPDATE_DIR, names.canaryManifest), body, 'utf8');
+  console.warn(`[update] тестовый канал: раздаём ${checked.release.version} (${bytes.length} байт)`);
 }
 function mirroredTreeVersion(manifestName) {
   try {
@@ -2861,7 +3081,7 @@ async function maintainUpdateMirror() {
       if (names.kind !== 'licno') continue;
       await mirrorPlatform(platform);
     }
-    await mirrorCanaryManifest();
+    await mirrorCanary();
     await mirrorTree('web', 'web-version.json', WEB_DIR, WEB_DIR);
   } catch (e) {
     console.warn('[update] обход зеркала не выполнен:', (e && e.message) || e);
@@ -2910,7 +3130,11 @@ function performShutdown({
   Promise.resolve(flush).then(complete, complete);
   return done;
 }
-function createShutdownHandler({ stop = stopEmbeddedCoturn, perform = performShutdown } = {}) {
+function stopEmbeddedChildren() {
+  stopEmbeddedCoturn();
+  stopEmbeddedNtfy();
+}
+function createShutdownHandler({ stop = stopEmbeddedChildren, perform = performShutdown } = {}) {
   let shuttingDown = false;
   return function shutdown() {
     if (shuttingDown) return;
@@ -2986,12 +3210,6 @@ server.listen(PORT, () => {
   );
   console.log(
     '[push]',
-    pushReady()
-      ? 'FCM configured — wake-up pushes enabled'
-      : 'FCM NOT configured — FCM clients get no wake-ups'
-  );
-  console.log(
-    '[push]',
     vapidPublicKey()
       ? 'UnifiedPush web-push (VAPID) enabled'
       : 'UnifiedPush web-push (VAPID) NOT configured'
@@ -3040,6 +3258,13 @@ module.exports.runtime = {
   resolveTurnSecret,
   startEmbeddedCoturn,
   stopEmbeddedCoturn,
+  stopEmbeddedNtfy,
+  stopEmbeddedChildren,
+  startEmbeddedNtfy,
+  ntfyStatus,
+  proxyToNtfy,
+  proxyNtfyUpgrade,
+  writeNtfyConfig,
   verifySpkSignature,
   flushFrameBatch,
   sendImmediate,
@@ -3071,7 +3296,7 @@ module.exports.runtime = {
   pinnedLookup,
   httpJson,
   fetchPeerRelays,
-  pushSelfTo, mirroredRelease, verifyReleaseSignature, fetchText, mirrorPlatform, mirroredTreeVersion, mirrorTree, maintainUpdateMirror,
+  pushSelfTo, mirroredRelease, verifyReleaseSignature, fetchText, mirrorPlatform, mirrorCanary, mirroredCanaryRelease, mirroredTreeVersion, mirrorTree, maintainUpdateMirror,
   vapidSyncWith,
   vapidSyncOnce,
   gossipOnce,

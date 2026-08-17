@@ -1,4 +1,7 @@
 const assert = require('assert');
+const push = require('./push');
+const fs = require('fs');
+const path = require('path');
 const {
   isUnifiedPushEndpoint,
   validUnifiedPushEndpoint,
@@ -7,7 +10,6 @@ const {
   vapidPublicKey,
   vapidPublicKeyFor,
   generateVapidKeys,
-  messageFcmPayload,
 } = require('./push');
 let passed = 0;
 function test(name, fn) {
@@ -88,20 +90,24 @@ test('ВЫС-51: без адреса (диагностика, старый вы�
   assert.strictEqual(vapidPublicKeyFor(null), kp.publicKey);
   assert.strictEqual(vapidPublicKeyFor(''), kp.publicKey);
 });
-test('FCM-уведомление о сообщении не несёт ничего, кроме типа', () => {
-  const payload = messageFcmPayload('ТОКЕН-УСТРОЙСТВА');
-  assert.deepStrictEqual(payload.data, { type: 'message' }, 'в data не должно быть ни идентификаторов, ни ключей');
-  assert.deepStrictEqual(
-    Object.keys(payload).sort(),
-    ['android', 'data', 'notification', 'token'],
-    'состав полей FCM-сообщения изменился — проверьте, что новое поле не раскрывает метаданные'
-  );
-  assert.strictEqual(payload.notification.body, 'Новое зашифрованное сообщение', 'текст не зависит от содержимого');
-  assert.strictEqual(payload.android.notification.tag, 'new-message');
+test('УВД-7: FCM вырезан — токен, который не разбирается как подписка, отвергается', () => {
+  assert.strictEqual(typeof push.sendPush, 'function');
+  assert.strictEqual(push.messageFcmPayload, undefined, 'вернулась сборка FCM-сообщения');
+  assert.strictEqual(push.pushReady, undefined, 'вернулась проверка настроенности FCM');
+  assert.strictEqual(push.loadGoogleAuth, undefined, 'вернулась загрузка google-auth-library');
+  assert.strictEqual(push.detectProjectId, undefined, 'вернулось определение проекта Firebase');
+  assert.strictEqual(push.applyCredentialsFile, undefined, 'вернулась подстановка ключа сервисного аккаунта');
+  const source = fs.readFileSync(path.join(__dirname, 'push.js'), 'utf8');
+  for (const trace of ['fcm', 'FCM', 'googleapis', 'google-auth', 'service-account', 'firebase']) {
+    assert.ok(!source.includes(trace), `в push.js остался след Google: ${trace}`);
+  }
 });
-test('публичный ключ из клиентской метки не попадает в FCM ни при каких условиях', () => {
-  const serialized = JSON.stringify(messageFcmPayload('ТОКЕН'));
-  assert.ok(!serialized.includes('messageId'), 'поле идентификатора удалено');
-  assert.ok(!serialized.includes('chatTag'), 'признак чата в FCM не передаётся (ПРФ-4)');
+test('УВД-7: без подписи UnifiedPush отправка не выдумывает запасной путь', async () => {
+  assert.strictEqual(await push.sendPush('НЕ-JSON-ТОКЕН', 'mid', 'tag', 'addr'), 'invalid');
+  assert.strictEqual(await push.sendCallPush('НЕ-JSON-ТОКЕН', 'addr'), 'invalid');
+  assert.strictEqual(await push.sendTestPush('НЕ-JSON-ТОКЕН', 'pt_1', 'message', 'addr'), 'invalid');
+  assert.strictEqual(await push.sendPush('', 'mid', 'tag', 'addr'), false);
+  assert.strictEqual(await push.sendCallPush(null, 'addr'), false);
+  assert.strictEqual(await push.sendTestPush('{}', '', 'message', 'addr'), false);
 });
 console.log(`\npush: ${passed} passed`);

@@ -6,6 +6,15 @@ const RELEASES = {
     manifest: 'android-version.json',
     canaryManifest: 'android-canary-version.json',
     file: 'licno-android.apk',
+    canaryFile: 'licno-android-canary.apk',
+    type: 'application/vnd.android.package-archive',
+    kind: 'licno',
+  },
+  distributor: {
+    manifest: 'distributor-version.json',
+    canaryManifest: '',
+    file: 'licno-push.apk',
+    canaryFile: '',
     type: 'application/vnd.android.package-archive',
     kind: 'licno',
   },
@@ -30,9 +39,11 @@ function releasePath(dir, platform, kind) {
   const name =
     kind === 'file'
       ? release.file
-      : kind === 'canary'
-        ? release.canaryManifest
-        : release.manifest;
+      : kind === 'canaryFile'
+        ? release.canaryFile
+        : kind === 'canary'
+          ? release.canaryManifest
+          : release.manifest;
   if (!name) return null;
   const full = path.resolve(dir, name);
   const root = path.resolve(dir);
@@ -73,10 +84,16 @@ function manifestResponse(input) {
   return { status: 200, platform: asked, manifest, body: JSON.stringify(manifest) };
 }
 function fileResponse(input) {
-  const { dir, platform, stat } = input && typeof input === 'object' ? input : {};
+  const { dir, platform, stat, channel } = input && typeof input === 'object' ? input : {};
   const asked = askedPlatform(platform);
   if (!asked) return { status: 404, reason: 'неизвестная платформа' };
-  const target = releasePath(dir, asked, 'file');
+  const wantedChannel = askedChannel(channel);
+  if (!wantedChannel) return { status: 404, reason: 'неизвестный канал' };
+  const canary = wantedChannel === 'canary';
+  if (canary && !RELEASES[asked].canaryFile) {
+    return { status: 404, reason: 'у платформы нет тестового канала' };
+  }
+  const target = releasePath(dir, asked, canary ? 'canaryFile' : 'file');
   if (!target) return { status: 404, reason: 'раздача обновлений не настроена' };
   let info = null;
   try {
@@ -89,10 +106,11 @@ function fileResponse(input) {
   return {
     status: 200,
     platform: asked,
+    channel: wantedChannel,
     path: target,
     size,
     type: RELEASES[asked].type,
-    filename: RELEASES[asked].file,
+    filename: canary ? RELEASES[asked].canaryFile : RELEASES[asked].file,
   };
 }
 module.exports = {
