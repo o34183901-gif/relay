@@ -1,4 +1,4 @@
-const BUILD_ID = '20260814145614-93be104a';
+const BUILD_ID = '20260817091652-b02fb3549';
 const CACHE_NAME = `licno-pwa-${BUILD_ID}`;
 const APP_ROOT = '/app/';
 const SHELL = [
@@ -6,9 +6,6 @@ const SHELL = [
   `${APP_ROOT}manifest.webmanifest`,
   `${APP_ROOT}icons/icon-1024.png`,
   `${APP_ROOT}icons/icon-maskable-1024.png`,
-  // UI-5: воркер расшифровки вложений и его копия nacl. Кладём в оболочку, чтобы
-  // после установки они были на месте сразу и офлайн: без воркера расшифровка
-  // уедет в главный поток, и чат снова начнёт подвисать при открытии.
   `${APP_ROOT}attachment-decrypt-worker.js`,
   `${APP_ROOT}nacl-fast.min.js`,
 ];
@@ -70,27 +67,12 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(cacheFirst(request));
 });
 
-// ПРФ-4: уведомления разных чатов больше не затирают друг друга.
-//
-// Раньше все сообщения показывались под ОДНИМ тегом licno-new-message и без
-// renotify: каждое следующее беззвучно заменяло предыдущее. Пять сообщений из
-// трёх чатов давали одно безымянное уведомление — пользователь заключал, что
-// часть сообщений потерялась.
-//
-// Теперь релей кладёт в тело пуша непрозрачный признак чата (chatTag — хэш
-// адреса отправителя). Тело web-push зашифровано ключами подписки, поэтому
-// провайдер пуша его не видит; для нас же этого достаточно, чтобы дать каждому
-// чату свою ветку уведомлений. Имени отправителя здесь по-прежнему нет: service
-// worker не имеет доступа к расшифрованной адресной книге, а возить имя через
-// сервер значило бы раскрыть ему социальный граф.
 function notificationTagFor(data) {
   if (data && data.title === 'Входящий звонок') return 'licno-call';
   const chatTag = data && typeof data.chatTag === 'string' ? data.chatTag : '';
-  // Признак недоверенный — пропускаем только безопасный алфавит.
   if (/^[A-Za-z0-9_-]{1,64}$/.test(chatTag)) return 'licno-chat-' + chatTag;
-  return 'licno-new-message'; // старый релей без chatTag — прежнее поведение
+  return 'licno-new-message';
 }
-
 self.addEventListener('push', (event) => {
   let data = {};
   try {
@@ -100,8 +82,6 @@ self.addEventListener('push', (event) => {
     self.registration.showNotification(data.title || 'Лично', {
       body: data.body || 'Новое зашифрованное сообщение',
       tag: notificationTagFor(data),
-      // Замена уведомления в пределах ОДНОГО чата должна быть заметной: иначе
-      // новое сообщение подменяет старое совершенно беззвучно.
       renotify: true,
       icon: `${APP_ROOT}icons/icon-1024.png`,
       badge: `${APP_ROOT}icons/icon-1024.png`,
@@ -109,7 +89,6 @@ self.addEventListener('push', (event) => {
     })
   );
 });
-
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(
@@ -123,7 +102,6 @@ self.addEventListener('notificationclick', (event) => {
     })
   );
 });
-
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });

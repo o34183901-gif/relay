@@ -1,11 +1,4 @@
-/* global importScripts, jsQR */
-/**
- * QR распознаётся вне главного потока PWA. Особенно важно для Safari/iPhone:
- * jsQR на кадре камеры может считать сотни миллисекунд, но навигация и кнопка
- * «Отмена» всё это время должны оставаться отзывчивыми.
- */
 importScripts('jsqr.bundle.js');
-
 self.onmessage = (event) => {
   const input = event.data || {};
   try {
