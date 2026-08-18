@@ -1,10 +1,10 @@
 {
-  "version": "0.0.82",
+  "version": "0.0.83",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
   "sha256": "01b8a0f5820c47b1fadef5bed5672bc29e543ecb3cd6e853ab161cdd77d95fcd",
   "platform": "web",
-  "filesHash": "7853bbbe35d1f92d146c6567610d40fca69556b8dd4421c7b6cc76288fab7f76",
+  "filesHash": "8a6e8baa0460ff59dc17f8c6609fe3ce22f940c93794045592f7869c135f208e",
   "files": [
     {
       "path": "_expo/static/js/web/ChatScreen-a8316bde759cf445c12d65e450f9c9c0.js",
@@ -114,13 +114,13 @@
     {
       "path": "sw.js",
       "size": 3400,
-      "sha256": "eee861d35c9ba034a09891dcec9602d12e7f6d2ae874cdc2d5f88cb410b901aa"
+      "sha256": "f25dc460e003f0fc4a436f4455e0c3e29f3d495242d69f885734e4f9f3418c3d"
     },
     {
       "path": "version.json",
       "size": 75,
-      "sha256": "51dff1c989aa5869a509b122b1995ac80d4be63e1d751207b7a4a7ee16d91ab9"
+      "sha256": "5c62a31849a4047129875b87cf996e5b36428d98688b56aeb8c9e196eadf001b"
     }
   ],
-  "signature": "G+nARSwHWk3+0Dw4R7TbsIWswFh6iqsN8TT09XtkPTCVi3KHMMtEzuB8Gaq/fZZVLCD3yLRxwlIJTwJyU4GnDA=="
+  "signature": "IFYSJts90NOEddvskoJXpROD+dCg1dGE2GkxbjQnHeTk8mH+Zfsv2dgoS5BmN3EAWGj0jzUU4NKSJLq1PzcmBQ=="
 }
