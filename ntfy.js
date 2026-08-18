@@ -43,7 +43,7 @@ function ntfyBaseUrl(selfUrl) {
   if (parsed.protocol !== 'wss:' && parsed.protocol !== 'https:') return '';
   if (!parsed.hostname) return '';
   const port = parsed.port ? `:${parsed.port}` : '';
-  return `https://${parsed.hostname}${port}${NTFY_PREFIX}`;
+  return `https://${parsed.hostname}${port}`;
 }
 
 function yamlString(value) {

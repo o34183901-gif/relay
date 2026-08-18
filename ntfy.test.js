@@ -64,9 +64,13 @@ test('путь /ntfy срезается, а чужие пути не прокс�
 });
 
 test('адрес сервера уведомлений выводится из адреса релея', () => {
-  assert.strictEqual(ntfyBaseUrl('wss://relay.example'), `https://relay.example${NTFY_PREFIX}`);
-  assert.strictEqual(ntfyBaseUrl('wss://relay.example:8443'), `https://relay.example:8443${NTFY_PREFIX}`);
-  assert.strictEqual(ntfyBaseUrl('https://relay.example'), `https://relay.example${NTFY_PREFIX}`);
+  assert.strictEqual(ntfyBaseUrl('wss://relay.example'), 'https://relay.example');
+  assert.strictEqual(ntfyBaseUrl('wss://relay.example:8443'), 'https://relay.example:8443');
+  assert.strictEqual(ntfyBaseUrl('https://relay.example'), 'https://relay.example');
+  assert.ok(
+    !ntfyBaseUrl('wss://relay.example').includes(NTFY_PREFIX),
+    'ntfy отказывается стартовать, если base-url содержит путь: sub-path он не поддерживает'
+  );
   assert.strictEqual(ntfyBaseUrl('ws://relay.example'), '', 'открытый канал адресом не становится');
   assert.strictEqual(ntfyBaseUrl('мусор'), '');
   assert.strictEqual(ntfyBaseUrl(''), '');
