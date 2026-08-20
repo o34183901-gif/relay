@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 const NTFY_PREFIX = '/ntfy';
 const NTFY_DEFAULT_PORT = 2586;
 const NTFY_DEFAULT_CACHE = '12h';
@@ -56,8 +58,10 @@ function ntfyConfigText(input) {
     port = NTFY_DEFAULT_PORT,
     cacheFile = '',
     cacheDuration = NTFY_DEFAULT_CACHE,
+    authFile = '',
   } = input && typeof input === 'object' ? input : {};
   const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : NTFY_DEFAULT_PORT;
+  const resolvedAuthFile = authFile || (cacheFile ? path.join(path.dirname(cacheFile), 'auth.db') : '');
   const lines = [];
   if (baseUrl) lines.push(`base-url: ${yamlString(baseUrl)}`);
   lines.push(`listen-http: ${yamlString(`127.0.0.1:${safePort}`)}`);
@@ -65,6 +69,8 @@ function ntfyConfigText(input) {
   if (cacheFile) lines.push(`cache-file: ${yamlString(cacheFile)}`);
   lines.push(`cache-duration: ${yamlString(cacheDuration)}`);
   lines.push('attachment-cache-dir: ""');
+  if (resolvedAuthFile) lines.push(`auth-file: ${yamlString(resolvedAuthFile)}`);
+  lines.push('auth-default-access: "deny-all"');
   lines.push('enable-signup: false');
   lines.push('enable-login: false');
   lines.push('upstream-base-url: ""');

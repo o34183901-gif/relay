@@ -82,6 +82,7 @@ function decode(digest) {
   if (!Number.isInteger(p) || p < 1 || p > 24) return null;
   if (!Number.isInteger(n) || n < 0 || n > MAX_KEYS) return null;
   if (!(bits instanceof Uint8Array)) return null;
+  if (n > Math.floor((bits.length * 8) / (p + 1))) return null;
   const m = 1 << p;
   const range = Math.max(1, n) * m;
   const reader = createReader(bits);

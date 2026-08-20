@@ -106,7 +106,7 @@ test('резерв не шире очереди: перекос настроек
     { admit: false, evict: null },
     'формально это отказ — но только когда оператор сам так настроил'
   );
-  assert.ok(QUEUE_RESERVE < 500, 'штатный резерв заведомо уже штатной очереди');
+  assert.ok(QUEUE_RESERVE > 0 && QUEUE_RESERVE < 500, 'штатный резерв ненулевой и уже штатной очереди');
 });
 test('без потолков всё проходит — потолки задаёт вызывающий', () => {
   assert.deepStrictEqual(admitEnvelope(), { admit: true, evict: null });

@@ -72,6 +72,27 @@ test('НЕПОДПИСАННЫЙ ВЫПУСК НЕ РАЗДАЁТСЯ', () => {
     assert.ok(verdict.reason);
   }
 });
+test('REL-09: подпись манифеста проверяется, файл сверяется по размеру и sha', () => {
+  const bad = manifestResponse({ dir: DIR, platform: 'android', read: () => SIGNED, verify: () => false });
+  assert.strictEqual(bad.status, 404, 'неверная подпись манифеста => 404');
+  const good = manifestResponse({ dir: DIR, platform: 'android', read: () => SIGNED, verify: () => true });
+  assert.strictEqual(good.status, 200, 'верная подпись => 200');
+  const wrongSize = fileResponse({
+    dir: DIR,
+    platform: 'android',
+    stat: statOf({ [path.join(DIR, 'licno-android.apk')]: { size: 999 } }),
+    expect: { size: 1000, sha256: 'a'.repeat(64) },
+  });
+  assert.strictEqual(wrongSize.status, 404, 'размер не совпал с манифестом => 404');
+  const wrongSha = fileResponse({
+    dir: DIR,
+    platform: 'android',
+    stat: statOf({ [path.join(DIR, 'licno-android.apk')]: { size: 1000 } }),
+    expect: { size: 1000, sha256: 'a'.repeat(64) },
+    hash: () => 'b'.repeat(64),
+  });
+  assert.strictEqual(wrongSha.status, 404, 'sha не совпал с манифестом => 404');
+});
 test('чужая платформа не получает чужой файл', () => {
   for (const bad of ['web', 'symbian', 'ANDROID', '../android', 'android ', 42, {}, []]) {
     assert.strictEqual(askedPlatform(bad), null, `принята платформа ${JSON.stringify(bad)}`);

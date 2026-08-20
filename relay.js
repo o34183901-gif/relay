@@ -16,13 +16,14 @@ const {
   vapidPublicKeyFor,
   generateVapidKeys,
 } = require('./push');
-const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate, byteGate, buildIceServers, parsePublicStun } = require('./relays');
+const { mergeRelays, isValidRelayUrl, normalizeRelayUrl, isPrivateHost, coturnConfigText, rateGate, byteGate, buildIceServers, parsePublicStun, MAX_RELAYS } = require('./relays');
 const { chatNotificationTag, createPushGate } = require('./notifications');
 const { createStore } = require('./store');
 const mbx = require('./mbx');
 const { createHttpRateLimit } = require('./httpRateLimit');
 
 const updateFeed = require('./updateFeed');
+const updateManifestRule = require('./updateManifest');
 const ntfy = require('./ntfy');
 const updateMirror = require('./updateMirror');
 const webApp = require('./webApp');
@@ -31,7 +32,7 @@ const { RELEASE_PUBLIC_KEY } = require('./releaseKey');
 const ed25519 = require('./ed25519');
 const gatewayTicketRule = require('./gateway-ticket');
 const reportsRule = require('./reports');
-const REPORTS_OWNER_KEY = process.env.RELAY_REPORTS_KEY || RELEASE_PUBLIC_KEY;
+const REPORTS_OWNER_KEY = process.env.RELAY_REPORTS_KEY || '';
 const { resolveNativeEd25519 } = require('./nativeEd25519');
 const nativeEd25519 = resolveNativeEd25519(() => crypto);
 if (nativeEd25519.implementation) ed25519.setNative(nativeEd25519.implementation);
@@ -135,6 +136,14 @@ function mbxRefreshDigest(now = Date.now()) {
 
 
 const SELF_URL = normalizeRelayUrl(process.env.RELAY_SELF_URL || '') || null;
+const REPORTS_SELF_HOST = (() => {
+  if (!SELF_URL) return '';
+  try {
+    return new URL(SELF_URL).host;
+  } catch (e) {
+    return '';
+  }
+})();
 const PEER_SEED = (process.env.RELAY_PEERS || '')
   .split(',')
   .map((s) => s.trim())
@@ -145,12 +154,14 @@ let relayDir = mergeRelays([], [SELF_URL, ...PEER_SEED, ...store.directory()].fi
 store.addRelays(relayDir, Date.now());
 function learnRelays(urls) {
   const before = relayDir.length;
+  const seen = mergeRelays([], urls);
   relayDir = mergeRelays(relayDir, urls);
-  if (relayDir.length !== before) {
-    store.addRelays(relayDir, Date.now());
-    return true;
-  }
-  return false;
+  if (seen.length) store.addRelays(seen, Date.now());
+  return relayDir.length !== before;
+}
+function sweepRelayDirectory(now = Date.now()) {
+  store.addRelays([], now);
+  relayDir = mergeRelays([], [SELF_URL, ...PEER_SEED, ...store.directory()].filter(Boolean));
 }
 const MAX_ENVELOPE_BYTES = 32 * 1024 * 1024;
 const MAX_SEALED_PAYLOAD_BYTES = envelopeFrame.maxSealedBytes(MAX_ENVELOPE_BYTES);
@@ -166,6 +177,8 @@ const RATE_MAX_BYTES = Number(process.env.RELAY_MAX_BYTES_PER_SEC) || 12 * 1024 
 const RATE_ABUSE_WINDOWS = Number(process.env.RELAY_ABUSE_WINDOWS) || 15;
 const COSTLY_WINDOW_MS = 60 * 1000;
 const MBX_DIGEST_MAX_PER_MIN = Number(process.env.RELAY_MBX_DIGEST_PER_MIN) || 10;
+const TURN_MAX_PER_MIN = 30;
+const PUSH_TEST_MAX_PER_MIN = 12;
 const MBX_FETCH_MAX_PER_MIN = Number(process.env.RELAY_MBX_FETCH_PER_MIN) || 30;
 const MBX_HTTP_MAX_PER_MIN = Number(process.env.RELAY_MBX_HTTP_PER_MIN) || 12;
 const MBX_HTTP_PAGE = Math.min(mbx.SYNC_LIMIT, Number(process.env.RELAY_MBX_HTTP_PAGE) || 512);
@@ -174,6 +187,20 @@ const reportHttpRate = createHttpRateLimit({
   max: reportsRule.PER_IP_PER_DAY,
   windowMs: reportsRule.DAY_MS,
 });
+const REPORT_ADMIN_MAX_PER_MIN = 30;
+const reportAdminRate = createHttpRateLimit({ max: REPORT_ADMIN_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+const REPORT_FETCH_MAX_BYTES = 4 * 1024 * 1024;
+const reportOwnerReplay = new Map();
+function reportRequestFresh(domain, signature, now) {
+  if (typeof signature !== 'string' || !signature) return false;
+  const key = domain + '|' + signature;
+  for (const [seen, until] of reportOwnerReplay) {
+    if (until <= now) reportOwnerReplay.delete(seen);
+  }
+  if (reportOwnerReplay.has(key)) return false;
+  reportOwnerReplay.set(key, now + reportsRule.REQUEST_TTL_MS + reportsRule.REQUEST_SKEW_MS);
+  return true;
+}
 const ROSTER_PUT_MAX_PER_MIN = Number(process.env.RELAY_ROSTER_PUT_PER_MIN) || 10;
 const UPDATE_DIR = process.env.RELAY_UPDATE_DIR || path.join(path.dirname(DB_FILE), 'releases');
 const UPDATE_MIRROR_OFF = String(process.env.RELAY_UPDATE_MIRROR || '').trim().toLowerCase() === 'off';
@@ -187,6 +214,18 @@ const updateManifestRate = createHttpRateLimit({
   windowMs: COSTLY_WINDOW_MS,
 });
 const updateFileRate = createHttpRateLimit({ max: UPDATE_FILE_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+const healthHttpRate = createHttpRateLimit({ max: 60, windowMs: COSTLY_WINDOW_MS });
+const helloSigRate = createHttpRateLimit({ max: 60, windowMs: COSTLY_WINDOW_MS });
+const NTFY_MAX_PER_MIN = 60;
+const ntfyHttpRate = createHttpRateLimit({ max: NTFY_MAX_PER_MIN, windowMs: COSTLY_WINDOW_MS });
+let healthStatsCache = null;
+let healthStatsAt = 0;
+function healthStats(now) {
+  if (healthStatsCache && now - healthStatsAt < 1000) return healthStatsCache;
+  healthStatsCache = store.stats();
+  healthStatsAt = now;
+  return healthStatsCache;
+}
 const MAX_CONN_PER_IP = Number(process.env.RELAY_MAX_CONN_PER_IP) || 1000;
 const MAX_BUFFERED_BYTES = Number(process.env.RELAY_MAX_BUFFERED) || 64 * 1024 * 1024;
 const METRICS_TOKEN = process.env.RELAY_METRICS_TOKEN || null;
@@ -238,7 +277,10 @@ function sampleEventLoopLag(now = Date.now()) {
   if (lag > eventLoopLag.max) eventLoopLag.max = lag;
   eventLoopLag.samples.push(lag);
   if (eventLoopLag.samples.length > LAG_WINDOW) eventLoopLag.samples.shift();
-  eventLoopLag.streak = lag >= LAG_ALERT_MS ? eventLoopLag.streak + 1 : 0;
+  eventLoopLag.streak =
+    lag >= LAG_ALERT_MS
+      ? eventLoopLag.streak + Math.max(1, Math.floor(lag / EVENT_LOOP_PROBE_MS))
+      : 0;
   const overloaded = eventLoopLag.streak >= LAG_ALERT_STREAK;
   if (overloaded && !eventLoopLag.overloaded) {
     console.warn(
@@ -385,7 +427,7 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 function metricsAuthorized(req) {
-  if (!METRICS_TOKEN) return isPrivateHost(clientIp(req));
+  if (!METRICS_TOKEN) return isPrivateHost((req && req.socket && req.socket.remoteAddress) || '');
   const url = new URL(req.url, 'http://x');
   if (safeEqual(url.searchParams.get('token'), METRICS_TOKEN)) return true;
   const auth = (req.headers && req.headers.authorization) || '';
@@ -446,7 +488,10 @@ function rememberVapidRequest(request) {
     for (const [nonce, timestamp] of vapidRequestNonces) {
       if (timestamp < cutoff) vapidRequestNonces.delete(nonce);
     }
-    if (vapidRequestNonces.size > 5000) vapidRequestNonces.clear();
+    while (vapidRequestNonces.size > 5000) {
+      const oldest = vapidRequestNonces.keys().next().value;
+      vapidRequestNonces.delete(oldest);
+    }
   }
   return true;
 }
@@ -706,6 +751,9 @@ function loadOrCreateRelaySignKeys({
   return { pub: naclUtil.encodeBase64(kp.publicKey), sec: kp.secretKey };
 }
 const RELAY_KEYS = loadOrCreateRelaySignKeys();
+const CHAT_TAG_SALT = RELAY_KEYS
+  ? crypto.createHash('sha256').update(Buffer.from(RELAY_KEYS.sec)).update('licno-chat-tag-salt-v1').digest()
+  : Buffer.alloc(0);
 function signRelayAuth(cnonce) {
   return naclUtil.encodeBase64(ed25519.sign(naclUtil.decodeUTF8(RELAY_AUTH_PREFIX + cnonce), RELAY_KEYS.sec));
 }
@@ -943,6 +991,12 @@ function proxyToNtfy(req, res) {
     res.end('ntfy disabled');
     return;
   }
+  if (!ntfyHttpRate.allow(clientIp(req), Date.now())) {
+    counters.ntfyProxyErrors += 1;
+    res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '60' });
+    res.end('rate');
+    return;
+  }
   const upstream = http.request(
     {
       host: '127.0.0.1',
@@ -974,6 +1028,11 @@ function proxyToNtfy(req, res) {
 function proxyNtfyUpgrade(req, socket, head) {
   const target = ntfy.ntfyTarget(req.url);
   if (!target || !NTFY_ON) {
+    socket.destroy();
+    return;
+  }
+  if (!ntfyHttpRate.allow(clientIp(req), Date.now())) {
+    counters.ntfyProxyErrors += 1;
     socket.destroy();
     return;
   }
@@ -1092,7 +1151,15 @@ function verifySpkSignature(spkObj, signPublicKeyB64) {
 }
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
-    const st = store.stats();
+    const nowHealth = Date.now();
+    const trustedHealth =
+      !!GOSSIP_TOKEN && safeEqual((req.headers && req.headers['x-gossip-token']) || '', GOSSIP_TOKEN);
+    if (!trustedHealth && !healthHttpRate.allow(clientIp(req), nowHealth)) {
+      res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '60' });
+      res.end('rate');
+      return;
+    }
+    const st = healthStats(nowHealth);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(
       JSON.stringify({
@@ -1178,12 +1245,16 @@ const server = http.createServer((req, res) => {
         }
         res.writeHead(200, webApp.webAppHeaders('index.html', pageStat.size));
         if (req.method === 'HEAD') return res.end();
-        fs.createReadStream(page).pipe(res);
+        const pageStream = fs.createReadStream(page);
+        pageStream.on('error', () => res.destroy());
+        pageStream.pipe(res);
         return;
       }
       res.writeHead(200, webApp.webAppHeaders(relative, stat.size));
       if (req.method === 'HEAD') return res.end();
-      fs.createReadStream(full).pipe(res);
+      const fileStream = fs.createReadStream(full);
+      fileStream.on('error', () => res.destroy());
+      fileStream.pipe(res);
       return;
     }
   }
@@ -1208,12 +1279,30 @@ const server = http.createServer((req, res) => {
       res.end('rate');
       return;
     }
+    const channel = parsed.searchParams.get('channel') || '';
     if (wantsFile) {
+      const manifestVerdict = updateFeed.manifestResponse({
+        dir: UPDATE_DIR,
+        platform,
+        channel,
+        read: (target) => fs.readFileSync(target, 'utf8'),
+        verify: verifyManifestSignature,
+      });
+      if (manifestVerdict.status !== 200) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end(manifestVerdict.reason || 'not found');
+        return;
+      }
       const verdict = updateFeed.fileResponse({
         dir: UPDATE_DIR,
         platform,
-        channel: parsed.searchParams.get('channel') || '',
+        channel,
         stat: (target) => fs.statSync(target),
+        expect: {
+          size: Number(manifestVerdict.manifest.size),
+          sha256: String(manifestVerdict.manifest.sha256 || ''),
+        },
+        hash: (target) => releaseFileHash(target),
       });
       if (verdict.status !== 200) {
         res.writeHead(404, { 'content-type': 'text/plain' });
@@ -1238,14 +1327,12 @@ const server = http.createServer((req, res) => {
       stream.pipe(res);
       return;
     }
-    const host = String((req.headers && req.headers.host) || '').trim();
-    const selfUrl = /^[A-Za-z0-9.\-:[\]]{1,255}$/.test(host) ? `https://${host}` : '';
     const verdict = updateFeed.manifestResponse({
       dir: UPDATE_DIR,
       platform,
-      channel: parsed.searchParams.get('channel') || '',
-      selfUrl,
+      channel,
       read: (target) => fs.readFileSync(target, 'utf8'),
+      verify: verifyManifestSignature,
     });
     if (verdict.status !== 200) {
       res.writeHead(404, { 'content-type': 'text/plain' });
@@ -1337,25 +1424,46 @@ const server = http.createServer((req, res) => {
   if (req.url === '/reports' || req.url.startsWith('/reports?')) {
     const parsed = new URL(req.url, 'http://x');
     if (req.method === 'GET') {
+      const nowReports = Date.now();
+      if (!reportAdminRate.allow(clientIp(req), nowReports)) {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' });
+        res.end(JSON.stringify({ ok: false, reason: 'rate' }));
+        return;
+      }
+      const signature = parsed.searchParams.get('sig');
       const verdict = reportsRule.verifyOwnerRequest({
         domain: reportsRule.FETCH_DOMAIN,
         ts: parsed.searchParams.get('ts'),
-        signature: parsed.searchParams.get('sig'),
+        host: REPORTS_SELF_HOST,
+        signature,
         publicKey: REPORTS_OWNER_KEY,
-        now: Date.now(),
+        now: nowReports,
       });
       if (!verdict.ok) {
         res.writeHead(403, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: false, reason: verdict.reason }));
         return;
       }
+      if (!reportRequestFresh(reportsRule.FETCH_DOMAIN, signature, nowReports)) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: 'replay' }));
+        return;
+      }
       const rows = store.reportsPage(reportsRule.FETCH_PAGE);
+      const page = [];
+      let budget = 0;
+      for (const row of rows) {
+        const item = { id: row.id, at: row.at, body: row.body };
+        budget += Buffer.byteLength(typeof row.body === 'string' ? row.body : '');
+        if (page.length && budget > REPORT_FETCH_MAX_BYTES) break;
+        page.push(item);
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
           ok: true,
           left: store.reportsCount(),
-          reports: rows.map((row) => ({ id: row.id, at: row.at, body: row.body })),
+          reports: page,
         })
       );
       return;
@@ -1370,17 +1478,30 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: false, reason: 'method' }));
       return;
     }
+    const nowAck = Date.now();
+    if (!reportAdminRate.allow(clientIp(req), nowAck)) {
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' });
+      res.end(JSON.stringify({ ok: false, reason: 'rate' }));
+      return;
+    }
     readJsonBody(req, 256 * 1024, (body) => {
+      const signature = body && body.sig;
       const verdict = reportsRule.verifyOwnerRequest({
         domain: reportsRule.DELETE_DOMAIN,
         ts: body && body.ts,
-        signature: body && body.sig,
+        host: REPORTS_SELF_HOST,
+        signature,
         publicKey: REPORTS_OWNER_KEY,
         now: Date.now(),
       });
       if (!verdict.ok) {
         res.writeHead(403, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: false, reason: verdict.reason }));
+        return;
+      }
+      if (!reportRequestFresh(reportsRule.DELETE_DOMAIN, signature, Date.now())) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, reason: 'replay' }));
         return;
       }
       const ids = Array.isArray(body.ids) ? body.ids.slice(0, reportsRule.FETCH_PAGE) : [];
@@ -1491,6 +1612,12 @@ function send(ws, obj, sizeHint) {
     ) {
       const encodedLength = frameBatchBytes(obj, sizeHint);
       if (encodedLength <= 64 * 1024) {
+        if (
+          ws.frameBatchQueue.length &&
+          (ws.frameBatchQueue.length >= 24 || ws.frameBatchBytes + encodedLength > 192 * 1024)
+        ) {
+          flushFrameBatch(ws);
+        }
         ws.frameBatchQueue.push(obj);
         ws.frameBatchBytes += encodedLength;
         if (ws.frameBatchQueue.length >= 24 || ws.frameBatchBytes >= 192 * 1024) {
@@ -1593,6 +1720,7 @@ function flushQueue(pubkey, ws, onComplete) {
 const GW_PULL_MAX_ITEMS = 50;
 const GW_PULL_RATE = 6;
 const GW_PULL_WINDOW_MS = 60 * 1000;
+const GW_PULL_MAX_KEYS = 10000;
 const gatewayTickets = gatewayTicketRule.createTicketLedger();
 const gatewayPullRate = new Map();
 function gatewayPullAllowed(pubkey) {
@@ -1600,11 +1728,29 @@ function gatewayPullAllowed(pubkey) {
   const entry = gatewayPullRate.get(pubkey);
   if (!entry || at - entry.startedAt > GW_PULL_WINDOW_MS) {
     gatewayPullRate.set(pubkey, { startedAt: at, count: 1 });
+    if (gatewayPullRate.size > GW_PULL_MAX_KEYS) {
+      sweepGatewayPullRate(at);
+      while (gatewayPullRate.size > GW_PULL_MAX_KEYS) {
+        const oldest = gatewayPullRate.keys().next().value;
+        gatewayPullRate.delete(oldest);
+      }
+    }
     return true;
   }
   entry.count += 1;
   return entry.count <= GW_PULL_RATE;
 }
+function sweepGatewayPullRate(now = Date.now()) {
+  for (const [pubkey, entry] of gatewayPullRate) {
+    if (now - entry.startedAt > GW_PULL_WINDOW_MS) gatewayPullRate.delete(pubkey);
+  }
+}
+function sweepRateBudgets(now = Date.now()) {
+  sweepCostlyBudgets(now);
+  sweepGatewayPullRate(now);
+}
+setInterval(sweepRateBudgets, COSTLY_WINDOW_MS).unref();
+setInterval(() => mbxRefreshDigest(), COSTLY_WINDOW_MS).unref();
 function handleGatewayPull(ws, msg) {
   if (!ws.authed || !ws.pubkey) return send(ws, { type: 'gw-pull-result', ok: false });
   if (!ws.proven) return send(ws, { type: 'gw-pull-result', ok: false });
@@ -1613,7 +1759,7 @@ function handleGatewayPull(ws, msg) {
   const bound = owner ? store.getIdentity(owner) : null;
   const verdict = gatewayTicketRule.checkTicket({
     candidate: msg && msg.ticket,
-    ownerSignKey: bound && bound.signPk,
+    ownerSignKey: bound && bound.proven ? bound.signPk : null,
     presenter: { addr: ws.pubkey, signKey: ws.signPk },
     now: Date.now(),
     verify: (bytes, sig, publicKey) =>
@@ -1678,7 +1824,6 @@ function flushBinaryQueue(pubkey, ws) {
   start();
   return ids.length;
 }
-const ACK_QUEUED = true;
 function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   const id = nextId();
   const stored = store.enqueue({
@@ -1705,11 +1850,11 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
   const liveFrame = queuedMessageFrame({ id, from, envelope, ...metadata });
   if (ws && sendMessageFrame(ws, liveFrame, metadata.envelopeBytes, { immediate: !stored })) {
     counters.deliveredOnline += 1;
-    return { queued: ACK_QUEUED, id };
+    return { queued: true, id };
   }
   if (!stored) {
     counters.dropped += 1;
-    return { queued: ACK_QUEUED, dropped: true, id };
+    return { queued: false, dropped: true, id };
   }
   counters.queuedOffline += 1;
   const token = store.getToken(to);
@@ -1722,18 +1867,31 @@ function deliver(from, to, envelope, silent, callPush, metadata = {}) {
       counters.pushes += 1;
       sendCallPush(token, to).then(onInvalid);
     }
-    return { queued: ACK_QUEUED, id };
+    return { queued: true, id };
   }
-  if (silent) return { queued: ACK_QUEUED, id };
-  const chatTag = chatNotificationTag(metadata.fromAccount || from);
+  if (silent) return { queued: true, id };
+  const chatTag = chatNotificationTag(metadata.fromAccount || from, CHAT_TAG_SALT);
   if (token && messagePushGate.allow(to, chatTag, Date.now())) {
     counters.pushes += 1;
     sendPush(token, metadata.notificationId || id, chatTag, to).then(onInvalid);
   }
-  return { queued: ACK_QUEUED, id };
+  return { queued: true, id };
+}
+function isRecipientAddress(addr) {
+  if (typeof addr !== 'string' || addr.length !== 44) return false;
+  let bytes;
+  try {
+    bytes = naclUtil.decodeBase64(addr);
+  } catch (error) {
+    return false;
+  }
+  return bytes.length === nacl.box.publicKeyLength && naclUtil.encodeBase64(bytes) === addr;
 }
 function acceptEnvelope(ws, { to, envelope, silent, callPush, ref, envelopeJson, noMeta }) {
-  if (to.length > MAX_ADDR_LEN) {
+  if (!ws.proven) {
+    return send(ws, { type: 'error', error: 'box ownership proof required' });
+  }
+  if (!isRecipientAddress(to)) {
     return send(ws, { type: 'error', error: 'invalid recipient' });
   }
   let json = envelopeJson;
@@ -1778,6 +1936,7 @@ function deliverBinary(from, header, payload, metadata = {}) {
     reciprocityTtlMs: QUEUE_TTL_MS,
   });
   const recipient = online.get(header.to);
+  if (recipient && recipient.frameBatchQueue && recipient.frameBatchQueue.length) flushFrameBatch(recipient);
   if (recipient && sendBinary(recipient, queuedBinaryHeader({
     id,
     from,
@@ -1787,14 +1946,14 @@ function deliverBinary(from, header, payload, metadata = {}) {
     metadata,
   }), payload)) {
     counters.deliveredOnline += 1;
-    return { id, queued: ACK_QUEUED, dropped: false };
+    return { id, queued: true, dropped: false };
   }
   if (!stored) {
     counters.dropped += 1;
-    return { id, queued: ACK_QUEUED, dropped: true };
+    return { id, queued: false, dropped: true };
   }
   counters.queuedOffline += 1;
-  return { id, queued: ACK_QUEUED, dropped: false };
+  return { id, queued: true, dropped: false };
 }
 function ackReceived(recipientPubkey, id) {
   const from = store.ack(recipientPubkey, id);
@@ -1828,12 +1987,21 @@ function rateLimited(ws) {
   ws.rateCount += 1;
   return ws.rateCount > RATE_MAX_FRAMES;
 }
+const costlyBudgets = new Map();
+function costlyIdentity(ws) {
+  return (ws && ws.pubkey) || (ws && ws.ip) || 'anon';
+}
 function costlyLimited(ws, kind, max, now = Date.now()) {
-  if (!ws.costly) ws.costly = new Map();
-  const state = ws.costly.get(kind);
+  const identity = costlyIdentity(ws);
+  let byKind = costlyBudgets.get(identity);
+  if (!byKind) {
+    byKind = new Map();
+    costlyBudgets.set(identity, byKind);
+  }
+  const state = byKind.get(kind);
   let over;
   if (!state || now - state.start > COSTLY_WINDOW_MS) {
-    ws.costly.set(kind, { start: now, count: 1 });
+    byKind.set(kind, { start: now, count: 1 });
     over = 1 > max;
   } else {
     state.count += 1;
@@ -1841,6 +2009,14 @@ function costlyLimited(ws, kind, max, now = Date.now()) {
   }
   if (over) counters.costlyRefused += 1;
   return over;
+}
+function sweepCostlyBudgets(now = Date.now()) {
+  for (const [identity, byKind] of costlyBudgets) {
+    for (const [kind, state] of byKind) {
+      if (now - state.start > COSTLY_WINDOW_MS) byKind.delete(kind);
+    }
+    if (!byKind.size) costlyBudgets.delete(identity);
+  }
 }
 function byteLimited(ws, bytes) {
   const gate = byteGate(ws.byteState, Date.now(), bytes, RATE_WINDOW_MS, RATE_MAX_BYTES, RATE_ABUSE_WINDOWS);
@@ -1948,7 +2124,14 @@ function bindSocketToCertifiedDevice(ws, candidate) {
 function enforceAuthTimeout(ws) {
   if (ws.authed) return false;
   send(ws, { type: 'error', error: 'auth timeout' });
-  ws.terminate();
+  try {
+    ws.close(4008, 'auth timeout');
+  } catch (e) {
+    try {
+      ws.terminate();
+    } catch (e2) {
+    }
+  }
   return true;
 }
 function handleSocketMessage(ws, raw, isBinary, options = {}) {
@@ -1967,6 +2150,11 @@ function handleSocketMessage(ws, raw, isBinary, options = {}) {
     return;
   }
   if (isBinary) {
+    if (!ws.authed && (raw.length || 0) > MAX_PREAUTH_FRAME_BYTES) {
+      counters.oversized += 1;
+      send(ws, { type: 'binary-error', error: 'frame too large' });
+      return ws.terminate();
+    }
     try {
       handleBinary(ws, raw);
     } catch (error) {
@@ -2082,10 +2270,6 @@ function handleBinaryFrameSafely(ws, raw) {
       if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
         return send(ws, { type: 'binary-error', error: 'invalid frame in batch' });
       }
-      if (rateLimited(ws)) {
-        send(ws, { type: 'error', error: 'rate limit' });
-        return ws.terminate();
-      }
       handleFrameSafely(ws, frame);
     }
     return true;
@@ -2133,6 +2317,9 @@ function handleBinaryFrameSafely(ws, raw) {
     (header.ref != null && (typeof header.ref !== 'string' || header.ref.length > 160))
   ) {
     return send(ws, { type: 'binary-error', ref: header.ref, error: 'invalid attachment chunk' });
+  }
+  if (!ws.proven) {
+    return send(ws, { type: 'error', error: 'box ownership proof required' });
   }
   counters.msgsIn += 1;
   const result = deliverBinary(ws.pubkey, header, payload, senderMetadata(ws));
@@ -2195,7 +2382,12 @@ function handleFrameSafely(ws, msg) {
       const eph = nacl.box.keyPair();
       ws.ephSec = naclUtil.encodeBase64(eph.secretKey);
       const reply = { type: 'challenge', nonce: ws.nonce, eph: naclUtil.encodeBase64(eph.publicKey) };
-      if (typeof msg.cnonce === 'string' && msg.cnonce && msg.cnonce.length <= MAX_ADDR_LEN) {
+      if (
+        typeof msg.cnonce === 'string' &&
+        msg.cnonce &&
+        msg.cnonce.length <= MAX_ADDR_LEN &&
+        helloSigRate.allow(ws.ip || 'anon', Date.now())
+      ) {
         reply.relayPub = RELAY_KEYS.pub;
         reply.relaySig = signRelayAuth(msg.cnonce);
       }
@@ -2207,6 +2399,11 @@ function handleFrameSafely(ws, msg) {
       }
       if (typeof msg.signature !== 'string') {
         return send(ws, { type: 'error', error: 'auth requires signature' });
+      }
+      ws.authCount = (ws.authCount || 0) + 1;
+      if (ws.authCount > 20) {
+        send(ws, { type: 'error', error: 'too many auth attempts' });
+        return ws.terminate();
       }
       if (!verifySignature(ws.nonce, msg.signature, ws.pendingSpk)) {
         return send(ws, { type: 'error', error: 'bad signature' });
@@ -2240,6 +2437,8 @@ function handleFrameSafely(ws, msg) {
       clearTimeout(ws.authTimer);
       if (!ws.proven) {
         counters.unprovenReceive = (counters.unprovenReceive || 0) + 1;
+        const evictedUnproven = store.evictColdIdentities(MAX_IDENTITIES);
+        if (evictedUnproven) console.log(`[identities] evicted ${evictedUnproven} cold identity(ies) over cap`);
         return send(ws, {
           type: 'ready',
           queued: 0,
@@ -2277,9 +2476,6 @@ function handleFrameSafely(ws, msg) {
         overloaded: relayOverloaded(),
       });
     }
-    if (msg.type === 'relays') {
-      return send(ws, { type: 'relays', relays: relayDir });
-    }
     if (msg.type === 'ping') {
       if (ws.deviceId) store.touchDevice(ws.pubkey, Date.now());
       const busy = relayOverloaded();
@@ -2287,6 +2483,9 @@ function handleFrameSafely(ws, msg) {
       return send(ws, busy ? { type: 'pong', overloaded: true } : { type: 'pong' });
     }
     if (!ws.authed) return send(ws, { type: 'error', error: 'not authenticated' });
+    if (msg.type === 'relays') {
+      return send(ws, { type: 'relays', relays: relayDir });
+    }
     if (msg.type === 'device-roster-put') {
       if (costlyLimited(ws, 'rosterPut', ROSTER_PUT_MAX_PER_MIN)) {
         return send(ws, { type: 'device-roster-error', error: 'rate' });
@@ -2336,11 +2535,17 @@ function handleFrameSafely(ws, msg) {
         return send(ws, { type: 'relays', relays: relayDir });
       }
       const urls = Array.isArray(msg.relays) ? msg.relays : [msg.url];
-      const clean = urls.filter((u) => isValidRelayUrl(u));
-      if (clean.length) learnRelays(clean);
+      const clean = urls.slice(0, MAX_RELAYS).filter((u) => isValidRelayUrl(u));
+      if (ws.proven && clean.length) learnRelays(clean);
       return send(ws, { type: 'relays', relays: relayDir });
     }
     if (msg.type === 'turn') {
+      if (!ws.proven) {
+        return send(ws, { type: 'error', error: 'box ownership proof required' });
+      }
+      if (costlyLimited(ws, 'turn', TURN_MAX_PER_MIN)) {
+        return send(ws, { type: 'error', error: 'rate' });
+      }
       return send(ws, { type: 'turn', iceServers: turnIceServers() });
     }
     if (msg.type === 'prekeys-put') {
@@ -2470,11 +2675,9 @@ function handleFrameSafely(ws, msg) {
       if (!/^[A-Za-z0-9_-]{8,96}$/.test(testId)) {
         return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'invalid-test-id' });
       }
-      const now = Date.now();
-      if (now - (ws.lastPushTestAt || 0) < 5000) {
+      if (costlyLimited(ws, 'pushTest', PUSH_TEST_MAX_PER_MIN)) {
         return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'rate-limited' });
       }
-      ws.lastPushTestAt = now;
       const token = store.getToken(ws.pubkey);
       if (!token) {
         return send(ws, { type: 'push-test-result', testId, accepted: false, error: 'not-registered' });
@@ -2728,17 +2931,24 @@ async function fetchPeerNotes(wsUrl) {
   if (added) mbxTrim(now);
   return added;
 }
+let gossipRunning = false;
 async function gossipOnce() {
-  const peers = relayDir.filter((u) => !SELF_URL || u.toLowerCase() !== SELF_URL.toLowerCase());
-  let learned = false;
-  for (const peer of peers) {
-    const list = await fetchPeerRelays(peer);
-    if (list && learnRelays(list)) learned = true;
-    await pushSelfTo(peer);
-    await fetchPeerNotes(peer);
+  if (gossipRunning) return;
+  gossipRunning = true;
+  try {
+    const peers = relayDir.filter((u) => !SELF_URL || u.toLowerCase() !== SELF_URL.toLowerCase());
+    let learned = false;
+    for (const peer of peers) {
+      const list = await fetchPeerRelays(peer);
+      if (list && learnRelays(list)) learned = true;
+      await pushSelfTo(peer);
+      await fetchPeerNotes(peer);
+    }
+    mbxTrim();
+    if (learned) console.log(`[gossip] directory now ${relayDir.length} relays`);
+  } finally {
+    gossipRunning = false;
   }
-  mbxTrim();
-  if (learned) console.log(`[gossip] directory now ${relayDir.length} relays`);
 }
 function scheduleFederation(options = {}) {
   const selfUrl = options.selfUrl === undefined ? SELF_URL : options.selfUrl;
@@ -2789,6 +2999,7 @@ function expireQueuedEnvelopes(now = Date.now(), queueStore = store, { onFatal =
     if (redacted) console.log(`[ttl] redacted ${redacted} revoked device record(s)`);
     const staleReports = store.sweepReports(now - reportsRule.REPORT_TTL_MS);
     if (staleReports) console.log(`[ttl] dropped ${staleReports} stale report(s)`);
+    sweepRelayDirectory(now);
     return removed;
   } catch (e) {
     if (isFatalDbError(e)) {
@@ -2820,6 +3031,55 @@ function verifyReleaseSignature(payload, signature, key) {
   } catch (e) {
     return false;
   }
+}
+function verifyManifestSignature(manifest) {
+  try {
+    return (
+      verifyReleaseSignature(
+        updateManifestRule.signedPayload(manifest),
+        manifest && manifest.signature,
+        RELEASE_PUBLIC_KEY
+      ) === true
+    );
+  } catch (e) {
+    return false;
+  }
+}
+const updateHashCache = new Map();
+function releaseFileHash(target) {
+  let info = null;
+  try {
+    info = fs.statSync(target);
+  } catch (e) {
+    return '';
+  }
+  const cached = updateHashCache.get(target);
+  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) return cached.sha;
+  const hash = crypto.createHash('sha256');
+  let fd = null;
+  try {
+    fd = fs.openSync(target, 'r');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let read = 0;
+    while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      hash.update(buffer.subarray(0, read));
+    }
+  } catch (e) {
+    return '';
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch (e) {}
+    }
+  }
+  const sha = hash.digest('hex');
+  updateHashCache.set(target, { size: info.size, mtimeMs: info.mtimeMs, sha });
+  if (updateHashCache.size > 32) {
+    const oldest = updateHashCache.keys().next().value;
+    updateHashCache.delete(oldest);
+  }
+  return sha;
 }
 async function fetchText(url, limit) {
   const controller = new AbortController();
@@ -3007,14 +3267,18 @@ async function mirrorTree(platform, manifestName, targetDir, replaceDir) {
       return;
     }
     let bytes = null;
+    const itemController = new AbortController();
+    const itemTimer = setTimeout(() => itemController.abort(), 300000);
     try {
-      const response = await fetch(fileUrl, { redirect: 'follow' });
+      const response = await fetch(fileUrl, { redirect: 'follow', signal: itemController.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       bytes = Buffer.from(await response.arrayBuffer());
     } catch (e) {
       console.warn(`[update] файл ${platform} ${safe} не скачался:`, (e && e.message) || e);
       fs.rmSync(stageDir, { recursive: true, force: true });
       return;
+    } finally {
+      clearTimeout(itemTimer);
     }
     const digest = crypto.createHash('sha256').update(bytes).digest('hex');
     if (bytes.length !== Number(item.size) || digest !== String(item.sha256).toLowerCase()) {
@@ -3051,13 +3315,17 @@ async function mirrorTree(platform, manifestName, targetDir, replaceDir) {
       return;
     }
     let bytes = null;
+    const mainController = new AbortController();
+    const mainTimer = setTimeout(() => mainController.abort(), 300000);
     try {
-      const response = await fetch(fileUrl, { redirect: 'follow' });
+      const response = await fetch(fileUrl, { redirect: 'follow', signal: mainController.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       bytes = Buffer.from(await response.arrayBuffer());
     } catch (e) {
       console.warn(`[update] файл ${platform} не скачался:`, (e && e.message) || e);
       return;
+    } finally {
+      clearTimeout(mainTimer);
     }
     const digest = crypto.createHash('sha256').update(bytes).digest('hex');
     const fileOk = updateMirror.fileVerdict({ size: bytes.length, sha256: digest, release: checked.release });
@@ -3095,7 +3363,7 @@ if (!UPDATE_MIRROR_OFF) {
   }, 60000).unref();
   setInterval(maintainUpdateMirror, UPDATE_MIRROR_MS).unref();
 }
-const SHUTDOWN_FLUSH_MS = 5000;
+const SHUTDOWN_FLUSH_MS = 9000;
 function performShutdown({
   queueStore = store,
   exit = (code) => process.exit(code),
@@ -3120,14 +3388,18 @@ function performShutdown({
   }
   let resolveDone;
   const done = new Promise((resolve) => { resolveDone = resolve; });
-  const complete = () => {
+  const settle = () => {
     clearTimer(timer);
     finish();
     resolveDone();
   };
-  const timer = setTimer(complete, timeoutMs);
+  const timer = setTimer(() => {
+    console.warn(`[shutdown] флаш не завершился за ${timeoutMs} мс — доводим остановку принудительно`);
+    finish();
+    resolveDone();
+  }, timeoutMs);
   if (typeof timer.unref === 'function') timer.unref();
-  Promise.resolve(flush).then(complete, complete);
+  Promise.resolve(flush).then(settle, settle);
   return done;
 }
 function stopEmbeddedChildren() {
@@ -3281,6 +3553,11 @@ module.exports.runtime = {
   ackReceived,
   ackBinaryReceived,
   rateLimited,
+  costlyLimited,
+  sweepCostlyBudgets,
+  sweepGatewayPullRate,
+  sweepRateBudgets,
+  gatewayPullAllowed,
   byteLimited,
   closeRevokedDevice,
   acceptSignedRoster,

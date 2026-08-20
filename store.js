@@ -53,6 +53,7 @@ function createStore(dbPath, opts = {}) {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('secure_delete = ON');
+  db.pragma('busy_timeout = 250');
   db.exec(`
     CREATE TABLE IF NOT EXISTS queue (
       id        TEXT PRIMARY KEY,
@@ -154,6 +155,9 @@ function createStore(dbPath, opts = {}) {
   if (!hasProvenCol) db.exec('ALTER TABLE identities ADD COLUMN proven INTEGER DEFAULT 0');
   const hasLastSeenCol = db.prepare("SELECT count(*) c FROM pragma_table_info('identities') WHERE name='last_seen'").get().c;
   if (!hasLastSeenCol) db.exec('ALTER TABLE identities ADD COLUMN last_seen INTEGER DEFAULT 0');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_identities_last_seen ON identities(last_seen)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_ts ON queue(ts)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_binary_queue_ts ON binary_queue(ts)');
   const hasSpkPqCol = db.prepare("SELECT count(*) c FROM pragma_table_info('prekeys_spk') WHERE name='pq'").get().c;
   if (!hasSpkPqCol) db.exec('ALTER TABLE prekeys_spk ADD COLUMN pq TEXT');
   const deviceColumns0 = new Set(
@@ -264,8 +268,11 @@ function createStore(dbPath, opts = {}) {
           metadata: parse(row.meta_json),
         }));
       }
-      for (const col of legacyQueue) db.exec(`ALTER TABLE queue DROP COLUMN ${col}`);
-      for (const col of legacyBinary) db.exec(`ALTER TABLE binary_queue DROP COLUMN ${col}`);
+      const dropLegacyColumns = db.transaction(() => {
+        for (const col of legacyQueue) db.exec(`ALTER TABLE queue DROP COLUMN ${col}`);
+        for (const col of legacyBinary) db.exec(`ALTER TABLE binary_queue DROP COLUMN ${col}`);
+      });
+      dropLegacyColumns();
     }
     db.exec('CREATE INDEX IF NOT EXISTS idx_queue_pair ON queue(pair_tag, ts)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_binary_queue_pair ON binary_queue(pair_tag, ts)');
@@ -291,61 +298,35 @@ function createStore(dbPath, opts = {}) {
   }
   const blobPath = (mid) => path.join(blobDir, mid + '.json');
   const binaryPath = (mid) => path.join(blobDir, mid + '.bin');
-  const pendingBlobs = new Map();
-  const pendingBinaries = new Map();
-  const bodyWrites = new Set();
-  function writeBody(pending, mid, file, body, what) {
-    const entry = { body, cancelled: false };
-    pending.set(mid, entry);
+  function writeBodySync(file, body) {
     const tmp = file + '.tmp';
-    const promise = fs.promises
-      .writeFile(tmp, body)
-      .then(async () => {
-        if (entry.cancelled) return fs.promises.unlink(tmp).catch(() => {});
-        await fs.promises.rename(tmp, file);
-        if (entry.cancelled) await fs.promises.unlink(file).catch(() => {});
-      })
-      .catch((error) => {
-        console.warn('[store] не удалось записать ' + what, mid, error && error.message);
-        return fs.promises.unlink(tmp).catch(() => {});
-      })
-      .finally(() => {
-        bodyWrites.delete(promise);
-        if (pending.get(mid) === entry) pending.delete(mid);
-      });
-    bodyWrites.add(promise);
-  }
-  function writeBlob(mid, envJson) {
-    writeBody(pendingBlobs, mid, blobPath(mid), envJson, 'тело конверта');
-  }
-  function writeBinary(mid, bytes) {
-    if (!blobDir) throw new Error('binary blob directory is not configured');
-    writeBody(pendingBinaries, mid, binaryPath(mid), bytes, 'чанк вложения');
-  }
-  function pendingBody(pending, mid) {
-    const entry = pending.get(mid);
-    return entry && !entry.cancelled ? entry.body : null;
-  }
-  const pendingBlob = (mid) => pendingBody(pendingBlobs, mid);
-  const pendingBinary = (mid) => pendingBody(pendingBinaries, mid);
-  function unlinkBody(pending, mid, file) {
-    const entry = pending.get(mid);
-    if (entry) {
-      entry.cancelled = true;
-      pending.delete(mid);
+    try {
+      fs.writeFileSync(tmp, body);
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+      }
+      throw error;
     }
+  }
+  function writeBlobSync(mid, envJson) {
+    writeBodySync(blobPath(mid), envJson);
+  }
+  function writeBinarySync(mid, bytes) {
+    if (!blobDir) throw new Error('binary blob directory is not configured');
+    writeBodySync(binaryPath(mid), bytes);
+  }
+  function unlinkFileFor(file) {
     try {
       fs.unlinkSync(file);
     } catch (e) {
     }
   }
-  const unlinkBlob = (mid) => unlinkBody(pendingBlobs, mid, blobPath(mid));
-  const unlinkBinary = (mid) => unlinkBody(pendingBinaries, mid, binaryPath(mid));
-  async function flushPendingBlobs() {
-    while (bodyWrites.size) {
-      await Promise.allSettled([...bodyWrites]);
-    }
-  }
+  const unlinkBlob = (mid) => unlinkFileFor(blobPath(mid));
+  const unlinkBinary = (mid) => unlinkFileFor(binaryPath(mid));
+  async function flushPendingBlobs() {}
   function dropRow(r) {
     const removed = q.delId.run(r.id).changes;
     if (r.blob) unlinkBlob(r.id);
@@ -357,22 +338,19 @@ function createStore(dbPath, opts = {}) {
     insert: db.prepare(
       'INSERT OR REPLACE INTO queue (id,to_pk,envelope,silent,call_push,ts,blob,bytes,sender_meta,pair_tag,stranger) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
     ),
-    forUser: db.prepare('SELECT * FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     idsForUser: db.prepare('SELECT id FROM queue WHERE to_pk=? ORDER BY ts ASC'),
     countFor: db.prepare('SELECT count(*) c FROM queue WHERE to_pk=?'),
     countFromTo: db.prepare('SELECT count(*) c FROM queue WHERE pair_tag=?'),
-    oldestFor: db.prepare('SELECT id, blob, bytes FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
-    oldestFromTo: db.prepare('SELECT id, blob, bytes FROM queue WHERE pair_tag=? ORDER BY ts ASC LIMIT 1'),
+    oldestFor: db.prepare('SELECT id, blob, bytes, ts FROM queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
+    oldestFromTo: db.prepare('SELECT id, blob, bytes, ts FROM queue WHERE pair_tag=? ORDER BY ts ASC LIMIT 1'),
     strangerCount: db.prepare('SELECT count(*) c FROM queue WHERE to_pk=? AND stranger=1'),
     oldestStranger: db.prepare(
-      'SELECT id, blob, bytes FROM queue WHERE to_pk=? AND stranger=1 ORDER BY ts ASC LIMIT 1'
+      'SELECT id, blob, bytes, ts FROM queue WHERE to_pk=? AND stranger=1 ORDER BY ts ASC LIMIT 1'
     ),
-    oldestGlobal: db.prepare('SELECT id, blob, bytes FROM queue ORDER BY ts ASC LIMIT 1'),
     byId: db.prepare('SELECT * FROM queue WHERE id=?'),
     delId: db.prepare('DELETE FROM queue WHERE id=?'),
     blobsOlder: db.prepare('SELECT id FROM queue WHERE blob=1 AND ts < ?'),
     blobIds: db.prepare('SELECT id FROM queue WHERE blob=1'),
-    usersQueued: db.prepare('SELECT count(DISTINCT to_pk) c FROM queue'),
     totalQueued: db.prepare('SELECT count(*) c FROM queue'),
     sumBytes: db.prepare('SELECT coalesce(sum(bytes),0) c FROM queue'),
     needBackfill: db.prepare('SELECT id, blob FROM queue WHERE bytes=0'),
@@ -392,20 +370,67 @@ function createStore(dbPath, opts = {}) {
     countFor: db.prepare('SELECT count(*) c FROM binary_queue WHERE to_pk=?'),
     countFromTo: db.prepare('SELECT count(*) c FROM binary_queue WHERE pair_tag=?'),
     strangerCount: db.prepare('SELECT count(*) c FROM binary_queue WHERE to_pk=? AND stranger=1'),
+    oldestFor: db.prepare('SELECT id, bytes, ts FROM binary_queue WHERE to_pk=? ORDER BY ts ASC LIMIT 1'),
+    oldestFromTo: db.prepare('SELECT id, bytes, ts FROM binary_queue WHERE pair_tag=? ORDER BY ts ASC LIMIT 1'),
+    oldestStranger: db.prepare(
+      'SELECT id, bytes, ts FROM binary_queue WHERE to_pk=? AND stranger=1 ORDER BY ts ASC LIMIT 1'
+    ),
     rowsForDrop: db.prepare('SELECT id,bytes FROM binary_queue WHERE to_pk=?'),
     older: db.prepare('SELECT id,bytes FROM binary_queue WHERE ts < ?'),
     expire: db.prepare('DELETE FROM binary_queue WHERE ts < ?'),
     allIds: db.prepare('SELECT id FROM binary_queue'),
-    usersQueued: db.prepare('SELECT count(DISTINCT to_pk) c FROM binary_queue'),
     totalQueued: db.prepare('SELECT count(*) c FROM binary_queue'),
     sumBytes: db.prepare('SELECT coalesce(sum(bytes),0) c FROM binary_queue'),
   };
+  const usersQueuedBoth = db.prepare(
+    'SELECT count(*) c FROM (SELECT to_pk FROM queue UNION SELECT to_pk FROM binary_queue)'
+  );
   function dropBinaryRow(row) {
     const removed = binary.delId.run(row.id).changes;
     unlinkBinary(row.id);
     if (!removed) return;
     liveCount = Math.max(0, liveCount - 1);
     liveBytes = Math.max(0, liveBytes - (row.bytes || 0));
+  }
+  function oldestVictim(kind, arg) {
+    let text = null;
+    let bin = null;
+    if (kind === 'own') {
+      text = q.oldestFromTo.get(arg);
+      bin = binary.oldestFromTo.get(arg);
+    } else if (kind === 'stranger') {
+      text = q.oldestStranger.get(arg);
+      bin = binary.oldestStranger.get(arg);
+    } else {
+      text = q.oldestFor.get(arg);
+      bin = binary.oldestFor.get(arg);
+    }
+    let pickBin = false;
+    let row = null;
+    if (text && bin) {
+      pickBin = bin.ts < text.ts;
+      row = pickBin ? bin : text;
+    } else if (text) {
+      row = text;
+    } else if (bin) {
+      row = bin;
+      pickBin = true;
+    }
+    if (!row) return null;
+    if (pickBin) {
+      return {
+        bytes: row.bytes || 0,
+        removeRow: () => binary.delId.run(row.id).changes,
+        cleanup: () => unlinkBinary(row.id),
+      };
+    }
+    return {
+      bytes: row.bytes || 0,
+      removeRow: () => q.delId.run(row.id).changes,
+      cleanup: () => {
+        if (row.blob) unlinkBlob(row.id);
+      },
+    };
   }
   const correspondents = {
     note: db.prepare('INSERT OR REPLACE INTO correspondents (tag, ts) VALUES (?, ?)'),
@@ -417,11 +442,17 @@ function createStore(dbPath, opts = {}) {
     ),
   };
   const MAX_CORRESPONDENTS = 200000;
+  let correspondentCount = correspondents.count.get().c;
   function noteCorrespondent(tag, ts) {
     if (!tag) return;
+    const known = correspondents.get.get(tag);
     correspondents.note.run(tag, ts);
-    const over = correspondents.count.get().c - MAX_CORRESPONDENTS;
-    if (over > 0) correspondents.dropOldest.run(over);
+    if (known) return;
+    correspondentCount += 1;
+    if (correspondentCount > MAX_CORRESPONDENTS) {
+      const over = correspondentCount - MAX_CORRESPONDENTS;
+      correspondentCount -= correspondents.dropOldest.run(over).changes;
+    }
   }
   function isCorrespondent(tag, now, ttlMs) {
     if (!tag || !ttlMs) return false;
@@ -445,58 +476,25 @@ function createStore(dbPath, opts = {}) {
       ts: row.ts,
     };
   }
-  function binaryRowToItem(row) {
-    if (!row) return null;
-    let payload = pendingBinary(row.id);
-    if (payload == null) {
-      try {
-        payload = fs.readFileSync(binaryPath(row.id));
-      } catch (error) {
-        dropBinaryRow(row);
-        return null;
-      }
-    }
-    return binaryItem(row, payload);
-  }
   async function binaryRowToItemAsync(row) {
     if (!row) return null;
-    let payload = pendingBinary(row.id);
-    if (payload == null) {
-      try {
-        payload = await fs.promises.readFile(binaryPath(row.id));
-      } catch (error) {
-        dropBinaryRow(row);
-        return null;
-      }
+    let payload;
+    try {
+      payload = await fs.promises.readFile(binaryPath(row.id));
+    } catch (error) {
+      dropBinaryRow(row);
+      return null;
     }
     return binaryItem(row, payload);
   }
-  const rowToItem = (r) => {
-    let envJson = r.envelope;
-    if (r.blob) {
-      envJson = pendingBlob(r.id);
-      if (envJson == null) {
-        try {
-          envJson = fs.readFileSync(blobPath(r.id), 'utf8');
-        } catch (e) {
-          dropRow(r);
-          return null;
-        }
-      }
-    }
-    return itemFromEnvelope(r, envJson);
-  };
   const rowToItemAsync = async (r) => {
     let envJson = r.envelope;
     if (r.blob) {
-      envJson = pendingBlob(r.id);
-      if (envJson == null) {
-        try {
-          envJson = await fs.promises.readFile(blobPath(r.id), 'utf8');
-        } catch (e) {
-          dropRow(r);
-          return null;
-        }
+      try {
+        envJson = await fs.promises.readFile(blobPath(r.id), 'utf8');
+      } catch (e) {
+        dropRow(r);
+        return null;
       }
     }
     return itemFromEnvelope(r, envJson);
@@ -554,6 +552,7 @@ function createStore(dbPath, opts = {}) {
     ),
     del: db.prepare('DELETE FROM identities WHERE pk=?'),
   };
+  let identityTotal = id.count.get().c;
   const tok = {
     get: db.prepare('SELECT token FROM push_tokens WHERE pk=?'),
     set: db.prepare('INSERT OR REPLACE INTO push_tokens (pk,token) VALUES (?,?)'),
@@ -686,6 +685,7 @@ function createStore(dbPath, opts = {}) {
       id: mid,
       to,
       from,
+      authSender,
       fromAccount,
       fromDeviceId,
       deviceCertificate,
@@ -703,59 +703,84 @@ function createStore(dbPath, opts = {}) {
       reciprocityTtlMs = 0,
     }) {
       const envJson = typeof envelopeJson === 'string' ? envelopeJson : JSON.stringify(envelope);
-      const bytes = Buffer.byteLength(envJson);
-      const tag = pairTag(from, to);
-      const correspondent = isCorrespondent(pairTag(to, from), ts, reciprocityTtlMs);
+      const sealedMeta = sealMeta({
+        from: from || undefined,
+        fromAccount: fromAccount || from || undefined,
+        fromDeviceId: fromDeviceId || undefined,
+        deviceCertificate: deviceCertificate || undefined,
+        deviceRoster: deviceRoster || undefined,
+      });
+      const bytes = Buffer.byteLength(envJson) + (sealedMeta ? sealedMeta.length : 0);
+      const senderId = authSender == null ? from : authSender;
+      const tag = pairTag(senderId, to);
+      const correspondent = isCorrespondent(pairTag(to, senderId), ts, reciprocityTtlMs);
       const verdict = admitEnvelope({
         recipientCount: q.countFor.get(to).c + binary.countFor.get(to).c,
         strangerCount: q.strangerCount.get(to).c + binary.strangerCount.get(to).c,
         senderCount: tag ? q.countFromTo.get(tag).c + binary.countFromTo.get(tag).c : 0,
         correspondent,
-        senderKnown: !!from,
+        senderKnown: !!senderId,
         maxPerUser,
         maxPerSender,
         reserve,
       });
       if (!verdict.admit) return false;
+      let victim = null;
       if (verdict.evict === 'own') {
-        const own = q.oldestFromTo.get(tag);
-        if (own) dropRow(own);
-        else return false;
+        victim = oldestVictim('own', tag);
+        if (!victim) return false;
       } else if (verdict.evict === 'stranger') {
-        const spam = q.oldestStranger.get(to);
-        if (spam) dropRow(spam);
-        else return false;
+        victim = oldestVictim('stranger', to);
+        if (!victim) return false;
       } else if (verdict.evict === 'oldest') {
-        const o = q.oldestFor.get(to);
-        if (o) dropRow(o);
+        victim = oldestVictim('oldest', to);
       }
+      const projectedCount = liveCount - (victim ? 1 : 0);
+      const projectedBytes = liveBytes - (victim ? victim.bytes : 0);
       if (
-        (maxTotal && liveCount >= maxTotal) ||
-        (maxTotalBytes && liveBytes + bytes > maxTotalBytes)
+        (maxTotal && projectedCount >= maxTotal) ||
+        (maxTotalBytes && projectedBytes + bytes > maxTotalBytes)
       ) {
         return false;
       }
       const asBlob = blobDir && bytes > blobThreshold;
-      if (asBlob) writeBlob(mid, envJson);
-      q.insert.run(
-        mid,
-        to,
-        asBlob ? '' : envJson,
-        silent ? 1 : 0,
-        callPush ? 1 : 0,
-        ts,
-        asBlob ? 1 : 0,
-        bytes,
-        sealMeta({
-          from: from || undefined,
-          fromAccount: fromAccount || from || undefined,
-          fromDeviceId: fromDeviceId || undefined,
-          deviceCertificate: deviceCertificate || undefined,
-          deviceRoster: deviceRoster || undefined,
-        }),
-        tag,
-        from && !correspondent ? 1 : 0
-      );
+      if (asBlob) {
+        try {
+          writeBlobSync(mid, envJson);
+        } catch (error) {
+          return false;
+        }
+      }
+      let evicted = 0;
+      const commit = db.transaction(() => {
+        if (victim) evicted = victim.removeRow();
+        q.insert.run(
+          mid,
+          to,
+          asBlob ? '' : envJson,
+          silent ? 1 : 0,
+          callPush ? 1 : 0,
+          ts,
+          asBlob ? 1 : 0,
+          bytes,
+          sealedMeta,
+          tag,
+          senderId && !correspondent ? 1 : 0
+        );
+      });
+      try {
+        commit();
+      } catch (error) {
+        if (asBlob) unlinkBlob(mid);
+        throw error;
+      }
+      if (victim) {
+        victim.cleanup();
+        if (evicted) {
+          liveCount = Math.max(0, liveCount - 1);
+          liveBytes = Math.max(0, liveBytes - victim.bytes);
+        }
+      }
       liveCount += 1;
       liveBytes += bytes;
       noteCorrespondent(tag, ts);
@@ -765,6 +790,7 @@ function createStore(dbPath, opts = {}) {
       id: binaryId,
       to,
       from,
+      authSender,
       ref,
       transferId,
       index,
@@ -780,15 +806,16 @@ function createStore(dbPath, opts = {}) {
       reciprocityTtlMs = 0,
     }) {
       const bytes = payload.length;
-      const tag = pairTag(from, to);
+      const senderId = authSender == null ? from : authSender;
+      const tag = pairTag(senderId, to);
       const recipientCount = q.countFor.get(to).c + binary.countFor.get(to).c;
       const pairCount = q.countFromTo.get(tag).c + binary.countFromTo.get(tag).c;
-      const correspondent = isCorrespondent(pairTag(to, from), ts, reciprocityTtlMs);
+      const correspondent = isCorrespondent(pairTag(to, senderId), ts, reciprocityTtlMs);
       if (maxPerUser && recipientCount >= maxPerUser) return false;
       if (
         maxPerUser &&
         reserve > 0 &&
-        from &&
+        senderId &&
         !correspondent &&
         q.strangerCount.get(to).c + binary.strangerCount.get(to).c >=
           Math.max(0, maxPerUser - reserve)
@@ -803,7 +830,11 @@ function createStore(dbPath, opts = {}) {
         return false;
       }
       if (binary.byId.get(binaryId)) throw new Error('binary id already queued');
-      writeBinary(binaryId, payload);
+      try {
+        writeBinarySync(binaryId, payload);
+      } catch (error) {
+        return false;
+      }
       try {
         binary.insert.run(
           binaryId,
@@ -816,7 +847,7 @@ function createStore(dbPath, opts = {}) {
           ts,
           sealMeta({ from: from || undefined, metadata: metadata || undefined }),
           tag,
-          from && !correspondent ? 1 : 0
+          senderId && !correspondent ? 1 : 0
         );
       } catch (error) {
         unlinkBinary(binaryId);
@@ -829,9 +860,6 @@ function createStore(dbPath, opts = {}) {
     },
     binaryQueueIdsFor(to) {
       return binary.idsForUser.all(to).map((row) => row.id);
-    },
-    getBinaryItem(binaryId) {
-      return binaryRowToItem(binary.byId.get(binaryId));
     },
     getBinaryItemAsync(binaryId) {
       return binaryRowToItemAsync(binary.byId.get(binaryId));
@@ -848,15 +876,8 @@ function createStore(dbPath, opts = {}) {
       dropBinaryRow(row);
       return result;
     },
-    queueFor(to) {
-      return q.forUser.all(to).map(rowToItem).filter(Boolean);
-    },
     queueIdsFor(to) {
       return q.idsForUser.all(to).map((r) => r.id);
-    },
-    getItem(mid) {
-      const r = q.byId.get(mid);
-      return r ? rowToItem(r) : null;
     },
     getItemAsync(mid) {
       const r = q.byId.get(mid);
@@ -871,6 +892,7 @@ function createStore(dbPath, opts = {}) {
     dropQueueFor,
     mbxPut(records, valueHash) {
       let added = 0;
+      const seqBefore = mbxSeq;
       const insert = db.transaction((list) => {
         for (const record of list) {
           mbxSeq += 1;
@@ -887,7 +909,12 @@ function createStore(dbPath, opts = {}) {
           else mbxSeq -= 1;
         }
       });
-      insert(Array.isArray(records) ? records : []);
+      try {
+        insert(Array.isArray(records) ? records : []);
+      } catch (error) {
+        mbxSeq = seqBefore;
+        throw error;
+      }
       if (added) mbxRevision += 1;
       return added;
     },
@@ -920,8 +947,8 @@ function createStore(dbPath, opts = {}) {
     mbxEvictSome(limit) {
       const want = Math.max(0, Math.floor(Number(limit) || 0));
       if (!want) return 0;
+      if (!mbxq.count.get().c) return 0;
       const oldest = mbxq.oldestSlot.get().s;
-      if (!oldest) return 0;
       const removed = mbxq.evictBatch.run(oldest, want).changes;
       if (removed) mbxRevision += 1;
       return removed;
@@ -966,7 +993,6 @@ function createStore(dbPath, opts = {}) {
         const isBinary = f.endsWith('.bin');
         if (!isTmp && !isBlob && !isBinary) continue;
         const mid = f.replace(/\.(json|bin)(\.tmp)?$/, '');
-        if (isTmp && (pendingBlobs.has(mid) || pendingBinaries.has(mid))) continue;
         if (isBlob && referenced.has(mid)) continue;
         if (isBinary && referencedBinary.has(mid)) continue;
         try {
@@ -986,19 +1012,21 @@ function createStore(dbPath, opts = {}) {
       return r ? { signPk: r.sign_pk, proven: !!r.proven } : null;
     },
     bindSignKey(pk, signPk, proven = false, now = 0) {
-      id.set.run(pk, signPk, proven ? 1 : 0, now);
+      if (id.set.run(pk, signPk, proven ? 1 : 0, now).changes) identityTotal += 1;
     },
     rebindSignKey(pk, signPk, now = 0) {
+      const existed = id.get.get(pk);
       id.rebind.run(pk, signPk, 1, now);
+      if (!existed) identityTotal += 1;
     },
     touchIdentity(pk, now) {
       id.touch.run(now, pk);
     },
     identityCount() {
-      return id.count.get().c;
+      return identityTotal;
     },
     evictColdIdentities(max) {
-      const over = id.count.get().c - max;
+      const over = identityTotal - max;
       if (over <= 0) return 0;
       const victims = id.coldNoQueue.all(over).map((r) => r.pk);
       const tx = db.transaction((pks) => {
@@ -1010,6 +1038,7 @@ function createStore(dbPath, opts = {}) {
         }
       });
       tx(victims);
+      identityTotal -= victims.length;
       return victims.length;
     },
     getToken(pk) {
@@ -1077,7 +1106,7 @@ function createStore(dbPath, opts = {}) {
     touchDevice(devicePk, now) {
       device.touch.run(now, devicePk);
     },
-    putAccountRoster(roster) {
+    putAccountRoster(roster, now = Date.now()) {
       const accountPk = roster.accountPublicKey;
       const rootSignPk = roster.accountSignPublicKey;
       const raw = JSON.stringify(roster);
@@ -1109,7 +1138,7 @@ function createStore(dbPath, opts = {}) {
         for (const entry of entries) {
           const cert = entry.certificate;
           const old = existingById.get(cert.deviceId);
-          const revokedAt = entry.revokedAt == null ? null : entry.revokedAt;
+          const revokedAt = entry.revokedAt == null ? null : Math.min(entry.revokedAt, now);
           if (revokedAt != null && (!old || old.revoked_at == null)) revokedDeviceKeys.push(cert.devicePublicKey);
           device.upsert.run(
             accountPk,
@@ -1127,7 +1156,7 @@ function createStore(dbPath, opts = {}) {
         const missing = existing.filter((row) => row.revoked_at == null && !incomingIds.has(row.device_id));
         if (missing.length) {
           for (const row of missing) {
-            device.revokeById.run(roster.updatedAt, accountPk, row.device_id);
+            device.revokeById.run(Math.min(roster.updatedAt, now), accountPk, row.device_id);
             revokedDeviceKeys.push(row.device_pk);
           }
         }
@@ -1181,7 +1210,7 @@ function createStore(dbPath, opts = {}) {
     },
     stats() {
       return {
-        usersQueued: q.usersQueued.get().c + binary.usersQueued.get().c,
+        usersQueued: usersQueuedBoth.get().c,
         totalQueued: q.totalQueued.get().c + binary.totalQueued.get().c,
         relays: dir.count.get().c,
         accounts: account.count.get().c,

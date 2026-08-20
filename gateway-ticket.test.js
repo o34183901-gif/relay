@@ -96,6 +96,16 @@ test('память о жетонах не растёт вечно', () => {
   clock.at = NOW + ticketRule.TICKET_TTL_MS + ticketRule.CLOCK_SKEW_MS + 1;
   assert.strictEqual(ledger.size(), 0, 'просроченные жетоны обязаны выметаться');
 });
+test('REL-23: реестр вытесняет по сроку, а не FIFO — использованный жетон помнится до expiry', () => {
+  const AT = 1_000_000_000_000;
+  const ledger = ticketRule.createTicketLedger({ now: () => AT, limit: 4 });
+  const late = AT + 9 * 60 * 1000;
+  const early = AT + 60 * 1000;
+  ledger.remember({ nonce: 'использован-поздний', expiresAt: late });
+  for (let i = 0; i < 4; i += 1) ledger.remember({ nonce: 'flood-' + i, expiresAt: early });
+  assert.strictEqual(ledger.used('использован-поздний'), true, 'поздний жетон не вытеснен наплывом ранних');
+  assert.ok(ledger.size() <= 4, 'реестр по-прежнему ограничен');
+});
 test('подделка любого поля ломает подпись', () => {
   const ticket = issue();
   const swaps = {

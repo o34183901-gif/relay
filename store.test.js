@@ -17,12 +17,20 @@ console.log('relay store (sqlite)');
 function fresh() {
   return createStore(':memory:');
 }
+async function queued(store, to) {
+  const items = [];
+  for (const id of store.queueIdsFor(to)) {
+    const item = await store.getItemAsync(id);
+    if (item) items.push(item);
+  }
+  return items;
+}
 
-test('enqueue + queueFor: порядок по времени, распаковка конверта', () => {
+test('enqueue + queueFor: порядок по времени, распаковка конверта', async () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: { cipher: '1' }, ts: 1 });
   s.enqueue({ id: 'b', to: 'bob', from: 'alice', envelope: { cipher: '2' }, ts: 2 });
-  const q = s.queueFor('bob');
+  const q = (await queued(s, 'bob'));
   assert.strictEqual(q.length, 2);
   assert.deepStrictEqual(q.map((x) => x.id), ['a', 'b']);
   assert.deepStrictEqual(q[0].envelope, { cipher: '1' });
@@ -30,26 +38,26 @@ test('enqueue + queueFor: порядок по времени, распаковк
   s.close();
 });
 
-test('ack: удаляет по id и возвращает адрес отправителя; чужой to игнорируется', () => {
+test('ack: удаляет по id и возвращает адрес отправителя; чужой to игнорируется', async () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
   assert.strictEqual(s.ack('carol', 'a'), null, 'нельзя ack чужой очереди');
   assert.strictEqual(s.ack('bob', 'a'), 'alice');
-  assert.strictEqual(s.queueFor('bob').length, 0);
+  assert.strictEqual((await queued(s, 'bob')).length, 0);
   assert.strictEqual(s.ack('bob', 'a'), null, 'повторный ack — уже нет');
   s.close();
 });
 
-test('maxPerUser: вытесняется самый старый', () => {
+test('maxPerUser: вытесняется самый старый', async () => {
   const s = fresh();
   for (let i = 0; i < 5; i++) s.enqueue({ id: 'm' + i, to: 'bob', envelope: {}, ts: i, maxPerUser: 3 });
-  const q = s.queueFor('bob');
+  const q = (await queued(s, 'bob'));
   assert.strictEqual(q.length, 3);
   assert.deepStrictEqual(q.map((x) => x.id), ['m2', 'm3', 'm4']);
   s.close();
 });
 
-test('maxTotal (H-03): глобальный потолок ОТКЛОНЯЕТ новый, чужое старьё не вытесняет', () => {
+test('maxTotal (H-03): глобальный потолок ОТКЛОНЯЕТ новый, чужое старьё не вытесняет', async () => {
   const s = fresh();
   for (let i = 0; i < 3; i++) {
     const ok = s.enqueue({ id: 'g' + i, to: 'u' + i, envelope: {}, ts: i, maxPerUser: 500, maxTotal: 3 });
@@ -58,25 +66,25 @@ test('maxTotal (H-03): глобальный потолок ОТКЛОНЯЕТ н
   const stored = s.enqueue({ id: 'g3', to: 'u3', envelope: {}, ts: 3, maxPerUser: 500, maxTotal: 3 });
   assert.strictEqual(stored, false, 'при полной глобальной очереди новый конверт отклонён');
   assert.strictEqual(s.stats().totalQueued, 3, 'всего не больше глобального потолка');
-  assert.ok(s.getItem('g0'), 'старейший чужой конверт НЕ вытеснен');
-  assert.strictEqual(s.getItem('g3'), null, 'отклонённый конверт не сохранён');
+  assert.ok((await s.getItemAsync('g0')), 'старейший чужой конверт НЕ вытеснен');
+  assert.strictEqual((await s.getItemAsync('g3')), null, 'отклонённый конверт не сохранён');
   s.close();
 });
 
-test('S5 maxPerSender: флудер вытесняет ТОЛЬКО свои сообщения, чужие целы', () => {
+test('S5 maxPerSender: флудер вытесняет ТОЛЬКО свои сообщения, чужие целы', async () => {
   const s = fresh();
   s.enqueue({ id: 'real', to: 'bob', from: 'carol', envelope: {}, ts: 1, maxPerUser: 500, maxPerSender: 2 });
   for (let i = 0; i < 5; i++) {
     s.enqueue({ id: 'spam' + i, to: 'bob', from: 'mallory', envelope: {}, ts: 10 + i, maxPerUser: 500, maxPerSender: 2 });
   }
-  const ids = s.queueFor('bob').map((x) => x.id);
+  const ids = (await queued(s, 'bob')).map((x) => x.id);
   assert.ok(ids.includes('real'), 'сообщение честного контакта НЕ вытеснено флудером');
   const spam = ids.filter((x) => x.startsWith('spam'));
   assert.strictEqual(spam.length, 2, 'у флудера не больше его квоты (self-eviction)');
   s.close();
 });
 
-test('СРВ-2: Sybil-флудер (свежие identity) не вытесняет чужое из полной очереди', () => {
+test('СРВ-2: Sybil-флудер (свежие identity) не вытесняет чужое из полной очереди', async () => {
   const s = fresh();
   for (let i = 0; i < 3; i++) {
     s.enqueue({ id: 'real' + i, to: 'bob', from: 'carol', envelope: {}, ts: i, maxPerUser: 3 });
@@ -86,14 +94,14 @@ test('СРВ-2: Sybil-флудер (свежие identity) не вытесняе
     assert.strictEqual(stored, false, 'свежий отправитель при полной очереди отклонён');
   }
   assert.deepStrictEqual(
-    s.queueFor('bob').map((x) => x.id),
+    (await queued(s, 'bob')).map((x) => x.id),
     ['real0', 'real1', 'real2'],
     'реальные сообщения жертвы не вытеснены Sybil-флудом'
   );
   s.close();
 });
 
-test('ВЫС-15: пять личностей не закрывают ящик — резерв достаётся корреспонденту', () => {
+test('ВЫС-15: пять личностей не закрывают ящик — резерв достаётся корреспонденту', async () => {
   const s = fresh();
   const limits = { maxPerUser: 10, maxPerSender: 4, reserve: 4, reciprocityTtlMs: 1000 };
   s.enqueue({ id: 'из-дома', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
@@ -111,12 +119,12 @@ test('ВЫС-15: пять личностей не закрывают ящик �
       'письмо корреспондента проходит в резерв'
     );
   }
-  const ids = s.queueFor('bob').map((x) => x.id);
+  const ids = (await queued(s, 'bob')).map((x) => x.id);
   assert.strictEqual(ids.filter((x) => x.startsWith('письмо')).length, 4, 'все письма на месте');
   s.close();
 });
 
-test('ВЫС-15: корреспондент у полной очереди вытесняет спам незнакомца, а не отбрасывается', () => {
+test('ВЫС-15: корреспондент у полной очереди вытесняет спам незнакомца, а не отбрасывается', async () => {
   const s = fresh();
   const limits = { maxPerUser: 6, maxPerSender: 6, reserve: 2, reciprocityTtlMs: 1000 };
   s.enqueue({ id: 'из-дома', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
@@ -125,14 +133,14 @@ test('ВЫС-15: корреспондент у полной очереди вы�
   for (let i = 0; i < 4; i++) {
     s.enqueue({ id: 'спам' + i, to: 'bob', from: 'личность' + i, envelope: {}, ts: 10 + i, ...limits });
   }
-  assert.strictEqual(s.queueFor('bob').length, 6, 'очередь полна');
+  assert.strictEqual((await queued(s, 'bob')).length, 6, 'очередь полна');
   s.enqueue({ id: 'из-дома-2', to: 'dave', from: 'bob', envelope: {}, ts: 30, ...limits });
   assert.strictEqual(
     s.enqueue({ id: 'письмо-дейва', to: 'bob', from: 'dave', envelope: {}, ts: 40, ...limits }),
     true,
     'письмо корреспондента у полной очереди принимается'
   );
-  const ids = s.queueFor('bob').map((x) => x.id);
+  const ids = (await queued(s, 'bob')).map((x) => x.id);
   assert.ok(ids.includes('письмо-дейва'), 'письмо в очереди');
   assert.ok(!ids.includes('спам0'), 'старейший спам незнакомца вытеснен');
   assert.ok(ids.includes('письмо0') && ids.includes('письмо1'), 'письма других корреспондентов целы');
@@ -143,7 +151,7 @@ test('ВЫС-15: корреспондент у полной очереди вы�
   );
   s.close();
 });
-test('ВЫС-15: память о корреспондентах стареет — «писал когда-то» не открывает резерв', () => {
+test('ВЫС-15: память о корреспондентах стареет — «писал когда-то» не открывает резерв', async () => {
   const s = fresh();
   const limits = { maxPerUser: 4, maxPerSender: 4, reserve: 2, reciprocityTtlMs: 100 };
   s.enqueue({ id: 'давно', to: 'carol', from: 'bob', envelope: {}, ts: 1, ...limits });
@@ -157,18 +165,18 @@ test('ВЫС-15: память о корреспондентах стареет �
   s.expireOlderThan(2000);
   s.close();
 });
-test('S4/H-03 maxTotalBytes: байтовый потолок ОТКЛОНЯЕТ новый, чужое не вытесняет', () => {
+test('S4/H-03 maxTotalBytes: байтовый потолок ОТКЛОНЯЕТ новый, чужое не вытесняет', async () => {
   const s = fresh();
   const big = { cipher: 'x'.repeat(1000) };
   for (let i = 0; i < 5; i++) {
     s.enqueue({ id: 'b' + i, to: 'u' + i, envelope: big, ts: i, maxPerUser: 500, maxTotalBytes: 2500 });
   }
   assert.ok(s.queueBytes() <= 2500, 'вес очереди под байтовым потолком');
-  assert.ok(s.getItem('b0'), 'старейший чужой конверт НЕ вытеснен по байтам');
-  assert.strictEqual(s.getItem('b4'), null, 'новейший сверх потолка отклонён');
+  assert.ok((await s.getItemAsync('b0')), 'старейший чужой конверт НЕ вытеснен по байтам');
+  assert.strictEqual((await s.getItemAsync('b4')), null, 'новейший сверх потолка отклонён');
   s.close();
 });
-test('queueBytes (O(1)): точен при вставке/ack/вытеснении', () => {
+test('queueBytes (O(1)): точен при вставке/ack/вытеснении', async () => {
   const s = fresh();
   assert.strictEqual(s.queueBytes(), 0);
   s.enqueue({ id: 'a', to: 'bob', envelope: { cipher: 'hello' }, ts: 1 });
@@ -178,16 +186,16 @@ test('queueBytes (O(1)): точен при вставке/ack/вытеснени
   assert.strictEqual(s.queueBytes(), 0, 'после ack вес обнулился');
   s.close();
 });
-test('TTL: expireOlderThan удаляет старьё', () => {
+test('TTL: expireOlderThan удаляет старьё', async () => {
   const s = fresh();
   s.enqueue({ id: 'old', to: 'bob', envelope: {}, ts: 100 });
   s.enqueue({ id: 'new', to: 'bob', envelope: {}, ts: 1000 });
   const removed = s.expireOlderThan(500);
   assert.strictEqual(removed, 1);
-  assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['new']);
+  assert.deepStrictEqual((await queued(s, 'bob')).map((x) => x.id), ['new']);
   s.close();
 });
-test('identities TOFU: первый ключ закрепляется, второй игнорируется', () => {
+test('identities TOFU: первый ключ закрепляется, второй игнорируется', async () => {
   const s = fresh();
   assert.strictEqual(s.getSignKey('bob'), null);
   s.bindSignKey('bob', 'KEY_A');
@@ -195,7 +203,7 @@ test('identities TOFU: первый ключ закрепляется, втор�
   assert.strictEqual(s.getSignKey('bob'), 'KEY_A');
   s.close();
 });
-test('identities proven (H-6): доказанную связку легаси не перебивает, владелец box-ключа — да', () => {
+test('identities proven (H-6): доказанную связку легаси не перебивает, владелец box-ключа — да', async () => {
   const s = fresh();
   s.bindSignKey('bob', 'KEY_A', true);
   s.touchIdentity('bob', 1234);
@@ -206,7 +214,7 @@ test('identities proven (H-6): доказанную связку легаси н
   assert.deepStrictEqual(s.getIdentity('bob'), { signPk: 'KEY_B', proven: true });
   s.close();
 });
-test('identities proven (H-6): незакреплённую (сквоттерскую) связку владелец перебивает', () => {
+test('identities proven (H-6): незакреплённую (сквоттерскую) связку владелец перебивает', async () => {
   const s = fresh();
   s.bindSignKey('bob', 'SQUAT', false);
   assert.deepStrictEqual(s.getIdentity('bob'), { signPk: 'SQUAT', proven: false });
@@ -214,7 +222,7 @@ test('identities proven (H-6): незакреплённую (сквоттерс�
   assert.deepStrictEqual(s.getIdentity('bob'), { signPk: 'OWNER', proven: true });
   s.close();
 });
-test('M-02: evictColdIdentities вытесняет холодные БЕЗ очереди, каскадно чистит prekey/токен', () => {
+test('M-02: evictColdIdentities вытесняет холодные БЕЗ очереди, каскадно чистит prekey/токен', async () => {
   const s = fresh();
   s.bindSignKey('cold', 'K1', true, 100);
   s.bindSignKey('warm', 'K2', true, 300);
@@ -233,7 +241,7 @@ test('M-02: evictColdIdentities вытесняет холодные БЕЗ оч�
   assert.strictEqual(s.evictColdIdentities(5), 0, 'под потолком вытеснения нет');
   s.close();
 });
-test('push tokens: set/get/del', () => {
+test('push tokens: set/get/del', async () => {
   const s = fresh();
   s.setToken('bob', 'tok1');
   assert.strictEqual(s.getToken('bob'), 'tok1');
@@ -243,7 +251,7 @@ test('push tokens: set/get/del', () => {
   assert.strictEqual(s.getToken('bob'), null);
   s.close();
 });
-test('directory: addRelays + dedupe', () => {
+test('directory: addRelays + dedupe', async () => {
   const s = fresh();
   s.addRelays(['wss://a', 'wss://b'], 1);
   s.addRelays(['wss://a', 'wss://c'], 2);
@@ -252,7 +260,7 @@ test('directory: addRelays + dedupe', () => {
   assert.ok(d.includes('wss://a') && d.includes('wss://b') && d.includes('wss://c'));
   s.close();
 });
-test('stats отражает состояние', () => {
+test('stats отражает состояние', async () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', envelope: {}, ts: 1 });
   s.enqueue({ id: 'b', to: 'carol', envelope: {}, ts: 1 });
@@ -263,7 +271,7 @@ test('stats отражает состояние', () => {
   assert.strictEqual(st.relays, 1);
   s.close();
 });
-test('prekeys: SPK сохраняется и заменяется', () => {
+test('prekeys: SPK сохраняется и заменяется', async () => {
   const s = fresh();
   assert.strictEqual(s.getSpk('bob'), null);
   s.setSpk('bob', { id: 'a', pub: 'PUB_A', sig: 'SIG_A' });
@@ -272,7 +280,7 @@ test('prekeys: SPK сохраняется и заменяется', () => {
   assert.strictEqual(s.getSpk('bob').id, 'b');
   s.close();
 });
-test('prekeys: одноразовый выдаётся РОВНО один раз, пачка заменяется целиком', () => {
+test('prekeys: одноразовый выдаётся РОВНО один раз, пачка заменяется целиком', async () => {
   const s = fresh();
   s.replaceOtps('bob', [
     { id: 'k1', pub: 'P1' },
@@ -297,11 +305,11 @@ const blobFiles = (dir) => fs.readdirSync(dir).filter((f) => f.endsWith('.json')
 test('АУД-06: тело читается ДО того, как доехало до диска', async () => {
   const { s, dir } = freshBlobs();
   s.enqueue({ id: 'big', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 1 });
-  const item = s.getItem('big');
+  const item = (await s.getItemAsync('big'));
   assert.deepStrictEqual(item.envelope, bigEnvelope(), '...но конверт уже отдаётся');
   await s.flushPendingBlobs();
   assert.deepStrictEqual(blobFiles(dir), ['big.json'], 'а затем тело оказывается на диске');
-  assert.deepStrictEqual(s.getItem('big').envelope, bigEnvelope(), 'и читается уже оттуда');
+  assert.deepStrictEqual((await s.getItemAsync('big')).envelope, bigEnvelope(), 'и читается уже оттуда');
   s.close();
 });
 test('blob: крупный конверт уходит файлом, мелкий остаётся в БД', async () => {
@@ -310,7 +318,7 @@ test('blob: крупный конверт уходит файлом, мелки�
   s.enqueue({ id: 'small', to: 'bob', from: 'alice', envelope: { cipher: 'hi' }, ts: 2 });
   await s.flushPendingBlobs();
   assert.deepStrictEqual(blobFiles(dir), ['big.json']);
-  const q = s.queueFor('bob');
+  const q = (await queued(s, 'bob'));
   assert.deepStrictEqual(q.map((x) => x.id), ['big', 'small']);
   assert.deepStrictEqual(q[0].envelope, bigEnvelope());
   assert.strictEqual(q[0].from, 'alice');
@@ -336,7 +344,7 @@ test('blob: вытеснение по maxPerUser удаляет файл ста�
   const { s, dir } = freshBlobs();
   for (let i = 0; i < 3; i++) s.enqueue({ id: 'm' + i, to: 'bob', envelope: bigEnvelope(), ts: i, maxPerUser: 2 });
   await s.flushPendingBlobs();
-  assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['m1', 'm2']);
+  assert.deepStrictEqual((await queued(s, 'bob')).map((x) => x.id), ['m1', 'm2']);
   assert.deepStrictEqual(blobFiles(dir).sort(), ['m1.json', 'm2.json']);
   s.close();
 });
@@ -355,8 +363,8 @@ test('blob: пропавший файл — строка подчищается,
   s.enqueue({ id: 'small', to: 'bob', envelope: { cipher: 'hi' }, ts: 2 });
   await s.flushPendingBlobs();
   fs.unlinkSync(path.join(dir, 'big.json'));
-  assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['small']);
-  assert.strictEqual(s.getItem('big'), null);
+  assert.deepStrictEqual((await queued(s, 'bob')).map((x) => x.id), ['small']);
+  assert.strictEqual((await s.getItemAsync('big')), null);
   s.close();
 });
 test('blob: cleanupOrphanBlobs убирает сирот и tmp, живые не трогает', async () => {
@@ -370,7 +378,7 @@ test('blob: cleanupOrphanBlobs убирает сирот и tmp, живые не
   assert.deepStrictEqual(fs.readdirSync(dir).sort(), ['live.json', 'unrelated.txt']);
   s.close();
 });
-test('queueBytes: считает и строки БД, и blob-файлы', () => {
+test('queueBytes: считает и строки БД, и blob-файлы', async () => {
   const { s } = freshBlobs(100);
   assert.strictEqual(s.queueBytes(), 0);
   s.enqueue({ id: 'small', to: 'bob', envelope: { cipher: 'hi' }, ts: 1 });
@@ -381,10 +389,10 @@ test('queueBytes: считает и строки БД, и blob-файлы', () =
   assert.ok(s.queueBytes() < bytes, 'после ack вес очереди уменьшился');
   s.close();
 });
-test('blob: без blobDir всё в БД (обратная совместимость)', () => {
+test('blob: без blobDir всё в БД (обратная совместимость)', async () => {
   const s = createStore(':memory:');
   s.enqueue({ id: 'big', to: 'bob', envelope: bigEnvelope(), ts: 1 });
-  assert.deepStrictEqual(s.queueFor('bob')[0].envelope, bigEnvelope());
+  assert.deepStrictEqual((await queued(s, 'bob'))[0].envelope, bigEnvelope());
   assert.strictEqual(s.cleanupOrphanBlobs(), 0);
   s.close();
 });
@@ -422,7 +430,7 @@ test('binary: чанк ставится в очередь, читается це
   assert.strictEqual(putChunk(s, 'c1'), true);
   await s.flushPendingBlobs();
   assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c1']);
-  const item = s.getBinaryItem('c1');
+  const item = (await s.getBinaryItemAsync('c1'));
   assert.strictEqual(item.to, 'bob');
   assert.strictEqual(item.from, 'alice');
   assert.strictEqual(item.ref, 'msg-1');
@@ -438,11 +446,11 @@ test('binary: чанк ставится в очередь, читается це
 test('АУД-06: чанк читается ДО того, как доехал до диска', async () => {
   const { s, dir } = freshBlobs();
   putChunk(s, 'c1');
-  const item = s.getBinaryItem('c1');
+  const item = (await s.getBinaryItemAsync('c1'));
   assert.ok(item && item.payload.equals(chunk()), '...но чанк уже отдаётся');
   await s.flushPendingBlobs();
   assert.deepStrictEqual(binFiles(dir), ['c1.bin'], 'а затем тело оказывается на диске');
-  assert.ok(s.getBinaryItem('c1').payload.equals(chunk()), 'и читается уже оттуда');
+  assert.ok((await s.getBinaryItemAsync('c1')).payload.equals(chunk()), 'и читается уже оттуда');
   s.close();
 });
 test('АУД-06: getBinaryItemAsync отдаёт то же — и из памяти, и с диска', async () => {
@@ -471,7 +479,7 @@ test('binary: пропавший файл — строка подчищаетс�
   putChunk(s, 'c2', { ts: 2 });
   await s.flushPendingBlobs();
   fs.unlinkSync(path.join(dir, 'c1.bin'));
-  assert.strictEqual(s.getBinaryItem('c1'), null, 'мёртвая строка удалена');
+  assert.strictEqual((await s.getBinaryItemAsync('c1')), null, 'мёртвая строка удалена');
   assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c2'], 'остальная очередь цела');
   assert.strictEqual(s.queueBytes(), 4096, 'вес очереди пересчитан ровно на один чанк');
   s.close();
@@ -505,14 +513,14 @@ test('binary: cleanupOrphanBlobs убирает .bin-сирот, но не тр�
   putChunk(s, 'live');
   assert.strictEqual(s.cleanupOrphanBlobs(), 0);
   await s.flushPendingBlobs();
-  assert.ok(s.getBinaryItem('live').payload.equals(chunk()), 'чанк уцелел');
+  assert.ok((await s.getBinaryItemAsync('live')).payload.equals(chunk()), 'чанк уцелел');
   fs.writeFileSync(path.join(dir, 'orphan.bin'), 'x');
   fs.writeFileSync(path.join(dir, 'half.bin.tmp'), 'x');
   assert.strictEqual(s.cleanupOrphanBlobs(), 2);
   assert.deepStrictEqual(fs.readdirSync(dir).sort(), ['live.bin']);
   s.close();
 });
-test('binary: потолки очереди считают чанки вместе с конвертами', () => {
+test('binary: потолки очереди считают чанки вместе с конвертами', async () => {
   const { s } = freshBlobs();
   assert.strictEqual(putChunk(s, 'c1', { maxPerUser: 2 }), true);
   assert.strictEqual(putChunk(s, 'c2', { ts: 2, maxPerUser: 2 }), true);
@@ -521,20 +529,20 @@ test('binary: потолки очереди считают чанки вмест
   assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['c1', 'c2']);
   s.close();
 });
-test('blob: ошибка фоновой записи подчищает недоступное тело', async () => {
+test('blob: НАЙДЕНО СРВ-03 — отказ записи тела отклоняет конверт, а не теряет его молча', async () => {
   const { s } = freshBlobs();
-  const originalWriteFile = fs.promises.writeFile;
-  fs.promises.writeFile = async () => { throw new Error('disk unavailable'); };
+  const originalWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = () => { throw new Error('disk unavailable'); };
   try {
-    s.enqueue({ id: 'write-failed', to: 'bob', envelope: bigEnvelope(), ts: 1 });
-    await s.flushPendingBlobs();
-    assert.strictEqual(s.getItem('write-failed'), null);
+    const queued = s.enqueue({ id: 'write-failed', to: 'bob', envelope: bigEnvelope(), ts: 1 });
+    assert.strictEqual(queued, false, 'enqueue сообщает отказ, а не молчаливый queued:true');
+    assert.strictEqual((await s.getItemAsync('write-failed')), null, 'фантомной строки без тела не осталось');
   } finally {
-    fs.promises.writeFile = originalWriteFile;
+    fs.writeFileSync = originalWriteFileSync;
     s.close();
   }
 });
-test('binary: raw-чанк читается, учитывается и подтверждается без base64', () => {
+test('binary: raw-чанк читается, учитывается и подтверждается без base64', async () => {
   const { s, dir } = freshBlobs();
   const payload = Buffer.from([0, 1, 2, 255]);
   assert.strictEqual(s.enqueueBinary({
@@ -542,27 +550,29 @@ test('binary: raw-чанк читается, учитывается и подт�
     index: 0, total: 1, metadata: { mime: 'image/png' }, payload, ts: 10,
   }), true);
   assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), ['binary-1']);
-  const item = s.getBinaryItem('binary-1');
+  const item = (await s.getBinaryItemAsync('binary-1'));
   assert.deepStrictEqual(item.payload, payload);
   assert.deepStrictEqual(item.metadata, { mime: 'image/png' });
   assert.strictEqual(s.ackBinary('mallory', 'binary-1'), null);
   assert.deepStrictEqual(s.ackBinary('bob', 'binary-1'), {
     from: 'alice', ref: 'message-1', transferId: 'transfer-1', index: 0,
   });
-  assert.strictEqual(s.getBinaryItem('binary-1'), null);
+  assert.strictEqual((await s.getBinaryItemAsync('binary-1')), null);
   assert.strictEqual(fs.existsSync(path.join(dir, 'binary-1.bin')), false);
   s.close();
 });
-test('binary: лимиты учитывают общую и парную очередь', () => {
+test('binary: НАЙДЕНО REL-03 — конверт само-вытесняет чанк того же отправителя, а не теряется', async () => {
   const { s } = freshBlobs();
   const payload = Buffer.from([1, 2, 3]);
   assert.strictEqual(s.enqueueBinary({ id: 'b-limit', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload, ts: 1 }), true);
-  assert.strictEqual(s.enqueue({ id: 'json-pair', to: 'bob', from: 'alice', envelope: {}, ts: 2, maxPerSender: 1 }), false);
+  assert.strictEqual(s.enqueue({ id: 'json-pair', to: 'bob', from: 'alice', envelope: {}, ts: 2, maxPerSender: 1 }), true, 'текст само-вытесняет собственный чанк, а не отвергается');
+  assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), [], 'старейший чанк отправителя вытеснен');
+  assert.deepStrictEqual(s.queueIdsFor('bob'), ['json-pair'], 'текст принят в парную очередь');
   assert.strictEqual(s.enqueueBinary({ id: 'b-count', to: 'carol', from: 'alice', transferId: 't2', index: 0, total: 1, payload, ts: 2, maxTotal: 1 }), false);
   assert.strictEqual(s.enqueueBinary({ id: 'b-bytes', to: 'carol', from: 'alice', transferId: 't3', index: 0, total: 1, payload, ts: 3, maxTotalBytes: s.queueBytes() }), false);
   s.close();
 });
-test('binary: ошибка метаданных и дубликат не оставляют сирот и не портят принятое тело', () => {
+test('binary: ошибка метаданных и дубликат не оставляют сирот и не портят принятое тело', async () => {
   const { s, dir } = freshBlobs();
   const circular = {};
   circular.self = circular;
@@ -574,7 +584,7 @@ test('binary: ошибка метаданных и дубликат не ост�
   const original = Buffer.from('original');
   s.enqueueBinary({ id: 'duplicate', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: original, ts: 2 });
   assert.throws(() => s.enqueueBinary({ id: 'duplicate', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: Buffer.from('replacement'), ts: 3 }));
-  assert.deepStrictEqual(s.getBinaryItem('duplicate').payload, original, 'дубликат не уничтожает уже принятое тело');
+  assert.deepStrictEqual((await s.getBinaryItemAsync('duplicate')).payload, original, 'дубликат не уничтожает уже принятое тело');
   s.close();
 });
 test('binary: пропавший raw-файл удаляет мёртвую строку', async () => {
@@ -582,11 +592,11 @@ test('binary: пропавший raw-файл удаляет мёртвую ст
   s.enqueueBinary({ id: 'missing-bin', to: 'bob', from: 'alice', transferId: 't', index: 0, total: 1, payload: Buffer.from('x'), ts: 1 });
   await s.flushPendingBlobs();
   fs.unlinkSync(path.join(dir, 'missing-bin.bin'));
-  assert.strictEqual(s.getBinaryItem('missing-bin'), null);
+  assert.strictEqual((await s.getBinaryItemAsync('missing-bin')), null);
   assert.deepStrictEqual(s.binaryQueueIdsFor('bob'), []);
   s.close();
 });
-test('перезапуск: backfill восстанавливает bytes, повреждённые JSON изолируются', () => {
+test('перезапуск: backfill восстанавливает bytes, повреждённые JSON изолируются', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-store-db-'));
   const dbPath = path.join(root, 'relay.sqlite');
   const blobDir = path.join(root, 'blobs');
@@ -597,7 +607,7 @@ test('перезапуск: backfill восстанавливает bytes, по�
     deviceCertificate: { id: 'device' }, deviceRoster: { version: 1 },
   });
   s.enqueue({ id: 'legacy-missing', to: 'bob', from: 'alice', envelope: bigEnvelope(), ts: 3 });
-  return s.flushPendingBlobs().then(() => {
+  return s.flushPendingBlobs().then(async () => {
     s.close();
     const raw = new Database(dbPath);
     raw.prepare('UPDATE queue SET bytes=0').run();
@@ -610,8 +620,8 @@ test('перезапуск: backfill восстанавливает bytes, по�
     mutate.prepare("UPDATE queue SET envelope='{broken' WHERE id='legacy-inline'").run();
     mutate.prepare("UPDATE queue SET sender_meta=x'00' WHERE id='legacy-blob'").run();
     mutate.close();
-    assert.strictEqual(s.getItem('legacy-inline'), null);
-    const blob = s.getItem('legacy-blob');
+    assert.strictEqual((await s.getItemAsync('legacy-inline')), null);
+    const blob = (await s.getItemAsync('legacy-blob'));
     assert.strictEqual(blob.deviceCertificate, undefined);
     assert.strictEqual(blob.deviceRoster, undefined);
     assert.strictEqual(blob.from, undefined, 'из нечитаемого блоба не берётся и отправитель');
@@ -646,7 +656,7 @@ function roster(version, devices, updatedAt = version * 1000) {
     rootSignature: 'roster-signature-' + version,
   };
 }
-test('linked devices: roster монотонен, читается по account и device key', () => {
+test('linked devices: roster монотонен, читается по account и device key', async () => {
   const s = fresh();
   const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
   const second = deviceCertificate('account-pk', 'root-sign-pk', 'second', 'second-pk', 'second-sign-pk', 2000);
@@ -670,7 +680,7 @@ test('linked devices: roster монотонен, читается по account �
   assert.strictEqual(s.putAccountRoster({ ...v2, rootSignature: 'other' }).reason, 'roster-version-conflict');
   s.close();
 });
-test('linked devices: отзыв необратим тем же сертификатом и чистит транспорт', () => {
+test('linked devices: отзыв необратим тем же сертификатом и чистит транспорт', async () => {
   const s = fresh();
   const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
   const second = deviceCertificate('account-pk', 'root-sign-pk', 'second', 'second-pk', 'second-sign-pk', 2000);
@@ -693,7 +703,7 @@ test('linked devices: отзыв необратим тем же сертифик
   assert.deepStrictEqual(revoked.revokedDeviceKeys, ['second-pk']);
   assert.strictEqual(s.getDevice('second-pk').revokedAt, 2500);
   assert.strictEqual(s.purgeDeviceTransport('second-pk'), 1);
-  assert.strictEqual(s.queueFor('second-pk').length, 0);
+  assert.strictEqual((await queued(s, 'second-pk')).length, 0);
   assert.strictEqual(s.getToken('second-pk'), null);
   assert.strictEqual(s.getSpk('second-pk'), null);
   assert.strictEqual(s.countOtps('second-pk'), 0);
@@ -706,7 +716,7 @@ test('linked devices: отзыв необратим тем же сертифик
   assert.strictEqual(replay.reason, 'device-revoked');
   s.close();
 });
-test('ГРФ-1: в базе нет ни колонки, ни индекса «кто кому»', () => {
+test('ГРФ-1: в базе нет ни колонки, ни индекса «кто кому»', async () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
   const columns = (table) => s.tableColumnsForTest(table);
@@ -724,7 +734,7 @@ test('ГРФ-1: в базе нет ни колонки, ни индекса «к
   assert.ok(indexes.includes('idx_binary_queue_pair'), 'квота ходит по индексу метки пары (бинарный)');
   s.close();
 });
-test('ГРФ-1: доставка получателю сохраняет ВСЕ метаданные отправителя', () => {
+test('ГРФ-1: доставка получателю сохраняет ВСЕ метаданные отправителя', async () => {
   const s = fresh();
   const cert = { deviceId: 'second-1', devicePublicKey: 'alice-dev' };
   const roster = { version: 7, devices: [{ certificate: cert, revokedAt: null }] };
@@ -739,7 +749,7 @@ test('ГРФ-1: доставка получателю сохраняет ВСЕ 
     envelope: { cipher: 'x' },
     ts: 1,
   });
-  const item = s.getItem('a');
+  const item = (await s.getItemAsync('a'));
   assert.strictEqual(item.from, 'alice-dev');
   assert.strictEqual(item.fromAccount, 'alice-acc');
   assert.strictEqual(item.fromDeviceId, 'second-1');
@@ -748,16 +758,16 @@ test('ГРФ-1: доставка получателю сохраняет ВСЕ 
   assert.strictEqual(s.ack('bob', 'a'), 'alice-dev');
   s.close();
 });
-test('ГРФ-1: без fromAccount он равен from (легаси-путь одноустройственного отправителя)', () => {
+test('ГРФ-1: без fromAccount он равен from (легаси-путь одноустройственного отправителя)', async () => {
   const s = fresh();
   s.enqueue({ id: 'a', to: 'bob', from: 'alice', envelope: {}, ts: 1 });
-  const item = s.getItem('a');
+  const item = (await s.getItemAsync('a'));
   assert.strictEqual(item.from, 'alice');
   assert.strictEqual(item.fromAccount, 'alice');
   assert.strictEqual(item.fromDeviceId, undefined);
   s.close();
 });
-test('ГРФ-1: квота на пару считается по метке — разные отправители не мешают друг другу', () => {
+test('ГРФ-1: квота на пару считается по метке — разные отправители не мешают друг другу', async () => {
   const s = fresh();
   s.enqueue({ id: 'real', to: 'bob', from: 'carol', envelope: {}, ts: 1, maxPerUser: 500, maxPerSender: 2 });
   for (let i = 0; i < 4; i++) {
@@ -766,9 +776,9 @@ test('ГРФ-1: квота на пару считается по метке — 
   for (let i = 0; i < 4; i++) {
     s.enqueue({ id: 'd' + i, to: 'dave', from: 'mallory', envelope: {}, ts: 20 + i, maxPerUser: 500, maxPerSender: 2 });
   }
-  assert.ok(s.queueFor('bob').map((x) => x.id).includes('real'), 'чужое не вытеснено');
-  assert.strictEqual(s.queueFor('bob').filter((x) => x.id.startsWith('s')).length, 2);
-  assert.strictEqual(s.queueFor('dave').length, 2, 'квота пары считается на пару, а не на отправителя');
+  assert.ok((await queued(s, 'bob')).map((x) => x.id).includes('real'), 'чужое не вытеснено');
+  assert.strictEqual((await queued(s, 'bob')).filter((x) => x.id.startsWith('s')).length, 2);
+  assert.strictEqual((await queued(s, 'dave')).length, 2, 'квота пары считается на пару, а не на отправителя');
   s.close();
 });
 test('ГРФ-1: файл базы не содержит адресов отправителей, метаданные переживают перезапуск', async () => {
@@ -794,21 +804,21 @@ test('ГРФ-1: файл базы не содержит адресов отпр�
   }
   assert.ok(fs.readFileSync(dbPath).includes(Buffer.from('RECIPIENT-KEY')));
   const again = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
-  const item = again.getItem('a');
+  const item = (await again.getItemAsync('a'));
   assert.strictEqual(item.from, 'SENDER-DEVICE-KEY', 'ключ подхватился из файла рядом с базой');
   assert.strictEqual(item.fromAccount, 'SENDER-ACCOUNT-KEY');
   assert.deepStrictEqual(item.deviceCertificate, cert);
   again.close();
   fs.unlinkSync(dbPath + '.metakey');
   const orphaned = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
-  const blind = orphaned.getItem('a');
+  const blind = (await orphaned.getItemAsync('a'));
   assert.deepStrictEqual(blind.envelope, { cipher: 'x' }, 'конверт не потерян');
   assert.strictEqual(blind.from, undefined, 'отправитель без ключа не восстанавливается');
   assert.strictEqual(orphaned.ack('RECIPIENT-KEY', 'a'), null, 'квитанцию слать некому');
   orphaned.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
-test('ГРФ-1: миграция старой базы переносит метаданные и сносит открытый текст', () => {
+test('ГРФ-1: миграция старой базы переносит метаданные и сносит открытый текст', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grf-mig-'));
   const dbPath = path.join(dir, 'relay.db');
   const legacy = new Database(dbPath);
@@ -841,7 +851,7 @@ test('ГРФ-1: миграция старой базы переносит мет
     .run('b1', 'bob', 'OLD-SENDER', 'r1', 't1', 0, 2, '{"fromAccount":"OLD-ACCOUNT"}', 10, 102);
   legacy.close();
   const s = createStore(dbPath, { blobDir: path.join(dir, 'blobs') });
-  const item = s.getItem('m1');
+  const item = (await s.getItemAsync('m1'));
   assert.strictEqual(item.from, 'OLD-SENDER', 'накопленная очередь не потеряла отправителя');
   assert.strictEqual(item.fromAccount, 'OLD-ACCOUNT');
   assert.strictEqual(item.fromDeviceId, 'dev-7');
@@ -851,7 +861,7 @@ test('ГРФ-1: миграция старой базы переносит мет
   assert.ok(!s.tableColumnsForTest('binary_queue').includes('meta_json'));
   const stored = s.enqueue({ id: 'm2', to: 'bob', from: 'OLD-SENDER', envelope: {}, ts: 200, maxPerUser: 500, maxPerSender: 1 });
   assert.strictEqual(stored, true);
-  assert.deepStrictEqual(s.queueFor('bob').map((x) => x.id), ['m2'], 'вытеснен свой же старейший');
+  assert.deepStrictEqual((await queued(s, 'bob')).map((x) => x.id), ['m2'], 'вытеснен свой же старейший');
   s.close();
   for (const file of fs.readdirSync(dir).filter((f) => f.startsWith('relay.db'))) {
     const raw = fs.readFileSync(path.join(dir, file));
@@ -860,7 +870,7 @@ test('ГРФ-1: миграция старой базы переносит мет
   }
   fs.rmSync(dir, { recursive: true, force: true });
 });
-test('ГРФ-3: имя давно отозванного устройства стирается, ключи и запрет оживления остаются', () => {
+test('ГРФ-3: имя давно отозванного устройства стирается, ключи и запрет оживления остаются', async () => {
   const s = fresh();
   const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
   const second = deviceCertificate('account-pk', 'root-sign-pk', 'second', 'second-pk', 'second-sign-pk', 2000);
@@ -895,7 +905,7 @@ test('ГРФ-3: имя давно отозванного устройства с
   );
   s.close();
 });
-test('linked devices: ключ устройства не переносится между аккаунтами', () => {
+test('linked devices: ключ устройства не переносится между аккаунтами', async () => {
   const s = fresh();
   const first = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'shared-device-pk', 'device-sign');
   assert.strictEqual(s.putAccountRoster(roster(1, [{ certificate: first, revokedAt: null }])).ok, true);
@@ -908,7 +918,7 @@ test('linked devices: ключ устройства не переносится 
   assert.strictEqual(s.putAccountRoster(otherRoster).reason, 'device-key-conflict');
   s.close();
 });
-test('linked devices: отсутствие устройства в новом полном roster отзывает его', () => {
+test('linked devices: отсутствие устройства в новом полном roster отзывает его', async () => {
   const s = fresh();
   const phone = deviceCertificate('account-pk', 'root-sign-pk', 'phone', 'account-pk', 'root-sign-pk');
   const second = deviceCertificate('account-pk', 'root-sign-pk', 'second', 'second-pk', 'second-sign-pk', 2000);
@@ -921,7 +931,7 @@ test('linked devices: отсутствие устройства в новом п
   assert.strictEqual(s.getDevice('second-pk').revokedAt, 3000);
   s.close();
 });
-test('linked devices: повреждённый roster в БД не выходит наружу', () => {
+test('linked devices: повреждённый roster в БД не выходит наружу', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'licno-roster-db-'));
   const dbPath = path.join(root, 'relay.sqlite');
   const s = createStore(dbPath);
@@ -933,7 +943,7 @@ test('linked devices: повреждённый roster в БД не выходи�
   assert.strictEqual(s.getAccountRoster('account-pk'), null);
   s.close();
 });
-test('отчёты: повтор той же посылки не создаёт вторую запись', () => {
+test('отчёты: повтор той же посылки не создаёт вторую запись', async () => {
   const s = fresh();
   s.addReport('id-1', 1000, '{"v":1}');
   s.addReport('id-1', 2000, '{"v":1}');
@@ -943,7 +953,7 @@ test('отчёты: повтор той же посылки не создаёт 
   assert.strictEqual(page[0].at, 1000, 'осталась первая запись, время не переписано');
   s.close();
 });
-test('отчёты: страница отдаёт самые старые вперёд и не больше запрошенного', () => {
+test('отчёты: страница отдаёт самые старые вперёд и не больше запрошенного', async () => {
   const s = fresh();
   s.addReport('c', 3000, '{"v":1,"n":3}');
   s.addReport('a', 1000, '{"v":1,"n":1}');
@@ -951,7 +961,7 @@ test('отчёты: страница отдаёт самые старые впе
   assert.deepStrictEqual(s.reportsPage(2).map((r) => r.id), ['a', 'b']);
   s.close();
 });
-test('отчёты: подтверждённые удаляются, остальные остаются', () => {
+test('отчёты: подтверждённые удаляются, остальные остаются', async () => {
   const s = fresh();
   s.addReport('a', 1000, '{}');
   s.addReport('b', 2000, '{}');
@@ -960,7 +970,7 @@ test('отчёты: подтверждённые удаляются, остал�
   assert.strictEqual(s.deleteReports([]), 0);
   s.close();
 });
-test('отчёты: невостребованные уходят по сроку', () => {
+test('отчёты: невостребованные уходят по сроку', async () => {
   const s = fresh();
   s.addReport('старый', 1000, '{}');
   s.addReport('свежий', 9000, '{}');
@@ -969,7 +979,7 @@ test('отчёты: невостребованные уходят по срок�
   s.close();
 });
 chain
-  .then(() => {
+  .then(async () => {
     console.log('\n' + passed + ' passed');
   })
   .catch((error) => {

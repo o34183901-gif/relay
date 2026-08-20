@@ -66,10 +66,11 @@ function buildTicket({ addr, agent, agentSign, now, ttlMs = TICKET_TTL_MS, nonce
 function parseTicket(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.v !== VERSION) return null;
-  for (const field of ['addr', 'agent', 'agentSign', 'nonce', 'sig']) {
+  for (const field of ['addr', 'agent', 'agentSign', 'sig']) {
     const item = value[field];
     if (typeof item !== 'string' || !item || item.length > 128) return null;
   }
+  if (typeof value.nonce !== 'string' || !value.nonce || value.nonce.length > 32) return null;
   if (!Number.isFinite(value.issuedAt) || value.issuedAt <= 0) return null;
   if (!Number.isFinite(value.expiresAt) || value.expiresAt <= value.issuedAt) return null;
   if (value.expiresAt - value.issuedAt > TICKET_TTL_MS) return null;
@@ -110,8 +111,16 @@ function createTicketLedger({ now = () => Date.now(), limit = 4096 } = {}) {
       if (until <= at) seen.delete(nonce);
     }
     while (seen.size > limit) {
-      const oldest = seen.keys().next().value;
-      seen.delete(oldest);
+      let victim = null;
+      let soonest = Infinity;
+      for (const [nonce, until] of seen) {
+        if (until < soonest) {
+          soonest = until;
+          victim = nonce;
+        }
+      }
+      if (victim === null) break;
+      seen.delete(victim);
     }
   }
   return {

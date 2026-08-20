@@ -21,6 +21,14 @@ test('признак стабилен для одного отправителя
   assert.notStrictEqual(chatNotificationTag(ALICE), chatNotificationTag(BOB));
 });
 
+test('REL-30: метка солится — без соли не воспроизводится, разные соли различны', () => {
+  const crypto = require('crypto');
+  const saltA = crypto.createHash('sha256').update('соль-узла-A').digest();
+  const saltB = crypto.createHash('sha256').update('соль-узла-B').digest();
+  assert.notStrictEqual(chatNotificationTag(ALICE, saltA), chatNotificationTag(ALICE), 'соль меняет метку');
+  assert.notStrictEqual(chatNotificationTag(ALICE, saltA), chatNotificationTag(ALICE, saltB), 'разные соли — разные метки');
+  assert.strictEqual(chatNotificationTag(ALICE, saltA), chatNotificationTag(ALICE, saltA), 'стабильна при одной соли');
+});
 test('признак безопасен как тег уведомления (base64url, ограниченная длина)', () => {
   const tag = chatNotificationTag(ALICE);
   assert.ok(/^[A-Za-z0-9_-]{1,64}$/.test(tag), 'тег: ' + tag);

@@ -90,9 +90,18 @@ test('конфиг слушает только петлю и не пересыл
   assert.ok(text.includes('upstream-base-url: ""'), 'пересылка на ntfy.sh обязана быть выключена');
   assert.ok(text.includes('enable-signup: false'));
   assert.ok(text.includes('enable-login: false'));
+  assert.ok(text.includes('auth-default-access: "deny-all"'), 'аноним не должен читать и публиковать в топики');
+  assert.ok(text.includes('auth-file: "/data/ntfy/auth.db"'), 'без файла учёток политика доступа не применяется');
+  assert.ok(
+    !text.split('\n').some((line) => /^auth-default-access:\s*"?(read-write|read-only|write-only)"?/.test(line)),
+    'умолчание ntfy read-write обязано быть закрыто'
+  );
   assert.ok(text.endsWith('\n'));
+  const withAuth = ntfyConfigText({ cacheFile: '/data/ntfy/cache.db', authFile: '/etc/ntfy/user.db' });
+  assert.ok(withAuth.includes('auth-file: "/etc/ntfy/user.db"'), 'явный файл учёток обязан побеждать вычисленный');
   const bare = ntfyConfigText();
   assert.ok(bare.includes(`listen-http: "127.0.0.1:${NTFY_DEFAULT_PORT}"`));
+  assert.ok(bare.includes('auth-default-access: "deny-all"'), 'закрытый доступ обязан быть и без адреса релея');
   assert.ok(
     !bare.split('\n').some((line) => line.startsWith('base-url:')),
     'без адреса релея строка base-url не выдумывается'

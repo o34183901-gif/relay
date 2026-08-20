@@ -17,6 +17,10 @@ function createHttpRateLimit({ max, windowMs }) {
     for (const [k, w] of windows) {
       if (now - w.start >= windowMs) windows.delete(k);
     }
+    while (windows.size > 4096) {
+      const oldest = windows.keys().next().value;
+      windows.delete(oldest);
+    }
   }
   function size() {
     return windows.size;

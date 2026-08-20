@@ -58,6 +58,7 @@ test('isUnifiedPushEndpoint: подписка → true, FCM-токен → false
 
 test('validUnifiedPushEndpoint: публичный http(s) — ок; приватный/мусор — нет', () => {
   assert.strictEqual(validUnifiedPushEndpoint('https://ntfy.example.com/up'), true);
+  assert.strictEqual(validUnifiedPushEndpoint('http://ntfy.example.com/up'), false);
   assert.strictEqual(validUnifiedPushEndpoint('http://127.0.0.1/up'), false);
   assert.strictEqual(validUnifiedPushEndpoint('http://2130706433/up'), false);
   assert.strictEqual(validUnifiedPushEndpoint('ws://example.com/up'), false);

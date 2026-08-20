@@ -7,3 +7,5 @@ After=network-online.target docker.service
 Type=oneshot
 Environment=LICNO_COMPOSE_DIR=/opt/licno-relay
 ExecStart=/usr/local/bin/licno-update.sh
+TimeoutStartSec=600
+TimeoutStopSec=60

@@ -70,6 +70,7 @@ function cleanText(value, label, max = 64) {
     .join('')
     .trim();
   if (!clean || [...clean].length > max) fail(`${label} has invalid length`);
+  if (clean !== value) fail(`${label} is not canonical`);
   return clean;
 }
 function cleanTimestamp(value, label) {

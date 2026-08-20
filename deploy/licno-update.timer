@@ -4,8 +4,7 @@ Description=Run licno relay verified auto-update every 5 minutes
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=5min
-RandomizedDelaySec=60
-Persistent=true
+RandomizedDelaySec=1800
 
 [Install]
 WantedBy=timers.target

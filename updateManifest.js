@@ -1,5 +1,6 @@
 'use strict';
 const SIGNED_FIELDS = ['version', 'url', 'size', 'sha256', 'platform', 'channel', 'notes', 'filesHash'];
+const MAX_RELEASE_BYTES = 4 * 1024 * 1024 * 1024;
 function manifestChannel(manifest) {
   const value = manifest && manifest.channel;
   return typeof value === 'string' && value ? value : 'stable';
@@ -38,15 +39,27 @@ function filesPayload(files) {
     .map((item) => `${item.path}\n${item.size}\n${item.sha256}`)
     .join('\n');
 }
+function canonicalValue(value) {
+  const type = typeof value;
+  if (type === 'string') return { t: 's', v: value };
+  if (type === 'number') return Number.isFinite(value) ? { t: 'n', v: value } : { t: 'x', v: String(value) };
+  if (type === 'boolean') return { t: 'b', v: value };
+  if (Array.isArray(value)) return { t: 'a', v: value.map(canonicalValue) };
+  if (value && type === 'object') {
+    const keys = Object.keys(value).sort();
+    return { t: 'o', v: keys.map((key) => [key, canonicalValue(value[key])]) };
+  }
+  return { t: 'x', v: String(value) };
+}
 function signedPayload(manifest) {
   const source = manifest && typeof manifest === 'object' ? manifest : {};
-  const parts = [];
+  const shape = [];
   for (const field of SIGNED_FIELDS) {
     const value = source[field];
     if (value === undefined || value === null) continue;
-    parts.push(`${field}=${String(value)}`);
+    shape.push([field, canonicalValue(value)]);
   }
-  return parts.join('\n');
+  return JSON.stringify(shape);
 }
 function verifyUpdateManifest(input) {
   const {
@@ -85,7 +98,9 @@ function verifyUpdateManifest(input) {
     return { ok: false, reason: 'в манифесте нет отпечатка файла' };
   }
   const size = Number(manifest.size);
-  if (!Number.isFinite(size) || size <= 0) return { ok: false, reason: 'в манифесте нет размера файла' };
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_RELEASE_BYTES) {
+    return { ok: false, reason: 'в манифесте нет размера файла' };
+  }
   const filesHash = manifest.filesHash;
   if (
     filesHash !== undefined &&

@@ -51,7 +51,7 @@ function releasePath(dir, platform, kind) {
   return full;
 }
 function manifestResponse(input) {
-  const { dir, platform, read, channel } = input && typeof input === 'object' ? input : {};
+  const { dir, platform, read, channel, verify } = input && typeof input === 'object' ? input : {};
   const asked = askedPlatform(platform);
   if (!asked) return { status: 404, reason: 'неизвестная платформа' };
   const wantedChannel = askedChannel(channel);
@@ -81,10 +81,13 @@ function manifestResponse(input) {
   if (typeof manifest.signature !== 'string' || !manifest.signature) {
     return { status: 404, reason: 'выпуск не подписан' };
   }
+  if (typeof verify === 'function' && verify(manifest) !== true) {
+    return { status: 404, reason: 'подпись выпуска не сходится' };
+  }
   return { status: 200, platform: asked, manifest, body: JSON.stringify(manifest) };
 }
 function fileResponse(input) {
-  const { dir, platform, stat, channel } = input && typeof input === 'object' ? input : {};
+  const { dir, platform, stat, channel, expect, hash } = input && typeof input === 'object' ? input : {};
   const asked = askedPlatform(platform);
   if (!asked) return { status: 404, reason: 'неизвестная платформа' };
   const wantedChannel = askedChannel(channel);
@@ -103,6 +106,23 @@ function fileResponse(input) {
   }
   const size = info && Number(info.size);
   if (!Number.isFinite(size) || size <= 0) return { status: 404, reason: 'файла выпуска нет' };
+  if (expect && typeof expect === 'object') {
+    if (Number(expect.size) !== size) {
+      return { status: 404, reason: 'размер файла не совпал с манифестом' };
+    }
+    if (typeof hash === 'function') {
+      let digest = '';
+      try {
+        digest = hash(target);
+      } catch (error) {
+        digest = '';
+      }
+      const wanted = String(expect.sha256 || '').toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(wanted) || String(digest).toLowerCase() !== wanted) {
+        return { status: 404, reason: 'отпечаток файла не совпал с манифестом' };
+      }
+    }
+  }
   return {
     status: 200,
     platform: asked,

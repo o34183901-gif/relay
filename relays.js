@@ -120,8 +120,8 @@ function coturnConfigText(secret, { turnHost, pidfile, userdb } = {}) {
     'no-dtls',
     'no-cli',
     'no-multicast-peers',
-    'min-port=49160',
-    'max-port=49200',
+    'min-port=49152',
+    'max-port=65535',
     'log-file=stdout',
   ];
   if (pidfile) lines.push(`pidfile=${pidfile}`);

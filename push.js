@@ -48,7 +48,7 @@ function validUnifiedPushEndpoint(endpoint) {
   } catch (e) {
     return false;
   }
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+  if (u.protocol !== 'https:') return false;
   if (isPrivateHost(u.hostname)) return false;
   return true;
 }

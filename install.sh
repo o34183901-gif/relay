@@ -23,11 +23,28 @@ apt-get update -y
 apt-get install -y curl ca-certificates gnupg ufw
 
 log "Установка Node.js 20 (если нужно)"
-if ! command -v node >/dev/null || [[ "$(node -v | cut -c2-3)" -lt 18 ]]; then
+NODE_MAJOR="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
+if ! command -v node >/dev/null || [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ ]] || [[ "$NODE_MAJOR" -lt 18 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
 fi
 node -v
+
+log "Установка встроенного сервера уведомлений ntfy (пуши при закрытом приложении)"
+NTFY_VERSION="2.27.0"
+if ! command -v ntfy >/dev/null 2>&1; then
+  case "$(dpkg --print-architecture)" in
+    amd64) NTFY_ARCH="linux_amd64"; NTFY_SHA256="4b7220cb0e7673a66ace8e1368573c0df89888aafde6860ae3a48ae1174c8cee" ;;
+    *) echo "ОШИБКА: ntfy для архитектуры $(dpkg --print-architecture) не закреплён контрольной суммой — уведомления при закрытом приложении настроить нельзя." >&2; exit 1 ;;
+  esac
+  NTFY_TMP="$(mktemp -d)"
+  curl -fsSL -o "${NTFY_TMP}/ntfy.tar.gz" "https://github.com/binwiederhier/ntfy/releases/download/v${NTFY_VERSION}/ntfy_${NTFY_VERSION}_${NTFY_ARCH}.tar.gz"
+  echo "${NTFY_SHA256}  ${NTFY_TMP}/ntfy.tar.gz" | sha256sum -c -
+  tar -xzf "${NTFY_TMP}/ntfy.tar.gz" -C "$NTFY_TMP" "ntfy_${NTFY_VERSION}_${NTFY_ARCH}/ntfy"
+  install -m 0755 "${NTFY_TMP}/ntfy_${NTFY_VERSION}_${NTFY_ARCH}/ntfy" /usr/local/bin/ntfy
+  rm -rf "$NTFY_TMP"
+fi
+ntfy --version
 
 log "Копирование релея в ${APP_DIR}"
 mkdir -p "$APP_DIR"
@@ -72,6 +89,11 @@ fi
 log "Установка и настройка TURN-сервера (coturn) для звонков"
 apt-get install -y coturn
 PUBIP="$(curl -fsSL https://api.ipify.org || echo '')"
+if ! [[ "$PUBIP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! [[ "$PUBIP" == *:* ]]; then
+  echo "ОШИБКА: не удалось определить публичный IP сервера (api.ipify.org недоступен или вернул '${PUBIP}')." >&2
+  echo "Без реального адреса TURN/звонки не настроить, а релей анонсировал бы себя пустым/локальным адресом и отравил каталог — прерываю." >&2
+  exit 1
+fi
 TURN_SECRET_FILE="${APP_DIR}/turn-secret"
 if [[ -f "$TURN_SECRET_FILE" ]]; then
   TURN_SECRET="$(cat "$TURN_SECRET_FILE")"
@@ -129,7 +151,7 @@ TURN_ENV="EnvironmentFile=${RELAY_ENV_FILE}"
 if [[ "$MODE" == "tls" ]]; then
   SELF_URL="wss://${HOST}"
 else
-  SELF_URL="ws://${PUBIP:-$(curl -fsSL https://api.ipify.org || echo 127.0.0.1)}:8787"
+  SELF_URL="ws://${PUBIP}:8787"
 fi
 DIR_ENV="Environment=RELAY_SELF_URL=${SELF_URL}"
 if [[ -n "${RELAY_PEERS:-}" ]]; then
@@ -144,6 +166,7 @@ if ! id -u "$RELAY_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin "$RELAY_USER"
 fi
 mkdir -p "$APP_DIR/blobs"
+mkdir -p "$APP_DIR/ntfy"
 chown -R "$RELAY_USER":"$RELAY_USER" "$APP_DIR"
 
 TRUST_ENV=""
@@ -164,6 +187,8 @@ ExecStart=/usr/bin/node ${APP_DIR}/relay.js
 Environment=PORT=8787
 Environment=RELAY_DB=${APP_DIR}/relay.db
 Environment=RELAY_BLOB_DIR=${APP_DIR}/blobs
+Environment=RELAY_EMBED_NTFY=1
+Environment=RELAY_NTFY_DIR=${APP_DIR}/ntfy
 ${TRUST_ENV}
 ${DIR_ENV}
 ${TURN_ENV}
@@ -214,7 +239,6 @@ CADDY
   echo -e "\n\033[1;32mГотово!\033[0m Релей доступен по:  wss://${HOST}"
   echo "Проверка:  curl https://${HOST}/health"
 else
-  PUBIP="$(curl -fsSL https://api.ipify.org || echo '<IP-сервера>')"
   echo -e "\n\033[1;32mГотово!\033[0m Релей (без TLS) доступен по:  ws://${PUBIP}:8787"
   echo "Проверка:  curl http://${PUBIP}:8787/health"
 fi

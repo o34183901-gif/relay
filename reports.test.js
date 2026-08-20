@@ -11,6 +11,7 @@ function test(name, fn) {
 const owner = nacl.sign.keyPair();
 const OWNER_PUB = naclUtil.encodeBase64(owner.publicKey);
 const OWNER_SEC = naclUtil.encodeBase64(owner.secretKey);
+const HOST = 'relay-a.example';
 const goodBody = { v: 1, ek: 'ZWs=', nonce: 'bm9uY2U=', cipher: 'Y2lwaGVy' };
 test('годная посылка принимается', () => {
   assert.deepStrictEqual(reports.validReport(goodBody, 128), { ok: true });
@@ -32,15 +33,44 @@ test('посылка сверх потолка не принимается', () 
 
 test('подпись владельца открывает выдачу', () => {
   const ts = 1770000000000;
-  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC });
+  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, host: HOST, secretKey: OWNER_SEC });
   const verdict = reports.verifyOwnerRequest({
+    domain: reports.FETCH_DOMAIN,
+    ts,
+    host: HOST,
+    signature: sig,
+    publicKey: OWNER_PUB,
+    now: ts + 1000,
+  });
+  assert.deepStrictEqual(verdict, { ok: true });
+});
+
+test('INF-01: подпись одного релея не открывает выдачу на другом', () => {
+  const ts = 1770000000000;
+  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, host: HOST, secretKey: OWNER_SEC });
+  const other = reports.verifyOwnerRequest({
+    domain: reports.FETCH_DOMAIN,
+    ts,
+    host: 'relay-b.example',
+    signature: sig,
+    publicKey: OWNER_PUB,
+    now: ts + 1000,
+  });
+  assert.strictEqual(other.ok, false, 'подпись хоста A прокатилась на хост B — флот воспроизводим');
+  assert.strictEqual(other.reason, 'signature');
+  const noHost = reports.verifyOwnerRequest({
     domain: reports.FETCH_DOMAIN,
     ts,
     signature: sig,
     publicKey: OWNER_PUB,
     now: ts + 1000,
   });
-  assert.deepStrictEqual(verdict, { ok: true });
+  assert.strictEqual(noHost.reason, 'host', 'запрос без привязки к хосту обязан отвергаться');
+  assert.throws(
+    () => reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC }),
+    /host/,
+    'подпись без хоста не должна выпускаться'
+  );
 });
 
 test('чужая подпись не открывает ничего', () => {
@@ -49,11 +79,13 @@ test('чужая подпись не открывает ничего', () => {
   const sig = reports.signOwnerRequest({
     domain: reports.FETCH_DOMAIN,
     ts,
+    host: HOST,
     secretKey: naclUtil.encodeBase64(stranger.secretKey),
   });
   const verdict = reports.verifyOwnerRequest({
     domain: reports.FETCH_DOMAIN,
     ts,
+    host: HOST,
     signature: sig,
     publicKey: OWNER_PUB,
     now: ts,
@@ -63,10 +95,11 @@ test('чужая подпись не открывает ничего', () => {
 });
 test('подпись на ЧТЕНИЕ не стирает отчёты', () => {
   const ts = 1770000000000;
-  const fetchSig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC });
+  const fetchSig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, host: HOST, secretKey: OWNER_SEC });
   const verdict = reports.verifyOwnerRequest({
     domain: reports.DELETE_DOMAIN,
     ts,
+    host: HOST,
     signature: fetchSig,
     publicKey: OWNER_PUB,
     now: ts,
@@ -75,10 +108,11 @@ test('подпись на ЧТЕНИЕ не стирает отчёты', () => 
 });
 test('просроченная подпись не работает — и из будущего тоже', () => {
   const ts = 1770000000000;
-  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, secretKey: OWNER_SEC });
+  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, host: HOST, secretKey: OWNER_SEC });
   const stale = reports.verifyOwnerRequest({
     domain: reports.FETCH_DOMAIN,
     ts,
+    host: HOST,
     signature: sig,
     publicKey: OWNER_PUB,
     now: ts + reports.REQUEST_TTL_MS + 1,
@@ -87,20 +121,34 @@ test('просроченная подпись не работает — и из 
   const future = reports.verifyOwnerRequest({
     domain: reports.FETCH_DOMAIN,
     ts,
+    host: HOST,
     signature: sig,
     publicKey: OWNER_PUB,
     now: ts - reports.REQUEST_TTL_MS - 1,
   });
   assert.strictEqual(future.reason, 'stale', 'окно двустороннее — часы узлов расходятся');
 });
+test('REL-08: свежая по формату подпись из будущего (в пределах TTL) отвергается', () => {
+  const ts = 1770000000000;
+  const sig = reports.signOwnerRequest({ domain: reports.FETCH_DOMAIN, ts, host: HOST, secretKey: OWNER_SEC });
+  const nearFuture = reports.verifyOwnerRequest({
+    domain: reports.FETCH_DOMAIN,
+    ts,
+    host: HOST,
+    signature: sig,
+    publicKey: OWNER_PUB,
+    now: ts - Math.floor(reports.REQUEST_TTL_MS / 2),
+  });
+  assert.strictEqual(nearFuture.reason, 'stale', 'будущее время в пределах TTL больше не проходит');
+});
 test('битые входные данные не роняют проверку', () => {
-  assert.strictEqual(reports.verifyOwnerRequest({ domain: 'x', ts: 'вчера', now: 1 }).reason, 'ts');
+  assert.strictEqual(reports.verifyOwnerRequest({ domain: 'x', ts: 'вчера', host: HOST, now: 1 }).reason, 'ts');
   assert.strictEqual(
-    reports.verifyOwnerRequest({ domain: 'x', ts: 1, signature: 'не base64!!!', publicKey: OWNER_PUB, now: 1 }).ok,
+    reports.verifyOwnerRequest({ domain: 'x', ts: 1, host: HOST, signature: 'не base64!!!', publicKey: OWNER_PUB, now: 1 }).ok,
     false
   );
   assert.strictEqual(
-    reports.verifyOwnerRequest({ domain: 'x', ts: 1, signature: 'YQ==', publicKey: '', now: 1 }).reason,
+    reports.verifyOwnerRequest({ domain: 'x', ts: 1, host: HOST, signature: 'YQ==', publicKey: '', now: 1 }).reason,
     'key'
   );
 });

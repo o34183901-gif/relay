@@ -56,9 +56,8 @@ function bucketDepth(size) {
 }
 function bucketOf(key, depth) {
   if (depth <= 0) return 0;
-  const head = (key[0] << 24) >>> 0;
-  const value = head + (key[1] << 16) + (key[2] << 8) + key[3];
-  return Math.floor(value / 2 ** (32 - depth));
+  const head = key[0] * 0x1000000 + (key[1] << 16) + (key[2] << 8) + key[3];
+  return Math.floor(head / 2 ** (32 - depth));
 }
 function bucketRange(bucket, depth) {
   const low = Buffer.alloc(KEY_BYTES);

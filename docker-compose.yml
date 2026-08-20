@@ -2,14 +2,15 @@ services:
   relay:
     image: ghcr.io/o34183901-gif/relay:${LICNO_CHANNEL:-stable}
     restart: unless-stopped
+    init: true
     environment:
-      RELAY_SELF_URL: ${RELAY_SELF_URL}
+      RELAY_SELF_URL: ${RELAY_SELF_URL:?RELAY_SELF_URL обязателен - wss-адрес, которым релей анонсирует себя в каталоге}
       RELAY_PEERS: ${RELAY_PEERS:-}
       RELAY_TRUST_PROXY: "1"
       RELAY_GOSSIP_TOKEN: ${RELAY_GOSSIP_TOKEN:-}
       RELAY_METRICS_TOKEN: ${RELAY_METRICS_TOKEN:-}
       RELAY_MAX_QUEUE_BYTES: ${RELAY_MAX_QUEUE_BYTES:-8589934592}
-      TURN_HOST: ${TURN_HOST}
+      TURN_HOST: ${TURN_HOST:?TURN_HOST обязателен - публичный IP сервера для звонков}
       RELAY_EMBED_COTURN: "1"
     volumes:
       - relay-data:/data
@@ -19,20 +20,41 @@ services:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49160-49200:49160-49200/udp"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
+    cpus: "2.0"
     mem_limit: ${RELAY_MEM_LIMIT:-2g}
     pids_limit: ${RELAY_PIDS_LIMIT:-1024}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    depends_on: [relay]
+    init: true
+    depends_on:
+      relay:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
     environment:
-      RELAY_HOST: ${RELAY_HOST}
+      RELAY_HOST: ${RELAY_HOST:?RELAY_HOST обязателен - публичный хост для TLS, напр. 203.0.113.7.sslip.io}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -46,8 +68,14 @@ services:
       - /tmp
     security_opt:
       - no-new-privileges:true
+    cpus: "1.0"
     mem_limit: 256m
     pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   relay-data:

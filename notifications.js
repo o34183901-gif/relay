@@ -1,11 +1,11 @@
 const crypto = require('crypto');
 const DEFAULT_WINDOW_MS = 20000;
 const DEFAULT_MAX_PER_RECIPIENT = 5;
-function chatNotificationTag(address) {
+function chatNotificationTag(address, salt) {
   if (!address) return '';
-  return crypto
-    .createHash('sha256')
-    .update('licno-chat-tag|' + String(address))
+  const hash = crypto.createHash('sha256').update('licno-chat-tag|' + String(address));
+  if (salt) hash.update(salt);
+  return hash
     .digest('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')

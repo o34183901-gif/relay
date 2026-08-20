@@ -1,28 +1,42 @@
-FROM node:20-slim
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS build
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ coturn gosu curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/* \
-  && groupadd -r licno && useradd -r -g licno -s /usr/sbin/nologin licno
+  && apt-get install -y --no-install-recommends python3 make g++ curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
 ARG NTFY_VERSION=2.27.0
 ARG NTFY_SHA256=4b7220cb0e7673a66ace8e1368573c0df89888aafde6860ae3a48ae1174c8cee
+ARG NTFY_SHA256_ARM64=a1635f0a89e49c65676d6c580da5636ad62cf05b525651bd6b809a590cd2b70c
 RUN set -eux; \
   case "$(dpkg --print-architecture)" in \
-    amd64) NTFY_ARCH=linux_amd64 ;; \
+    amd64) NTFY_ARCH=linux_amd64; NTFY_SUM="$NTFY_SHA256" ;; \
+    arm64) NTFY_ARCH=linux_arm64; NTFY_SUM="$NTFY_SHA256_ARM64" ;; \
     *) echo "ntfy: неподдержанная архитектура $(dpkg --print-architecture)" >&2; exit 1 ;; \
   esac; \
   curl -fsSL -o /tmp/ntfy.tar.gz \
     "https://github.com/binwiederhier/ntfy/releases/download/v${NTFY_VERSION}/ntfy_${NTFY_VERSION}_${NTFY_ARCH}.tar.gz"; \
-  echo "${NTFY_SHA256}  /tmp/ntfy.tar.gz" | sha256sum -c -; \
+  echo "${NTFY_SUM}  /tmp/ntfy.tar.gz" | sha256sum -c -; \
   tar -xzf /tmp/ntfy.tar.gz -C /tmp "ntfy_${NTFY_VERSION}_${NTFY_ARCH}/ntfy"; \
   install -m 0755 "/tmp/ntfy_${NTFY_VERSION}_${NTFY_ARCH}/ntfy" /usr/local/bin/ntfy; \
   rm -rf /tmp/ntfy.tar.gz "/tmp/ntfy_${NTFY_VERSION}_${NTFY_ARCH}"; \
   ntfy --version
 
+
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
+WORKDIR /app
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends coturn gosu ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd -r licno && useradd -r -g licno -s /usr/sbin/nologin licno
+
+COPY --from=build /usr/local/bin/ntfy /usr/local/bin/ntfy
+COPY --from=build /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
 
 COPY binary-frame.js ed25519.js envelopeFrame.js gateway-ticket.js httpRateLimit.js landing.js \
   linked-devices.js mailboxEvict.js mailboxGcs.js mbx.js nativeEd25519.js nativeX25519.js notifications.js \
@@ -38,7 +52,7 @@ ENV RELAY_DB=/data/relay.db \
 VOLUME ["/data"]
 EXPOSE 8787
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["docker-entrypoint.sh"]

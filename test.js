@@ -20,8 +20,9 @@ const reportsRule = require('./reports');
 const reportsOwner = nacl.sign.keyPair();
 const REPORTS_OWNER_PUB = naclUtil.encodeBase64(reportsOwner.publicKey);
 const REPORTS_OWNER_SEC = naclUtil.encodeBase64(reportsOwner.secretKey);
+const REPORTS_SELF_HOST = `127.0.0.1:${PORT}`;
 const signReports = (domain, ts) =>
-  reportsRule.signOwnerRequest({ domain, ts, secretKey: REPORTS_OWNER_SEC });
+  reportsRule.signOwnerRequest({ domain, ts, host: REPORTS_SELF_HOST, secretKey: REPORTS_OWNER_SEC });
 function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -155,6 +156,7 @@ async function main() {
     env: {
       ...process.env,
       PORT: String(PORT),
+      RELAY_SELF_URL: URL,
       RELAY_DB: DB,
       RELAY_VAPID_KEY_FILE: VAPID_FILE,
       RELAY_BLOB_DIR: BLOB_DIR,

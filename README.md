@@ -227,9 +227,10 @@ digest самостоятельно. Контейнера с доступом к
   синхронизирует сюда код, запускает эти два workflow здесь (дожидаясь их
   результата) и только потом собирает APK и веб-версию.
 
-> Хотите собирать локально вместо готового образа — раскомментируйте `build: .`
-> в `docker-compose.yml` (тогда авто-обновления нет, обновляйте
-> `git pull && docker compose up -d --build`).
+> Хотите собирать локально вместо готового образа — добавьте в сервис `relay`
+> в `docker-compose.yml` строку `build: .` рядом с `image:` (Compose соберёт образ
+> из `Dockerfile` в этом каталоге). Тогда авто-обновления по cosign-подписи нет,
+> обновляйте вручную: `git pull && docker compose up -d --build`.
 
 ## Как это масштабируется
 
@@ -244,13 +245,21 @@ gossip намеренно не выдаёт приватный push-ключ п�
 
 ## Альтернатива без Docker (bare-metal)
 
-Скрипт ставит Node.js, systemd-сервис, firewall, Caddy (авто-TLS) и coturn:
+Скрипт ставит Node.js, встроенный сервер уведомлений ntfy, systemd-сервис,
+firewall, Caddy (авто-TLS) и coturn:
 
 ```bash
 git clone https://github.com/o34183901-gif/relay.git && cd relay
 sudo RELAY_PEERS="wss://<живой-релей>" bash install.sh <RELAY_HOST>
 # первый релей: без RELAY_PEERS ->  sudo bash install.sh <RELAY_HOST>
 ```
+
+> **Авто-обновления bare-metal не покрываются.** Верифицированный апдейтер
+> (`deploy/install-updater.sh`, cosign-таймер) работает только с Docker-стеком:
+> ему нужен `docker-compose.yml`. Релей, поднятый через `install.sh`, обновляется
+> вручную — перекопировать обновлённый `server/` в `/opt/licno-relay` и
+> `systemctl restart licno-relay`. Для авто-обновлений по подписи используйте
+> Docker Compose.
 
 ## Удаление старой установки (bare-metal через install.sh)
 

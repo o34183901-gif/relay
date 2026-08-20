@@ -36,13 +36,21 @@ echo "==> Ставлю апдейтер и таймер"
 install -m 0755 "$SRC/licno-update.sh" /usr/local/bin/licno-update.sh
 install -m 0644 "$SRC/licno-update.service" /etc/systemd/system/licno-update.service
 install -m 0644 "$SRC/licno-update.timer" /etc/systemd/system/licno-update.timer
-sed -i "s#^Environment=LICNO_COMPOSE_DIR=.*#Environment=LICNO_COMPOSE_DIR=${COMPOSE_DIR}#" /etc/systemd/system/licno-update.service
+ESC_COMPOSE_DIR="$(printf '%s' "$COMPOSE_DIR" | sed -e 's/[\\&#]/\\&/g')"
+sed -i "s#^Environment=LICNO_COMPOSE_DIR=.*#Environment=LICNO_COMPOSE_DIR=${ESC_COMPOSE_DIR}#" /etc/systemd/system/licno-update.service
 
 systemctl daemon-reload
 systemctl enable --now licno-update.timer
 
 echo "==> Готово. Первый прогон запускаю сейчас:"
-systemctl start licno-update.service || true
+if systemctl start licno-update.service; then
+  echo "Первый прогон апдейтера завершился успешно."
+else
+  echo "ОШИБКА: первый прогон апдейтера завершился неудачей (частая причина — не прошла cosign-проверка подписи образа)." >&2
+  echo "Причина в журнале:" >&2
+  journalctl -u licno-update.service -n 50 --no-pager >&2 || true
+  exit 1
+fi
 echo
 echo "Проверка:   systemctl list-timers licno-update.timer"
 echo "Логи:       journalctl -u licno-update.service -n 50 --no-pager"
