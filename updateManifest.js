@@ -51,7 +51,7 @@ function canonicalValue(value) {
   }
   return { t: 'x', v: String(value) };
 }
-function signedPayload(manifest) {
+function signedPayloadCanonical(manifest) {
   const source = manifest && typeof manifest === 'object' ? manifest : {};
   const shape = [];
   for (const field of SIGNED_FIELDS) {
@@ -60,6 +60,16 @@ function signedPayload(manifest) {
     shape.push([field, canonicalValue(value)]);
   }
   return JSON.stringify(shape);
+}
+function signedPayload(manifest) {
+  const source = manifest && typeof manifest === 'object' ? manifest : {};
+  const parts = [];
+  for (const field of SIGNED_FIELDS) {
+    const value = source[field];
+    if (value === undefined || value === null) continue;
+    parts.push(`${field}=${String(value)}`);
+  }
+  return parts.join('\n');
 }
 function verifyUpdateManifest(input) {
   const {
@@ -77,7 +87,9 @@ function verifyUpdateManifest(input) {
   if (typeof signature !== 'string' || !signature) return { ok: false, reason: 'манифест не подписан' };
   let signatureOk = false;
   try {
-    signatureOk = verifySignature(signedPayload(manifest), signature, publicKey) === true;
+    signatureOk =
+      verifySignature(signedPayload(manifest), signature, publicKey) === true ||
+      verifySignature(signedPayloadCanonical(manifest), signature, publicKey) === true;
   } catch (error) {
     signatureOk = false;
   }
