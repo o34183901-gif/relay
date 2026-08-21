@@ -1,4 +1,4 @@
-const BUILD_ID = '20260818092220-e39a94958';
+const BUILD_ID = '20260821084927-55c021468';
 const CACHE_NAME = `licno-pwa-${BUILD_ID}`;
 const APP_ROOT = '/app/';
 const SHELL = [
@@ -12,10 +12,13 @@ const SHELL = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE_NAME)
-      .then((cache) => cache.addAll(SHELL))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then(async (cache) => {
+      const results = await Promise.allSettled(SHELL.map((url) => cache.add(url)));
+      const failed = SHELL.filter((url, index) => results[index].status === 'rejected');
+      if (failed.length) {
+        console.warn('[sw] часть оболочки не закэширована при установке: ' + failed.join(', '));
+      }
+    })
   );
 });
 
@@ -30,7 +33,6 @@ self.addEventListener('activate', (event) => {
             .map((name) => caches.delete(name))
         )
       )
-      .then(() => self.clients.claim())
   );
 });
 

@@ -1,55 +1,55 @@
 {
-  "version": "0.0.83",
+  "version": "0.0.84",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
-  "sha256": "01b8a0f5820c47b1fadef5bed5672bc29e543ecb3cd6e853ab161cdd77d95fcd",
+  "sha256": "c33b6fa6320b00457ba7e953c33877e5bc22d943705e929d8b12f04e60f48668",
   "platform": "web",
-  "filesHash": "8a6e8baa0460ff59dc17f8c6609fe3ce22f940c93794045592f7869c135f208e",
+  "filesHash": "0bcce77819aa1cc0b2286a00edee6e238dc321ebd0510bc9ea9bc1d2a463959a",
   "files": [
     {
-      "path": "_expo/static/js/web/ChatScreen-a8316bde759cf445c12d65e450f9c9c0.js",
-      "size": 158881,
-      "sha256": "96b345155df07ca89e4a45b1f1c511a5142d281c06e6928636e773de80221a1c"
+      "path": "_expo/static/js/web/ChatScreen-3da2f9380ee5fadf697ce02f844351d1.js",
+      "size": 147609,
+      "sha256": "e29b9a4c4c2a51759d610d1580569954a9d55115bb51717ad2bd51cd9dd95051"
     },
     {
-      "path": "_expo/static/js/web/GroupChatScreen-7b1902a7619ec02f190135c94ea058bb.js",
-      "size": 46130,
-      "sha256": "5714f38828c59219b187e48cd157886f076a908ef0a52ab5ec5d228607e8ff1d"
+      "path": "_expo/static/js/web/GroupChatScreen-82da658f6fac69374b0da89cf852faab.js",
+      "size": 54440,
+      "sha256": "03d4dc450cad48f6a809956dec77346622129a559f912880d683c0728ecde6d9"
     },
     {
-      "path": "_expo/static/js/web/GroupEditScreen-0f47baa97b727ec684304e1de08cb34c.js",
+      "path": "_expo/static/js/web/GroupEditScreen-62b6f88badf7d2dee1635c0eee128f28.js",
       "size": 9276,
-      "sha256": "47dd8846a4e70bc6e420004fdbccbd2bd5ead6701229bfaec4da9632333998e4"
+      "sha256": "f0442b37908c125869388b3757958a5ea33d1ec34949a4f319ef6c84726f7ce1"
     },
     {
-      "path": "_expo/static/js/web/GroupMembersScreen-908d9ea83ab27804d1c4dc5ca5ec5a5d.js",
-      "size": 6733,
-      "sha256": "5fefd5d1fca59d6b7f42ce8eb66b68c316b7590de05717e5d50b53a031337d8e"
+      "path": "_expo/static/js/web/GroupMembersScreen-c4cb3b245031257ce1eca7492fe51c63.js",
+      "size": 7738,
+      "sha256": "d173a6ed0eb37c96f800a20dec926fdb2e1d70e43a840c48395d283186d76a3b"
     },
     {
-      "path": "_expo/static/js/web/MyCodeScreen-8fb85e1a3a09b882301c02e72ff19829.js",
-      "size": 16631,
-      "sha256": "4f8b14c8da56d8e3a8f95b1fac552c479d4df007f3902fb81da9931f7949f846"
+      "path": "_expo/static/js/web/MyCodeScreen-8ca02bdaee9c59f4daa19757ca845828.js",
+      "size": 19123,
+      "sha256": "1d4d1ad21af219e72d07c4d8f9a0d6abf50a135d56d714a26f338d9dff97bb85"
     },
     {
-      "path": "_expo/static/js/web/OfflineSetupScreen-88159ff7ff90caafbf79f08a899d64ff.js",
-      "size": 18418,
-      "sha256": "60c09b4d5705d4e25da7e17b537b53d17c9835c2930cb297b7034834f04c44c4"
+      "path": "_expo/static/js/web/OfflineSetupScreen-be0c2c60f5217c7d48e0638f3cdb0897.js",
+      "size": 18508,
+      "sha256": "24fa1bf8003f01ce91dbebed68bc247db25f8a6aaae88e036f40ae291a2593ae"
     },
     {
-      "path": "_expo/static/js/web/ProfileScreen-d0eb57b088caf2f432cb3df3a9f0ccb9.js",
-      "size": 131886,
-      "sha256": "2fff93ba127d0e3c3c65f270843af970ac5924e42462d33f1d95e800f78647df"
+      "path": "_expo/static/js/web/ProfileScreen-7d3785f233c5cb3c2423d53fa6d32e34.js",
+      "size": 134076,
+      "sha256": "73a695dd485ba5c7f58955a73ba6daafde9828171e530661748b98c55c077901"
     },
     {
-      "path": "_expo/static/js/web/ScanScreen-411f366f55f04a23c78fb7cc73fd0e06.js",
-      "size": 10477,
-      "sha256": "26eaeeb48d6a3f5f640d54788be19c19704e6bb57e298830c7ac4c3d931f5d92"
+      "path": "_expo/static/js/web/ScanScreen-7d65f343be3b8e1b0d65430479cec867.js",
+      "size": 11972,
+      "sha256": "4efc6d3be824d57493271ef53f9a13f64a08c57ca9327a30a49ad174670c68be"
     },
     {
-      "path": "_expo/static/js/web/index-ed0726043711b0fb09087d0c70058aed.js",
-      "size": 2549389,
-      "sha256": "2e46646638435a488186f95c9ff0200c07a0d5852d7baeef70ca29eb24e15f0f"
+      "path": "_expo/static/js/web/index-441b1443bb13481c5f8df257c0d35220.js",
+      "size": 2621730,
+      "sha256": "27a8a621b883bac622612088aadf591e256d005c8bfec1354be021c74852cda9"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -84,7 +84,7 @@
     {
       "path": "index.html",
       "size": 1919,
-      "sha256": "01b8a0f5820c47b1fadef5bed5672bc29e543ecb3cd6e853ab161cdd77d95fcd"
+      "sha256": "c33b6fa6320b00457ba7e953c33877e5bc22d943705e929d8b12f04e60f48668"
     },
     {
       "path": "jsqr.bundle.js",
@@ -113,14 +113,14 @@
     },
     {
       "path": "sw.js",
-      "size": 3400,
-      "sha256": "f25dc460e003f0fc4a436f4455e0c3e29f3d495242d69f885734e4f9f3418c3d"
+      "size": 3646,
+      "sha256": "afe80eaccd05d007a187057c39ed33b429fb66e9b85c8be474806ef088f15aa5"
     },
     {
       "path": "version.json",
       "size": 75,
-      "sha256": "5c62a31849a4047129875b87cf996e5b36428d98688b56aeb8c9e196eadf001b"
+      "sha256": "fa1487015c97e1f9b6ec46aaf2ac92b366297fdbb6d84f4b48189c30e7ef01a5"
     }
   ],
-  "signature": "IFYSJts90NOEddvskoJXpROD+dCg1dGE2GkxbjQnHeTk8mH+Zfsv2dgoS5BmN3EAWGj0jzUU4NKSJLq1PzcmBQ=="
+  "signature": "bNoF6yEAw0urN5aEaadeppvBB6RdjstfzsBsEFIC3O9mGOfIKzn1TPx9x/eC3u8d7YfqVJyR+DaTb9jliuXrDQ=="
 }
