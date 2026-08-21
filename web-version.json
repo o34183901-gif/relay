@@ -1,15 +1,15 @@
 {
-  "version": "0.0.85",
+  "version": "0.0.88",
   "url": "https://raw.githubusercontent.com/o34183901-gif/relay/main/web/index.html",
   "size": 1919,
   "sha256": "c33b6fa6320b00457ba7e953c33877e5bc22d943705e929d8b12f04e60f48668",
   "platform": "web",
-  "filesHash": "f03c504647a4dc12093b103013caf9300dcacf3bb8bcd9bd540f5c035ee64632",
+  "filesHash": "87d2e0b994dacdd29b81ae9c8a0f3e19f6e72afe505576455b986145d70ffc12",
   "files": [
     {
-      "path": "_expo/static/js/web/ChatScreen-3da2f9380ee5fadf697ce02f844351d1.js",
-      "size": 147609,
-      "sha256": "e29b9a4c4c2a51759d610d1580569954a9d55115bb51717ad2bd51cd9dd95051"
+      "path": "_expo/static/js/web/ChatScreen-6dd4b070fb03c9fdd711bd0c2356f716.js",
+      "size": 148160,
+      "sha256": "6b6a17f6cfe872cd4b3a6d23d1d888a1b8b91dcff767aec0569251dbc22c94c2"
     },
     {
       "path": "_expo/static/js/web/GroupChatScreen-82da658f6fac69374b0da89cf852faab.js",
@@ -49,7 +49,7 @@
     {
       "path": "_expo/static/js/web/index-441b1443bb13481c5f8df257c0d35220.js",
       "size": 2621730,
-      "sha256": "27a8a621b883bac622612088aadf591e256d005c8bfec1354be021c74852cda9"
+      "sha256": "816cd8c8416bf0c8f9d5b25ebb7da88262644544a17b0992caae9c0ac8368757"
     },
     {
       "path": "assets/node_modules/@react-navigation/elements/lib/module/assets/back-icon-mask.5223c8d9b0d08b82a5670fb5f71faf78.png",
@@ -114,13 +114,13 @@
     {
       "path": "sw.js",
       "size": 3646,
-      "sha256": "77542947be4559352dcf43a4c9d120d29fcca7453ce7dc23d1aaf4892e328c0a"
+      "sha256": "93b3311bf17ac2c25d276dfde01bffe0e1f28d6bc5314513c7064523359a936b"
     },
     {
       "path": "version.json",
       "size": 75,
-      "sha256": "d574fb41eebe3cd0f26493177184ca1394cb9da89e0d3561a74c1df2a0d1b530"
+      "sha256": "29a0d0ae2458e41f9cc0003c0f6bfd9e9d5383740b08e7573269c3f4aff6dc3a"
     }
   ],
-  "signature": "ZYa6DXT4tz77+kmzIUYW5pu7GFdWOW4v378rI41uEV42E3DDRO0PXIAG2O9LUpN22NzsmyWE4pzAjIc+9+WPBg=="
+  "signature": "Ej+awsdTtTUn84NJRyjytmtIXMEguNaaRA2hExlgWrKecBbGkphGY4mv6b3xc2Z0/GKtW03rf6IrrP2f1/e3Dg=="
 }
